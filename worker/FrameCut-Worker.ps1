@@ -141,8 +141,13 @@ function Process-ImageJob($payload) {
   Ensure-Comfy
   $prefix=("framecut/job-{0}" -f $job.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
+  $negativePrompt=if($asset.kind -eq 'character'){
+    'text, caption, watermark, malformed anatomy, duplicate person, white background, flat lighting'
+  }else{
+    'person, people, human, character, face, portrait, body, hands, crowd, text, caption, watermark, white background, flat lighting'
+  }
   $env:COMFY_URL=$config.ComfyUrl
-  & python $imageClient $payload.prompt --negativ 'text, caption, watermark, malformed anatomy, duplicate people, white background, flat lighting' --breite 768 --hoehe 432 --schritte $photoSteps --seed (100000+[int]$job.id) --name $prefix
+  & python $imageClient $payload.prompt --negativ $negativePrompt --breite 768 --hoehe 432 --schritte $photoSteps --seed (100000+[int]$job.id) --name $prefix
   Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue
   if($LASTEXITCODE -ne 0){throw "ComfyUI wurde mit Code $LASTEXITCODE beendet."}
   $result=Get-ChildItem -LiteralPath (Join-Path $comfyOutputRoot 'framecut') -Filter ("job-{0}*.png" -f $job.id)|Sort-Object LastWriteTime -Descending|Select-Object -First 1

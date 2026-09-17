@@ -5,6 +5,7 @@ import { createHash, randomBytes, scryptSync, timingSafeEqual, createCipheriv, c
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path';
+import { buildReferencePrompt } from './lib/reference-prompt.mjs';
 
 const APP = resolve(import.meta.dirname);
 const WORKSPACE = resolve(APP, '..');
@@ -103,31 +104,6 @@ const rows = (query, ...params) => db.prepare(query).all(...params);
 const run = (query, ...params) => db.prepare(query).run(...params);
 function event(label, detail = '') { run('INSERT INTO activity(label,detail,created_at) VALUES (?,?,?)', label, detail, now()); }
 function assertText(value, label, limit = 8000) { const result = String(value || '').trim(); if (!result) throw new Error(`${label} darf nicht leer sein.`); if (result.length > limit) throw new Error(`${label} ist zu lang.`); return result; }
-function buildReferencePrompt(asset, projectStyle='') {
-  // Negation phrasing ("empty of people", "no characters") is unreliable on this local setup: the
-  // ComfyUI workflow runs at cfg 1.0, where negative prompts have zero effect, and even positive-prompt
-  // negations tend to be ignored or backfire on distilled/turbo models. The reliable fix is to never
-  // introduce the concept of a person at all, and instead force an isolated composition (extreme close-up
-  // / architecture-only framing) that leaves no room for a figure to appear.
-  const type = asset.kind === 'character' ? 'one consistent character shown as full-body front view, three-quarter portrait, and full-body back view' : asset.kind === 'location' ? 'a still, uninhabited environment study of architecture, landscape or interior only, wide static composition focused purely on structure, materials, weather and atmosphere' : 'an extreme close-up production reference photograph of a single object, filling most of the frame, isolated against a dark neutral backdrop';
-  // Style bibles are typically written as "[art style/technique sentence]. [main character description sentence...]"
-  // (e.g. "...1990s Image Comics style... A brooding antihero with a cape..."). Appending the full bible to a
-  // location/prop prompt reliably injects that character into otherwise-empty scenes, because the description
-  // itself introduces the concept of a person - independent of the "empty of people" phrasing fix above. For
-  // non-character assets, keep only the leading style/technique sentence(s) and drop whatever comes after the
-  // first mention of a person-describing word, so the palette/inking/lighting carries over without the figure.
-  const styleForPrompt = asset.kind === 'character' ? projectStyle : (() => {
-    const personWord = /\b(antihero|hero|villain|character|figure|man|woman|person|protagonist|he |she |his |her )\b/i;
-    const match = personWord.exec(projectStyle);
-    if (!match) return projectStyle;
-    const cutoff = projectStyle.lastIndexOf('.', match.index);
-    return cutoff > 0 ? projectStyle.slice(0, cutoff + 1).trim() : projectStyle;
-  })();
-  const style = styleForPrompt
-    ? `Project style bible: ${styleForPrompt}.`
-    : 'grounded cinematic reference illustration, natural materials and controlled lighting.';
-  return `${type}. ${asset.name}. ${asset.summary || ''} ${asset.visual_notes || ''} ${style} Consistent proportions and identity, unlettered, no logos, no watermark, no typography.`.replace(/\s+/g,' ').trim();
-}
 function hash(password, salt = randomBytes(16).toString('hex')) { return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`; }
 function validPassword(password, saved) {
   try {
@@ -1376,4 +1352,3 @@ const server = http.createServer(async (req, res) => {
 }else{
   server.listen(PORT,HOST,()=>console.log(`FrameCut: http://${HOST}:${PORT}`));
 }
-
