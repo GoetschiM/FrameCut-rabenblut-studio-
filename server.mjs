@@ -94,6 +94,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS asset_photos (id INTEGER PRIMARY KEY, asset_
 db.exec(`INSERT INTO asset_photos (asset_id, file_path, is_primary, created_at)
   SELECT id, file_path, 1, created_at FROM assets
   WHERE file_path IS NOT NULL AND id NOT IN (SELECT asset_id FROM asset_photos)`);
+// `assets.file_path` is the worker-facing primary reference. Older projects can have
+// an asset_photos primary that differs from this legacy column, which otherwise makes
+// the editor and the worker use different images for the same asset.
+db.exec(`UPDATE assets
+  SET file_path = (SELECT p.file_path FROM asset_photos p WHERE p.asset_id=assets.id AND p.is_primary=1 ORDER BY p.id DESC LIMIT 1)
+  WHERE EXISTS (SELECT 1 FROM asset_photos p WHERE p.asset_id=assets.id AND p.is_primary=1)`);
 try { db.exec("ALTER TABLE assets ADD COLUMN voice TEXT"); } catch { /* column already exists */ }
 db.exec(`CREATE TABLE IF NOT EXISTS shot_dialogue (id INTEGER PRIMARY KEY, shot_id INTEGER NOT NULL, asset_id INTEGER, sequence INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL, created_at TEXT NOT NULL)`);
 try { db.exec("ALTER TABLE episodes ADD COLUMN archived_at TEXT"); } catch { /* column already exists */ }
@@ -103,6 +109,40 @@ const row = (query, ...params) => db.prepare(query).get(...params);
 const rows = (query, ...params) => db.prepare(query).all(...params);
 const run = (query, ...params) => db.prepare(query).run(...params);
 function event(label, detail = '') { run('INSERT INTO activity(label,detail,created_at) VALUES (?,?,?)', label, detail, now()); }
+function missingReferenceAssets(shotIds) {
+  if (!shotIds.length) return [];
+  const marks = shotIds.map(() => '?').join(',');
+  return rows(`SELECT DISTINCT a.*
+    FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id
+    WHERE sa.shot_id IN (${marks}) AND (a.file_path IS NULL OR a.file_path='')
+    ORDER BY a.kind,a.name`, ...shotIds);
+}
+function queueMissingReferencePreviews(episode, ownerId, shotIds) {
+  const missing = missingReferenceAssets(shotIds);
+  let queued = 0;
+  for (const asset of missing) {
+    // A failed reference requires an intentional retry from the editor; silently
+    // creating it over and over would hide a real ComfyUI or prompt problem.
+    if (row("SELECT id FROM jobs WHERE asset_id=? AND kind='comfyui_reference_preview' AND state IN ('wartet','läuft','fehlgeschlagen')", asset.id)) continue;
+    const prompt = buildReferencePrompt(asset, episode.style_profile || '');
+    run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id,asset_id) VALUES (?,?,?,?,?,?,?,?)', episode.id, 'comfyui_reference_preview', `ComfyUI · Referenz: ${asset.name}`, 'wartet', prompt, now(), ownerId || null, asset.id);
+    queued++;
+  }
+  return { queued, missing: missing.length };
+}
+function recoverQueuedReferenceGaps() {
+  // Covers jobs that were queued before the prerequisite system existed.  Reference
+  // jobs are always selected before video jobs, and the selector below refuses to
+  // hand a video to the worker until every linked reference has a primary image.
+  const episodes = rows(`SELECT DISTINCT e.id,e.project_id,COALESCE(e.style_profile,p.style_profile) style_profile,j.owner_id
+    FROM jobs j JOIN episodes e ON e.id=j.episode_id JOIN projects p ON p.id=e.project_id
+    WHERE j.kind='minimax_h3' AND j.state='wartet'
+      AND EXISTS (SELECT 1 FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id WHERE sa.shot_id=j.shot_id AND (a.file_path IS NULL OR a.file_path=''))`);
+  for (const episode of episodes) {
+    const shotIds = rows("SELECT shot_id FROM jobs WHERE episode_id=? AND kind='minimax_h3' AND state='wartet' AND shot_id IS NOT NULL", episode.id).map(j => j.shot_id);
+    queueMissingReferencePreviews(episode, episode.owner_id, shotIds);
+  }
+}
 function assertText(value, label, limit = 8000) { const result = String(value || '').trim(); if (!result) throw new Error(`${label} darf nicht leer sein.`); if (result.length > limit) throw new Error(`${label} ist zu lang.`); return result; }
 function hash(password, salt = randomBytes(16).toString('hex')) { return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`; }
 function validPassword(password, saved) {
@@ -1239,16 +1279,9 @@ const server = http.createServer(async (req, res) => {
         : rows("SELECT s.* FROM shots s WHERE s.episode_id=? AND (s.output_video_path IS NULL OR s.output_video_path='') AND s.prompt<>'' AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.shot_id=s.id AND j.state IN ('wartet','läuft')) ORDER BY s.sequence", ep.id);
       if (!openShots.length) return json(res, 400, { error: force ? 'Alle Shots werden bereits gerendert oder warten schon.' : 'Keine offenen Shots zum Rendern gefunden.' });
       const tier = d.tier === 'Vorschau' ? 'Vorschau' : 'Fertig';
-      const shotIds = openShots.map(s => s.id);
-      const linkedAssets = rows(`SELECT DISTINCT a.* FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id WHERE sa.shot_id IN (${shotIds.map(() => '?').join(',')}) AND a.kind IN ('character','prop') AND (a.file_path IS NULL OR a.file_path='')`, ...shotIds);
       const project = row('SELECT style_profile FROM projects WHERE id=?', ep.project_id);
-      let photosQueued = 0;
-      for (const asset of linkedAssets) {
-        if (row("SELECT id FROM jobs WHERE asset_id=? AND kind='comfyui_reference_preview' AND state IN ('wartet','läuft')", asset.id)) continue;
-        const prompt = buildReferencePrompt(asset, project?.style_profile || '');
-        run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id,asset_id) VALUES (?,?,?,?,?,?,?,?)', ep.id, 'comfyui_reference_preview', `ComfyUI · Referenz: ${asset.name}`, 'wartet', prompt, now(), account.id, asset.id);
-        photosQueued++;
-      }
+      const referenceResult = queueMissingReferencePreviews({...ep,style_profile:ep.style_profile||project?.style_profile||''}, account.id, openShots.map(s => s.id));
+      const photosQueued = referenceResult.queued;
       let queued = 0;
       for (const shot of openShots) {
         run("UPDATE shots SET status='in Warteschlange', render_tier=? WHERE id=?", tier, shot.id);
@@ -1273,10 +1306,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (!shot) return json(res, 409, { error: 'Kein renderbarer offener Shot gefunden. Prüfe Shot-Prompt oder bestehende Aufträge.' });
       const tier = d.tier === 'Vorschau' ? 'Vorschau' : 'Fertig';
+      const project = row('SELECT style_profile FROM projects WHERE id=?', ep.project_id);
+      const referenceResult = queueMissingReferencePreviews({...ep,style_profile:ep.style_profile||project?.style_profile||''}, account.id, [shot.id]);
       run("UPDATE shots SET status='in Warteschlange', render_tier=? WHERE id=?", tier, shot.id);
       const job = run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id,shot_id) VALUES (?,?,?,?,?,?,?,?)', ep.id, 'minimax_h3', `MiniMax H3 · ${shot.title}`, 'wartet', 'Video-Job wartet auf einen lokalen FrameCut-Worker.', now(), account.id, shot.id);
-      event('Renderauftrag eingereiht', `${shot.title} (Shot ${shot.sequence})`);
-      return json(res, 201, { job: row('SELECT * FROM jobs WHERE id=?', Number(job.lastInsertRowid)), shot });
+      event('Renderauftrag eingereiht', `${shot.title} (Shot ${shot.sequence})${referenceResult.queued ? `, davor ${referenceResult.queued} fehlende Referenzfotos` : ''}`);
+      return json(res, 201, { job: row('SELECT * FROM jobs WHERE id=?', Number(job.lastInsertRowid)), shot, photosQueued:referenceResult.queued });
     }
     if (/^\/api\/episodes\/\d+\/assemble$/.test(path) && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
@@ -1311,7 +1346,51 @@ const server = http.createServer(async (req, res) => {
         return json(res, 500, { error: 'Export fehlgeschlagen: ' + err.message });
       }
     }
-    if (path === '/api/worker/next' && req.method === 'GET') { if (!workerGuard(req,res)) return; const workerId=String(req.headers['x-framecut-worker-id']||'laptop').slice(0,80); run('INSERT INTO workers(id,last_seen,first_seen) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen', workerId, now(), now()); db.exec('BEGIN IMMEDIATE'); let job; try { job=row("SELECT j.*,e.project_id,e.number episode_number,e.title episode_title,p.title project_title,COALESCE(e.style_profile,p.style_profile) style_profile,COALESCE(e.video_steps,p.video_steps) video_steps,COALESCE(e.photo_steps,p.photo_steps) photo_steps,COALESCE(e.preview_width,p.preview_width) preview_width,COALESCE(e.preview_height,p.preview_height) preview_height,COALESCE(e.final_width,p.final_width) final_width,COALESCE(e.final_height,p.final_height) final_height FROM jobs j JOIN episodes e ON e.id=j.episode_id JOIN projects p ON p.id=e.project_id WHERE j.state='wartet' AND j.kind IN ('comfyui_reference_preview','caption_asset','minimax_h3') ORDER BY CASE j.kind WHEN 'comfyui_reference_preview' THEN 1 WHEN 'caption_asset' THEN 2 ELSE 3 END,j.id LIMIT 1"); if(job){const claimed=run("UPDATE jobs SET state='läuft',started_at=?,worker_id=? WHERE id=? AND state='wartet'",now(),workerId,job.id);if(!claimed.changes){job=null;}else if(job.shot_id){run("UPDATE shots SET status='läuft' WHERE id=?",job.shot_id);}} db.exec('COMMIT'); } catch(error){db.exec('ROLLBACK');throw error;} if(!job)return json(res,204,{}); if(job.kind==='comfyui_reference_preview'){const asset=row('SELECT id,name,kind,summary,visual_notes FROM assets WHERE id=?',job.asset_id);if(!asset){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset fehlt.',now(),job.id);return json(res,409,{error:'Das zugehörige Asset fehlt.'});}return json(res,200,{job,asset,prompt:job.detail});} if(job.kind==='caption_asset'){const asset=row('SELECT id,name,kind,summary,visual_notes,file_path FROM assets WHERE id=?',job.asset_id);if(!asset||!asset.file_path){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset oder Foto fehlt.',now(),job.id);return json(res,409,{error:'Das zugehörige Asset oder Foto fehlt.'});}return json(res,200,{job,asset,downloadUrl:`/api/worker/assets/${asset.id}/file`});} const shot=row('SELECT * FROM shots WHERE id=?',job.shot_id); if(!shot){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Der zugehörige Shot fehlt.',now(),job.id);return json(res,409,{error:'Der zugehörige Shot fehlt.'});} const references=rows('SELECT a.id,a.name,a.kind,a.summary,a.visual_notes,a.file_path,sa.role FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id WHERE sa.shot_id=? ORDER BY CASE sa.role WHEN \'reference\' THEN 1 ELSE 2 END,a.id',shot.id).filter(a=>a.file_path).map(a=>({...a,file_path:undefined,downloadUrl:`/api/worker/assets/${a.id}/file`})); const source=shot.source_image_path?{name:'Shot-Startbild',kind:'source',role:'source',downloadUrl:`/api/worker/shots/${shot.id}/source`}:null; return json(res,200,{job,shot:{...shot,source_image_path:undefined,output_video_path:undefined,references:source?[source,...references]:references}}); }
+    if (path === '/api/worker/next' && req.method === 'GET') {
+      if (!workerGuard(req,res)) return;
+      const workerId=String(req.headers['x-framecut-worker-id']||'laptop').slice(0,80);
+      run('INSERT INTO workers(id,last_seen,first_seen) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen', workerId, now(), now());
+      db.exec('BEGIN IMMEDIATE');
+      let job;
+      try {
+        recoverQueuedReferenceGaps();
+        job=row(`SELECT j.*,e.project_id,e.number episode_number,e.title episode_title,p.title project_title,
+          COALESCE(e.style_profile,p.style_profile) style_profile,
+          COALESCE(e.video_steps,p.video_steps) video_steps,COALESCE(e.photo_steps,p.photo_steps) photo_steps,
+          COALESCE(e.preview_width,p.preview_width) preview_width,COALESCE(e.preview_height,p.preview_height) preview_height,
+          COALESCE(e.final_width,p.final_width) final_width,COALESCE(e.final_height,p.final_height) final_height
+          FROM jobs j JOIN episodes e ON e.id=j.episode_id JOIN projects p ON p.id=e.project_id
+          WHERE j.state='wartet' AND j.kind IN ('comfyui_reference_preview','caption_asset','minimax_h3')
+            AND (j.kind<>'minimax_h3' OR NOT EXISTS (
+              SELECT 1 FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id
+              WHERE sa.shot_id=j.shot_id AND (a.file_path IS NULL OR a.file_path='')
+            ))
+          ORDER BY CASE j.kind WHEN 'comfyui_reference_preview' THEN 1 WHEN 'caption_asset' THEN 2 ELSE 3 END,j.id LIMIT 1`);
+        if(job){
+          const claimed=run("UPDATE jobs SET state='läuft',started_at=?,worker_id=? WHERE id=? AND state='wartet'",now(),workerId,job.id);
+          if(!claimed.changes) job=null;
+          else if(job.shot_id) run("UPDATE shots SET status='läuft' WHERE id=?",job.shot_id);
+        }
+        db.exec('COMMIT');
+      } catch(error) { db.exec('ROLLBACK'); throw error; }
+      if(!job) return json(res,204,{});
+      if(job.kind==='comfyui_reference_preview'){
+        const asset=row('SELECT id,name,kind,summary,visual_notes FROM assets WHERE id=?',job.asset_id);
+        if(!asset){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset fehlt.',now(),job.id);return json(res,409,{error:'Das zugehörige Asset fehlt.'});}
+        return json(res,200,{job,asset,prompt:job.detail});
+      }
+      if(job.kind==='caption_asset'){
+        const asset=row('SELECT id,name,kind,summary,visual_notes,file_path FROM assets WHERE id=?',job.asset_id);
+        if(!asset||!asset.file_path){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset oder Foto fehlt.',now(),job.id);return json(res,409,{error:'Das zugehörige Asset oder Foto fehlt.'});}
+        return json(res,200,{job,asset,downloadUrl:`/api/worker/assets/${asset.id}/file`});
+      }
+      const shot=row('SELECT * FROM shots WHERE id=?',job.shot_id);
+      if(!shot){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Der zugehörige Shot fehlt.',now(),job.id);return json(res,409,{error:'Der zugehörige Shot fehlt.'});}
+      const references=rows("SELECT a.id,a.name,a.kind,a.summary,a.visual_notes,a.file_path,sa.role FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id WHERE sa.shot_id=? ORDER BY CASE sa.role WHEN 'reference' THEN 1 ELSE 2 END,a.id",shot.id)
+        .filter(a=>a.file_path).map(a=>({...a,file_path:undefined,downloadUrl:`/api/worker/assets/${a.id}/file`}));
+      const source=shot.source_image_path?{name:'Shot-Startbild',kind:'source',role:'source',downloadUrl:`/api/worker/shots/${shot.id}/source`}:null;
+      return json(res,200,{job,shot:{...shot,source_image_path:undefined,output_video_path:undefined,references:source?[source,...references]:references}});
+    }
     if (/^\/api\/worker\/jobs\/\d+\/image$/.test(path) && req.method === 'POST') { if(!workerGuard(req,res))return; const id=Number(path.split('/')[4]),job=row('SELECT * FROM jobs WHERE id=?',id),d=await body(req,9_000_000); if(!job?.asset_id)return json(res,404,{error:'Bildauftrag nicht gefunden.'}); const match=String(d.data||'').match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/); if(!match)return json(res,400,{error:'Bilddaten sind ungültig.'}); const bytes=Buffer.from(match[2],'base64');if(bytes.length>6*1024*1024)return json(res,400,{error:'Vorschaubild ist größer als 6 MB.'});await mkdir(UPLOADS,{recursive:true});const ext=match[1]==='image/png'?'png':match[1]==='image/webp'?'webp':'jpg',file=`worker-${id}-${randomBytes(5).toString('hex')}.${ext}`;await writeFile(join(UPLOADS,file),bytes);const portable=`data/uploads/${file}`;run('UPDATE assets SET file_path=? WHERE id=?',portable,job.asset_id);run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?",'Referenzbild lokal erzeugt und hochgeladen.',now(),id);event('Referenzbild fertig',`Job ${id} · Benutzer ${job.owner_id||'unbekannt'}`);return json(res,201,{ok:true,path:portable}); }
     if (/^\/api\/worker\/jobs\/\d+\/caption$/.test(path) && req.method === 'POST') {
       if (!workerGuard(req, res)) return;
