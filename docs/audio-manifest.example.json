@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "owner_id": "owner-example",
+  "project_id": "project-example",
+  "episode_id": "episode-example",
+  "timeline": {
+    "duration_ms": 10000,
+    "sample_rate_hz": 48000,
+    "channels": 2
+  },
+  "cues": [
+    {
+      "id": "cue-narration-01",
+      "kind": "narration",
+      "state": "ready",
+      "start_ms": 500,
+      "target_duration_ms": 1800,
+      "gain_db": 0,
+      "speaker_role": "narrator",
+      "text": "A short example narration.",
+      "source_job_id": "job-tts-01",
+      "artifact": {
+        "path": "audio/cues/cue-narration-01.wav"
+      }
+    },
+    {
+      "id": "cue-ambience-01",
+      "kind": "ambience",
+      "state": "pending",
+      "start_ms": 0,
+      "target_duration_ms": 10000,
+      "gain_db": -18,
+      "prompt": "Subtle indoor room tone without speech."
+    }
+  ]
+}
