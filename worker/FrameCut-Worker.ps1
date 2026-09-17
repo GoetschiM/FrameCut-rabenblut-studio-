@@ -228,11 +228,11 @@ function Process-Job($payload) {
   # differently ("the narrator" instead of "Michel") - that silently broke character
   # consistency whenever the wording did not match the asset name exactly.
   $keyframeRefs=@($allRefs|Sort-Object @{Expression={if($shot.prompt -match [regex]::Escape($_.name)){0}else{1}}},@{Expression={[int]$_.id}}|Select-Object -First 3)
-  # Characters AND distinctive props (the Tesla, a laptop, a jacket) both need their real
-  # photo handed to the renderer - otherwise the model invents a different car every shot.
-  # Locations are environment rather than identity, so they stay out of the reference set.
-  $identityRefs=@($keyframeRefs|Where-Object {$_.kind -eq 'character' -or $_.kind -eq 'prop'}|Select-Object -First 3)
-  $assetText=if ($keyframeRefs.Count -gt 0) { ($keyframeRefs|ForEach-Object {"$($_.name): $($_.visual_notes)"}) -join ' | ' } else { 'None' }
+  # Every explicitly linked production asset participates in continuity. Characters and
+  # props stabilize identity; location anchors keep a recurring world from drifting.
+  # The generated shot-start frame already carries composition, so do not re-download it.
+  $visualRefs=@($keyframeRefs|Where-Object {$_.kind -ne 'source'}|Select-Object -First 3)
+  $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {"$($_.name): $($_.visual_notes)"}) -join ' | ' } else { 'None' }
   $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage. Opening instant of this exact shot: {0}. Camera: {1}. Continuity metadata only (do not visualize biography, occupations or props unless the shot action explicitly asks for them): {2}. Show only the subjects and objects required by the stated action. Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {3}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout." -f $shot.prompt,$shot.camera,$assetText,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
   $approvedKeyframe=Join-Path $runtimeRoot ("approved-keyframes\shot-{0}.png" -f [int]$shot.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
@@ -244,7 +244,7 @@ function Process-Job($payload) {
   }
   Copy-Item -LiteralPath $sceneKeyframe -Destination (Join-Path $jobRoot 'scene-keyframe.png') -Force
   $cleanRefs=@()
-  foreach($item in $identityRefs){
+  foreach($item in $visualRefs){
     $localRef=Join-Path $jobRoot ("identity-{0}" -f [int]$item.id)
     Invoke-WebRequest -Uri ($config.ServerUrl+$item.downloadUrl) -Headers (Headers) -OutFile $localRef
     $cleanRefs+=$localRef
@@ -254,7 +254,7 @@ function Process-Job($payload) {
   Ensure-H3
   $promptFile=Join-Path $jobRoot 'prompt.txt'
   $conditioning='The supplied first frame is the exact full-screen composition and opening moment.'
-  $identityNote=if($cleanRefs.Count -gt 0){' The additional reference images define the exact appearance of the named people and objects - match them precisely and do not invent different faces, hair, clothing or vehicles.'}else{''}
+  $identityNote=if($cleanRefs.Count -gt 0){' The additional reference images define the exact appearance of the named people, objects and environments - preserve those faces, clothing, vehicles, architecture and atmosphere.'}else{''}
   $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change, never add an unrequested person. Project style: {4}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$job.style_profile)
   Set-Content -LiteralPath $promptFile -Value $fullPrompt -Encoding utf8
   $outputDir=Join-Path $runtimeRoot ("outputs-v2\project-{0}\episode-{1}" -f $job.project_id,$job.episode_number);New-Item -ItemType Directory -Force -Path $outputDir|Out-Null

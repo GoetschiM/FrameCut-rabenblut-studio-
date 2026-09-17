@@ -1376,16 +1376,16 @@ const server = http.createServer(async (req, res) => {
       if(!job) return json(res,204,{});
       if(job.kind==='comfyui_reference_preview'){
         const asset=row('SELECT id,name,kind,summary,visual_notes FROM assets WHERE id=?',job.asset_id);
-        if(!asset){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset fehlt.',now(),job.id);return json(res,409,{error:'Das zugehörige Asset fehlt.'});}
+        if(!asset){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset fehlt.',now(),job.id);return json(res,204,{});}
         return json(res,200,{job,asset,prompt:job.detail});
       }
       if(job.kind==='caption_asset'){
         const asset=row('SELECT id,name,kind,summary,visual_notes,file_path FROM assets WHERE id=?',job.asset_id);
-        if(!asset||!asset.file_path){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset oder Foto fehlt.',now(),job.id);return json(res,409,{error:'Das zugehörige Asset oder Foto fehlt.'});}
+        if(!asset||!asset.file_path){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset oder Foto fehlt.',now(),job.id);return json(res,204,{});}
         return json(res,200,{job,asset,downloadUrl:`/api/worker/assets/${asset.id}/file`});
       }
       const shot=row('SELECT * FROM shots WHERE id=?',job.shot_id);
-      if(!shot){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Der zugehörige Shot fehlt.',now(),job.id);return json(res,409,{error:'Der zugehörige Shot fehlt.'});}
+      if(!shot){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Der zugehörige Shot fehlt.',now(),job.id);return json(res,204,{});}
       const references=rows("SELECT a.id,a.name,a.kind,a.summary,a.visual_notes,a.file_path,sa.role FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id WHERE sa.shot_id=? ORDER BY CASE sa.role WHEN 'reference' THEN 1 ELSE 2 END,a.id",shot.id)
         .filter(a=>a.file_path).map(a=>({...a,file_path:undefined,downloadUrl:`/api/worker/assets/${a.id}/file`}));
       const source=shot.source_image_path?{name:'Shot-Startbild',kind:'source',role:'source',downloadUrl:`/api/worker/shots/${shot.id}/source`}:null;
