@@ -1,0 +1,34 @@
+# Runtime data and personal credentials
+worker/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+!*.example
+
+# Generated media and local caches
+outputs/
+uploads/
+exports/
+*.mp4
+*.mov
+*.webm
+*.wav
+*.mp3
+*.png
+*.jpg
+*.jpeg
+*.tar.gz
+
+# Legacy safety copies made on the production container
+*.bak
+*.bak-*
+
+# Dependencies and operating system files
+node_modules/
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db

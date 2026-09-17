@@ -1,0 +1,11 @@
+{
+  "WorkerId": "my-framecut-worker",
+  "ServerUrl": "https://framecut.example.com",
+  "H3Ref": "pinokio://minimax-h3",
+  "ComfyRef": "pinokio://comfyui",
+  "H3Url": "http://127.0.0.1:8188",
+  "ComfyUrl": "http://127.0.0.1:8190",
+  "ComfyAppPath": "C:\\Users\\YOUR_USER\\Documents\\Pinokio\\api\\comfy.git\\app",
+  "FfmpegPath": "C:\\Path\\To\\ffmpeg.exe",
+  "StripAudio": true
+}

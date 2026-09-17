@@ -1,0 +1,15 @@
+{
+  "id": "/",
+  "name": "FrameCut Studio",
+  "short_name": "FrameCut",
+  "description": "Geschichten, Figuren, Szenen und KI-Videoproduktionen planen.",
+  "lang": "de",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#101113",
+  "theme_color": "#101113",
+  "categories": ["photo", "video", "productivity"],
+  "icons": [{"src":"/framecut-icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
+}

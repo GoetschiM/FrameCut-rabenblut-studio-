@@ -1,0 +1,23 @@
+[Unit]
+Description=FrameCut production server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=framecut
+WorkingDirectory=/opt/framecut
+Environment=NODE_ENV=production
+Environment=RABENBLUT_STUDIO_HOST=0.0.0.0
+Environment=RABENBLUT_STUDIO_PORT=4317
+Environment=FRAMECUT_DATA_DIR=/srv/framecut-data
+ExecStart=/usr/bin/node /opt/framecut/server.mjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/srv/framecut-data
+
+[Install]
+WantedBy=multi-user.target
