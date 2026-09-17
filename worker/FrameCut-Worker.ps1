@@ -316,6 +316,10 @@ Write-Host ("Server: {0} | Worker: {1}" -f $config.ServerUrl,$config.WorkerId) -
 try {
   do {
     if(Test-Path -LiteralPath $stopPath){break}
+    # Renew the execution request on every poll. This is intentionally separate from the
+    # permanent AC power-plan setting: either safeguard may be reset by Windows updates
+    # or vendor power-management software, but both together keep a remote render host awake.
+    Set-Awake $true
     try {
       $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)
       if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}else{Process-Job $payload}}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}

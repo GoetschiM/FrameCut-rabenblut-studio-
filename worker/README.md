@@ -4,6 +4,14 @@ Nach der Proxmox-Einrichtung genügt ein Doppelklick auf `FrameCut-Worker.bat` a
 
 Der Worker rendert immer lokal und lädt nur Vorschauen sowie freigegebene Ergebnisse zum Server hoch.
 
+## Betrieb aus der Ferne
+
+Auf dem GPU-Rechner muss im **Netzbetrieb** automatischer Standby und Ruhezustand deaktiviert
+sein. Der Worker erneuert zusätzlich bei jedem Polling-Schritt einen Windows-System-Wakelock.
+Der Bildschirm darf ausgehen und Windows darf den Benutzer sperren: beides beendet den Worker
+nicht. Ein echtes **Abmelden**, ein Neustart oder ein leerer Akku beendet ihn hingegen; dafür ist
+später ein separater, dienstbasierter Worker vorgesehen.
+
 ## Worker auf einem anderen Rechner einrichten (Kollegen-Account)
 
 `worker/data/worker.config.json` kann diese optionalen Felder enthalten, um von den
