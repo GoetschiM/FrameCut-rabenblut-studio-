@@ -233,7 +233,9 @@ function Process-Job($payload) {
   # The generated shot-start frame already carries composition, so do not re-download it.
   $visualRefs=@($keyframeRefs|Where-Object {$_.kind -ne 'source'}|Select-Object -First 3)
   $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {"$($_.name): $($_.visual_notes)"}) -join ' | ' } else { 'None' }
-  $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage. Opening instant of this exact shot: {0}. Camera: {1}. Continuity metadata only (do not visualize biography, occupations or props unless the shot action explicitly asks for them): {2}. Show only the subjects and objects required by the stated action. Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {3}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout." -f $shot.prompt,$shot.camera,$assetText,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
+  $teslaRequested=($shot.prompt -match '(?i)\btesla\b') -or (($visualRefs|Where-Object {$_.name -match '(?i)\btesla\b'}).Count -gt 0)
+  $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'Do not show a Tesla, an electric car or a parked vehicle in this shot.'}
+  $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage. Opening instant of this exact shot: {0}. Camera: {1}. Continuity metadata only (do not visualize biography, occupations or props unless the shot action explicitly asks for them): {2}. Show only the subjects and objects required by the stated action. {3} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {4}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout." -f $shot.prompt,$shot.camera,$assetText,$teslaRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
   $approvedKeyframe=Join-Path $runtimeRoot ("approved-keyframes\shot-{0}.png" -f [int]$shot.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
   if(Test-Path -LiteralPath $approvedKeyframe){
@@ -255,7 +257,7 @@ function Process-Job($payload) {
   $promptFile=Join-Path $jobRoot 'prompt.txt'
   $conditioning='The supplied first frame is the exact full-screen composition and opening moment.'
   $identityNote=if($cleanRefs.Count -gt 0){' The additional reference images define the exact appearance of the named people, objects and environments - preserve those faces, clothing, vehicles, architecture and atmosphere.'}else{''}
-  $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change, never add an unrequested person. Project style: {4}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$job.style_profile)
+  $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change, never add an unrequested person. {4} Project style: {5}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$job.style_profile)
   Set-Content -LiteralPath $promptFile -Value $fullPrompt -Encoding utf8
   $outputDir=Join-Path $runtimeRoot ("outputs-v2\project-{0}\episode-{1}" -f $job.project_id,$job.episode_number);New-Item -ItemType Directory -Force -Path $outputDir|Out-Null
   $frames=5+(17*[Math]::Max(1,[Math]::Round(([Math]::Min(15,[double]$shot.duration_seconds)*24-5)/17)))
@@ -266,8 +268,8 @@ function Process-Job($payload) {
   $videoSteps = if($job.video_steps){[int]$job.video_steps}else{4}
   Write-Host ("Qualitaet: {0} ({1}x{2}, {3} Steps)" -f $shot.render_tier,$renderWidth,$renderHeight,$videoSteps) -ForegroundColor DarkCyan
   $renderArgs=@($renderClient,'--base-url',$config.H3Url,'--image',(Join-Path $jobRoot 'scene-keyframe.png'),'--prompt-file',$promptFile,'--output-dir',$outputDir,'--name',$name,'--width',[string]$renderWidth,'--height',[string]$renderHeight,'--frames',[string]$frames,'--steps',[string]$videoSteps,'--seed',[string]([int]$shot.seed),'--low-vram')
-  # Hand the linked character/prop photos to the model. Without these the renderer only ever
-  # saw the text prompt, which is why faces and vehicles drifted between shots.
+  # Hand every explicitly linked production reference to the model, preventing faces,
+  # vehicles and recurring locations from drifting between shots.
   foreach($refPath in $cleanRefs){ $renderArgs += @('--reference-image',$refPath) }
   if($cleanRefs.Count -gt 0){ Write-Host ("Referenzbilder: {0}" -f $cleanRefs.Count) -ForegroundColor DarkCyan }
   & python @renderArgs
