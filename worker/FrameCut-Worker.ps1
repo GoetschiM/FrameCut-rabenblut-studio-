@@ -61,26 +61,61 @@ function Report-Job([int]$Id,[string]$Action,[string]$Detail,[string]$OutputPath
   $payload=@{detail=$Detail}; if($OutputPath){$payload.outputPath=$OutputPath}
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$Id/$Action" -Headers (Headers) -ContentType 'application/json' -Body ($payload|ConvertTo-Json) | Out-Null
 }
-function Ensure-H3 {
-  $status = $null
-  try { $status = (& $pterm status $config.H3Ref --probe | ConvertFrom-Json) } catch {}
-  if ($status.ready) { return }
-  Write-Host 'MiniMax H3 wird ueber Pinokio gestartet ...' -ForegroundColor Cyan
-  # pterm run has no built-in timeout and can hang indefinitely (e.g. if Pinokio itself
-  # is wedged) with zero error, silently freezing the whole worker loop. Bound it.
-  $startJob = Start-Job -ScriptBlock { param($ptermPath,$ref) & $ptermPath run $ref | Out-Null } -ArgumentList $pterm,$config.H3Ref
-  $finished = Wait-Job -Job $startJob -Timeout 60
-  if (-not $finished) {
-    Stop-Job -Job $startJob -ErrorAction SilentlyContinue
-    Remove-Job -Job $startJob -Force -ErrorAction SilentlyContinue
-    throw 'pterm run (MiniMax H3 Start) hat nach 60 Sekunden nicht reagiert - Pinokio haengt vermutlich fest.'
+function Get-H3Status {
+  try { return (& $pterm status $config.H3Ref --probe | ConvertFrom-Json) } catch { return $null }
+}
+function Invoke-PtermBounded([string]$Action,[int]$TimeoutSeconds=90) {
+  $command=Start-Job -ScriptBlock { param($ptermPath,$verb,$ref) & $ptermPath $verb $ref 2>&1 } -ArgumentList $pterm,$Action,$config.H3Ref
+  $finished=Wait-Job -Job $command -Timeout $TimeoutSeconds
+  if(-not $finished){
+    Stop-Job -Job $command -ErrorAction SilentlyContinue
+    Remove-Job -Job $command -Force -ErrorAction SilentlyContinue
+    return [pscustomobject]@{TimedOut=$true;Output=''}
   }
-  Remove-Job -Job $startJob -Force -ErrorAction SilentlyContinue
-  for($attempt=0;$attempt -lt 60;$attempt++){
+  $output=(Receive-Job -Job $command 2>&1|Out-String).Trim()
+  Remove-Job -Job $command -Force -ErrorAction SilentlyContinue
+  return [pscustomobject]@{TimedOut=$false;Output=$output}
+}
+function Wait-H3Ready([int]$TimeoutSeconds=600) {
+  for($elapsed=0;$elapsed -lt $TimeoutSeconds;$elapsed+=5){
+    $status=Get-H3Status
+    if($status -and $status.ready){return $true}
     Start-Sleep -Seconds 5
-    try {$status=(& $pterm status $config.H3Ref --probe | ConvertFrom-Json);if($status.ready){return}}catch{}
   }
-  throw 'MiniMax H3 wurde nicht innerhalb von fuenf Minuten bereit.'
+  return $false
+}
+function Reset-H3 {
+  Write-Host 'MiniMax H3 wird kontrolliert zurueckgesetzt ...' -ForegroundColor Yellow
+  $stop=Invoke-PtermBounded 'stop' 90
+  if($stop.TimedOut){Write-Host 'pterm stop hat das Timeout erreicht; starte trotzdem einen einzigen frischen H3-Versuch.' -ForegroundColor Yellow}
+  Start-Sleep -Seconds 8
+}
+function Ensure-H3 {
+  $status=Get-H3Status
+  if($status -and $status.ready){return}
+
+  # If Pinokio already owns a startup, wait for that single attempt. Calling `pterm run`
+  # repeatedly here interrupts the loading process and caused the former endless loop.
+  $state=if($status){[string]$status.state}else{''}
+  if($status -and (($status.running -eq $true) -or $state -eq 'starting')){
+    Write-Host 'MiniMax H3 startet bereits; warte ohne zweiten Startversuch ...' -ForegroundColor Cyan
+    if(Wait-H3Ready 600){return}
+    Reset-H3
+  }
+
+  for($attempt=1;$attempt -le 2;$attempt++){
+    Write-Host ("MiniMax H3 wird ueber Pinokio gestartet (Versuch {0}/2) ..." -f $attempt) -ForegroundColor Cyan
+    $start=Invoke-PtermBounded 'run' 90
+    if($start.TimedOut){
+      Write-Host 'pterm run hat das Timeout erreicht.' -ForegroundColor Yellow
+      if($attempt -lt 2){Reset-H3;continue}
+      break
+    }
+    if(Wait-H3Ready 600){return}
+    Write-Host 'MiniMax H3 wurde nicht rechtzeitig bereit.' -ForegroundColor Yellow
+    if($attempt -lt 2){Reset-H3}
+  }
+  throw 'MiniMax H3 konnte nach einem kontrollierten Reset nicht gestartet werden.'
 }
 function Free-Models([string]$Url) {
   try { Invoke-RestMethod -Method Post -Uri "$Url/free" -ContentType 'application/json' -Body '{"unload_models":true,"free_memory":true}' | Out-Null } catch {}
