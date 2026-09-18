@@ -338,7 +338,10 @@ function Process-Job($payload) {
   $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change. Show exactly one instance of each named character unless the stated action explicitly requires more; never add, clone, replace or merge people. {4} {5} Project style: {6}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$negativeRule,$job.style_profile)
   Set-Content -LiteralPath $promptFile -Value $fullPrompt -Encoding utf8
   $outputDir=Join-Path $runtimeRoot ("outputs-v2\project-{0}\episode-{1}" -f $job.project_id,$job.episode_number);New-Item -ItemType Directory -Force -Path $outputDir|Out-Null
-  $frames=5+(17*[Math]::Max(1,[Math]::Round(([Math]::Min(15,[double]$shot.duration_seconds)*24-5)/17)))
+  # H3 only accepts 5 + 17n frames. Round() created clips shorter than the authored shot
+  # (for example 4.0s became 3.75s). Ceiling keeps the production timeline conservative:
+  # a requested duration is never silently cut short, and ffprobe records the true value.
+  $frames=5+(17*[Math]::Max(1,[Math]::Ceiling(([Math]::Min(15,[double]$shot.duration_seconds)*24-5)/17)))
   $name=("shot-{0:d3}-job-{1}" -f [int]$shot.sequence,[int]$job.id)
   $isPreview = $shot.render_tier -eq 'Vorschau'
   $renderWidth = if ($isPreview) { if($job.preview_width){[int]$job.preview_width}else{384} } else { if($job.final_width){[int]$job.final_width}else{768} }
