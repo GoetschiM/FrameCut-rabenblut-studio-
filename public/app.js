@@ -310,6 +310,7 @@ function render() {
       <summary style="cursor:pointer;color:var(--text-dim);font-size:12px;font-family:var(--font-mono);">⚙️ Nur für diese Episode: Stil & Qualität überschreiben (sonst gilt der Projekt-Standard)</summary>
       <form id="episode-settings-form" style="margin-top:12px;padding:14px;background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);">
         <label>Style-Prompt für diese Episode<textarea name="styleProfile" placeholder="Leer lassen = Projekt-Stil übernehmen">${esc(episode.style_profile || '')}</textarea></label>
+        <label>Negativ-Prompt für diese Episode<textarea name="negativePrompt" maxlength="2400" placeholder="Leer lassen = Projekt-Negativ-Prompt übernehmen">${esc(episode.negative_prompt || '')}</textarea><small>Zusätzliche Ausschlüsse für Keyframes und Videos, z. B. keine Schrift oder keine Fahrzeuge.</small></label>
         <div class="shot-modal-grid">
           <label>Foto-Steps<input name="photoSteps" type="number" min="1" max="40" placeholder="Projekt: ${project.photo_steps ?? 8}" value="${episode.photo_steps ?? ''}"></label>
           <label>Video-Steps<input name="videoSteps" type="number" min="1" max="40" placeholder="Projekt: ${project.video_steps ?? 4}" value="${episode.video_steps ?? ''}"></label>
@@ -826,7 +827,7 @@ function bindDynamic() {
   if (episodeSettingsReset) episodeSettingsReset.onclick = async () => {
     if (!confirm('Alle Episode-Überschreibungen entfernen? Diese Episode nutzt danach wieder die Projekt-Standardwerte.')) return;
     try {
-      await api(`/api/episodes/${currentEpisode}/settings`, { method: 'PATCH', body: JSON.stringify({ styleProfile: '', videoSteps: '', photoSteps: '', previewWidth: '', previewHeight: '', finalWidth: '', finalHeight: '' }) });
+      await api(`/api/episodes/${currentEpisode}/settings`, { method: 'PATCH', body: JSON.stringify({ styleProfile: '', negativePrompt: '', videoSteps: '', photoSteps: '', previewWidth: '', previewHeight: '', finalWidth: '', finalHeight: '' }) });
       await load();
       notice('Auf Projekt-Standard zurückgesetzt.');
     } catch (err) { notice(`Fehler: ${err.message}`); }
@@ -872,7 +873,39 @@ let queuePollHandle = null;
 
 function queueRowLabel(item) {
   const place = [item.project_title, item.episode_title ? `EP ${String(item.episode_number).padStart(2, '0')} · ${item.episode_title}` : null].filter(Boolean).join(' · ');
-  return place || item.label;
+  return item.label || place || 'Unbenannter Renderauftrag';
+}
+
+function queueRowContext(item) {
+  return [item.project_title, item.episode_title ? `EP ${String(item.episode_number).padStart(2, '0')} · ${item.episode_title}` : null].filter(Boolean).join(' · ');
+}
+
+function renderJobPhase(item) {
+  if (item.kind === 'comfyui_reference_preview') {
+    return {
+      label: 'Referenzbild',
+      text: item.state === 'läuft'
+        ? 'ComfyUI erzeugt gerade das Referenzbild für eine konsistente Szene.'
+        : 'Wird vor dem Video gerendert, damit Figuren und Orte wiedererkennbar bleiben.',
+    };
+  }
+  if (item.kind === 'caption_asset') {
+    return {
+      label: 'Bildanalyse',
+      text: item.state === 'läuft'
+        ? 'Die Referenz wird analysiert und als nutzbarer Bildprompt beschrieben.'
+        : 'Wird vor der Szenenplanung in die Materialbibliothek übernommen.',
+    };
+  }
+  if (item.kind === 'minimax_h3') {
+    return {
+      label: 'Video',
+      text: item.state === 'läuft'
+        ? 'Der Worker bereitet Schlüsselbild und MiniMax-H3-Clip nacheinander vor. Der erste Keyframe nach einem Modellstart kann einige Minuten dauern.'
+        : 'Startet automatisch, sobald alle verknüpften Referenzbilder fertig sind und die GPU frei ist.',
+    };
+  }
+  return { label: 'Auftrag', text: item.state === 'läuft' ? 'Der lokale Worker verarbeitet diesen Auftrag.' : 'Wartet auf den lokalen Worker.' };
 }
 
 function formatEta(seconds) {
@@ -926,7 +959,7 @@ async function pollQueueStatus() {
   const el = $('#queue-status');
   if (!el) return;
   try {
-    const { queue, avgSeconds, worker } = await api('/api/queue');
+    const { queue, avgSeconds, worker, runningCount = 0, waitingCount = 0 } = await api('/api/queue');
     toggleStopButtons(queue.length > 0);
     updateWorkerPill(worker, queue.length);
     if (!queue.length) { el.innerHTML = ''; return; }
@@ -936,28 +969,61 @@ async function pollQueueStatus() {
           ${worker.secondsSinceSeen !== null ? `Zuletzt gesehen vor ${formatEta(worker.secondsSinceSeen) || 'wenigen Sekunden'}.` : 'Es hat sich noch nie ein Worker gemeldet.'}
         </div>`
       : '';
+    const activeJob = queue.find(item => item.state === 'läuft');
+    const activePhase = activeJob ? renderJobPhase(activeJob) : null;
     el.innerHTML = `
-      <div class="panel" style="margin-bottom:18px;padding:14px 16px;">
-        <div style="font-size:11px;font-weight:700;letter-spacing:0.06em;color:var(--text-dim);margin-bottom:10px;">GEMEINSAME RENDER-WARTESCHLANGE${avgSeconds ? ` · ⌀ ${formatEta(avgSeconds)} pro Shot` : ''}</div>
+      <section class="render-queue-panel" aria-live="polite" aria-label="Renderstatus">
+        <div class="render-queue-heading">
+          <div>
+            <h3>Renderstatus</h3>
+            <p>Eine GPU verarbeitet immer genau einen Auftrag. Neue Videos bleiben sicher in der Reihenfolge.</p>
+          </div>
+          <div class="render-queue-metrics">
+            <span class="render-metric ${runningCount ? 'is-active' : ''}">${runningCount ? `${runningCount} aktiv` : 'bereit'}</span>
+            <span class="render-metric">${waitingCount} wartet</span>
+          </div>
+        </div>
         ${workerWarning}
+        ${activeJob ? `
+          <div class="render-now">
+            <div class="render-now-indicator"><span class="pulse"></span><span>Jetzt auf der GPU</span></div>
+            <div class="render-now-copy">
+              <strong>${esc(queueRowLabel(activeJob))}</strong>
+              <span>${esc(queueRowContext(activeJob))}</span>
+              <p><b>${esc(activePhase.label)}:</b> ${esc(activePhase.text)}</p>
+            </div>
+            <div class="render-now-time">${formatElapsed(activeJob.started_at, avgSeconds).text}</div>
+          </div>
+        ` : `
+          <div class="render-idle-note">Der Worker ist verbunden und übernimmt den nächsten Auftrag automatisch.</div>
+        `}
+        <div class="render-queue-list" aria-label="Wartende und laufende Aufträge">
         ${queue.map(item => {
           const running = item.state === 'läuft';
           const elapsed = running ? formatElapsed(item.started_at, avgSeconds) : null;
+          const phase = renderJobPhase(item);
           return `
-          <div style="display:flex;align-items:center;gap:10px;padding:6px 0;font-size:13px;border-top:1px solid var(--line);">
+          <div class="render-queue-row ${running ? 'is-running' : ''}">
             ${running
               ? '<span class="shot-badge running" style="position:static;"><span class="pulse" style="width:6px;height:6px;margin:0;"></span> RENDERT</span>'
               : `<span class="shot-badge queued" style="position:static;">#${item.position}</span>`}
-            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(queueRowLabel(item))}</span>
-            ${running
-              ? `<span style="font-family:var(--font-mono);${elapsed.overdue ? 'color:#ffc107;' : 'color:var(--text-dim);'}">${elapsed.overdue ? '⚠️ ' : ''}${elapsed.text}</span>`
-              : (item.etaSeconds ? `<span style="color:var(--text-dim);font-family:var(--font-mono);">${formatEta(item.etaSeconds)}</span>` : '')}
-            <span style="color:var(--text-dim);">${esc(item.owner_display_name || item.owner_username || 'unbekannt')}</span>
-            <button onclick="cancelQueueItem(${item.id})" title="Diesen Auftrag abbrechen" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:16px;line-height:1;padding:2px 4px;">×</button>
+            <div class="render-queue-item-copy">
+              <strong>${esc(queueRowLabel(item))}</strong>
+              <span>${esc(phase.label)} · ${esc(queueRowContext(item) || 'Projekt wird zugeordnet')}</span>
+            </div>
+            <div class="render-queue-eta">
+              ${running
+                ? `<span class="${elapsed.overdue ? 'is-overdue' : ''}">${elapsed.overdue ? 'Prüfe Laufzeit · ' : ''}${elapsed.text}</span>`
+                : (item.etaSeconds ? `<span>frühestens ${formatEta(item.etaSeconds)}</span>` : '<span>wartet auf GPU</span>')}
+              <small>${esc(item.owner_display_name || item.owner_username || 'unbekannt')}</small>
+            </div>
+            <button class="render-queue-cancel" onclick="cancelQueueItem(${item.id})" title="Diesen Auftrag abbrechen" aria-label="${esc(queueRowLabel(item))} abbrechen">×</button>
           </div>
         `;
         }).join('')}
-      </div>
+        </div>
+        ${avgSeconds ? `<p class="render-queue-footnote">Vergleichswert: durchschnittlich ${formatEta(avgSeconds)} pro fertigem Video. Referenzbilder und ein frischer Modellstart können länger dauern.</p>` : '<p class="render-queue-footnote">Nach den ersten fertigen Videos zeigt FrameCut hier eine realistische durchschnittliche Dauer.</p>'}
+      </section>
     `;
   } catch (e) { /* transient — keep the last known state on screen */ }
 }
