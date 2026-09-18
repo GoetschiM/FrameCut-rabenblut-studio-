@@ -263,6 +263,9 @@ function Process-Job($payload) {
   $job=$payload.job; $shot=$payload.shot
   Write-Host ("Job {0}: {1} / {2} / Shot {3:00} - {4}" -f $job.id,$job.project_title,$job.episode_title,$shot.sequence,$shot.title) -ForegroundColor Green
   if(-not $shot.prompt){throw 'Dieser Shot hat keinen Video-Prompt.'}
+  # H3 and the image worker share the 8 GB GPU. Explicitly evict any H3 model before
+  # the Z-Image keyframe load; otherwise ComfyUI can remain queued behind stale VRAM.
+  Free-Models $config.H3Url
   Free-Models $config.ComfyUrl
   $jobRoot=Join-Path $runtimeRoot ("jobs\{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $jobRoot|Out-Null
   $allRefs=@($shot.references|Where-Object {$_.role -ne 'style'})
