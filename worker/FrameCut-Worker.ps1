@@ -186,6 +186,26 @@ function Invoke-ZImage([string]$Prompt,[string]$Prefix,[int]$Seed,[int]$Steps=12
   if(-not $result){throw "ComfyUI meldete Erfolg, aber $leaf wurde nicht gefunden."}
   return $result.FullName
 }
+function Invoke-BoundedPython([string[]]$Arguments,[int]$TimeoutSeconds,[string]$Operation) {
+  $pythonExe=(Get-Command python -ErrorAction Stop).Source
+  $task=Start-Job -ScriptBlock {
+    param($exe,$childArgs)
+    & $exe @childArgs
+    [pscustomobject]@{FrameCutExitCode=[int]$LASTEXITCODE}
+  } -ArgumentList $pythonExe,(,$Arguments)
+  try {
+    if(-not (Wait-Job -Job $task -Timeout $TimeoutSeconds)) {
+      Stop-Job -Job $task -ErrorAction SilentlyContinue
+      throw "$Operation hat das Zeitlimit von $TimeoutSeconds Sekunden überschritten und wurde beendet."
+    }
+    $items=@(Receive-Job -Job $task)
+    $result=@($items|Where-Object {$_.PSObject.Properties.Name -contains 'FrameCutExitCode'}|Select-Object -Last 1)
+    $items|Where-Object {$_.PSObject.Properties.Name -notcontains 'FrameCutExitCode'}|ForEach-Object {Write-Host $_}
+    if(-not $result -or $result[0].FrameCutExitCode -ne 0){throw "$Operation wurde mit Code $($result[0].FrameCutExitCode) beendet."}
+  } finally {
+    Remove-Job -Job $task -Force -ErrorAction SilentlyContinue
+  }
+}
 function Get-CleanReference($Reference) {
   $cacheDir=Join-Path $runtimeRoot 'clean-references'
   New-Item -ItemType Directory -Force -Path $cacheDir|Out-Null
@@ -300,8 +320,8 @@ function Process-Job($payload) {
   # vehicles and recurring locations from drifting between shots.
   foreach($refPath in $cleanRefs){ $renderArgs += @('--reference-image',$refPath) }
   if($cleanRefs.Count -gt 0){ Write-Host ("Referenzbilder: {0}" -f $cleanRefs.Count) -ForegroundColor DarkCyan }
-  & python @renderArgs
-  if($LASTEXITCODE -ne 0){throw "MiniMax H3 wurde mit Code $LASTEXITCODE beendet."}
+  $renderTimeout=if($config.RenderTimeoutSeconds){[Math]::Max(300,[int]$config.RenderTimeoutSeconds)}else{1800}
+  Invoke-BoundedPython $renderArgs $renderTimeout 'MiniMax H3'
   $result=Get-ChildItem -LiteralPath $outputDir -Filter "$name*.mp4"|Sort-Object LastWriteTime -Descending|Select-Object -First 1
   if(-not $result){throw 'MiniMax H3 meldete Erfolg, aber es wurde keine MP4-Datei gefunden.'}
   # The model always generates an audio track and its speech/music output is unusable, so the
