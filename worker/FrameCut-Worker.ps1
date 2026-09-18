@@ -25,6 +25,11 @@ $qwenAppPath = if ($config.QwenTtsAppPath) { $config.QwenTtsAppPath } else { Joi
 $qwenPythonExe = if ($config.QwenTtsPythonPath) { $config.QwenTtsPythonPath } else { Join-Path $qwenAppPath 'venv\Scripts\python.exe' }
 $qwenClient = Join-Path $workerRoot 'framecut_qwen_tts.py'
 $qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '1.7B' }
+$stableAudioClient = Join-Path $workerRoot 'framecut_stable_audio.py'
+$stableAudioPython = if ($config.StableAudioPythonPath) { $config.StableAudioPythonPath } else { $qwenPythonExe }
+$stableAudioMusicUrl = if ($config.StableAudioMusicUrl) { [string]$config.StableAudioMusicUrl } else { '' }
+$stableAudioSfxUrl = if ($config.StableAudioSfxUrl) { [string]$config.StableAudioSfxUrl } else { '' }
+$stableAudioTimeout = if ($config.StableAudioTimeoutSeconds) { [Math]::Max(120, [int]$config.StableAudioTimeoutSeconds) } else { 1800 }
 $jobWorkspaceRoot = Join-Path $runtimeRoot 'jobs'
 # Working folders only contain copies, logs and intermediate render results. They are
 # deliberately separate from approved keyframes and central project media, which must
@@ -106,6 +111,7 @@ function Get-JobWorkspace($Job) {
   switch ([string]$Job.kind) {
     'caption_asset' { return Join-Path $jobWorkspaceRoot ("caption-{0}" -f $Job.id) }
     'audio_preview' { return Join-Path $jobWorkspaceRoot ("audio-preview-{0}" -f $Job.id) }
+    'audio_cue' { return Join-Path $jobWorkspaceRoot ("audio-cue-{0}" -f $Job.id) }
     'audio_mix' { return Join-Path $jobWorkspaceRoot ("audio-mix-{0}" -f $Job.id) }
     'minimax_h3' { return Join-Path $jobWorkspaceRoot ([string]$Job.id) }
     default { return $null }
@@ -376,6 +382,44 @@ function Invoke-QwenSpeech([array]$SpeechJobs,[string]$JobRoot) {
   if(-not $jsonLine){throw "Qwen3-TTS lieferte kein Ergebnis. $stdout $stderr"}
   return $jsonLine|ConvertFrom-Json
 }
+function Invoke-StableAudioCue($Cue,[string]$JobRoot) {
+  if (-not (Test-Path -LiteralPath $stableAudioClient)) { throw 'FrameCut Stable-Audio-Adapter fehlt.' }
+  if (-not (Test-Path -LiteralPath $stableAudioPython)) { throw "Stable-Audio Python-Umgebung fehlt: $stableAudioPython" }
+  $baseUrl = if ($Cue.kind -eq 'music') { $stableAudioMusicUrl } else { $stableAudioSfxUrl }
+  if (-not $baseUrl) {
+    $needed = if ($Cue.kind -eq 'music') { 'StableAudioMusicUrl' } else { 'StableAudioSfxUrl' }
+    throw "Stable Audio 3 ist für $($Cue.kind) nicht eingerichtet. Setze $needed im Worker-Setup; die Audio-Spur wurde nicht stillschweigend übersprungen."
+  }
+  $spec = Join-Path $JobRoot 'stable-audio-cue.json'
+  $output = Join-Path $JobRoot 'generated-audio.wav'
+  @{prompt=[string]$Cue.prompt;duration_seconds=[Math]::Max(1,[Math]::Ceiling(([double]$Cue.target_duration_ms)/1000));output=$output}|ConvertTo-Json -Compress|Set-Content -LiteralPath $spec -Encoding utf8
+  $stdout = Join-Path $JobRoot 'stable-audio-stdout.log'; $stderr = Join-Path $JobRoot 'stable-audio-stderr.log'
+  $argLine="`"$stableAudioClient`" --base-url `"$baseUrl`" --spec `"$spec`""
+  Write-Host ("Stable Audio 3 erzeugt {0} ({1}s) ..." -f $Cue.kind,([Math]::Ceiling(([double]$Cue.target_duration_ms)/1000))) -ForegroundColor Cyan
+  $proc=Start-Process -FilePath $stableAudioPython -ArgumentList $argLine -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru
+  if(-not $proc.WaitForExit($stableAudioTimeout*1000)){Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue;throw "Stable Audio 3 hat das Zeitlimit von $stableAudioTimeout Sekunden überschritten."}
+  $stderrText=if(Test-Path $stderr){(Get-Content $stderr -Raw).Trim()}else{''}
+  if($proc.ExitCode -ne 0 -or -not(Test-Path -LiteralPath $output)){throw "Stable Audio 3 fehlgeschlagen (Code $($proc.ExitCode)). $stderrText"}
+  return $output
+}
+function Process-AudioCueJob($payload) {
+  $job=$payload.job;$cue=$payload.cue;$root=Join-Path $runtimeRoot ("jobs\audio-cue-{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $root|Out-Null
+  if(-not $ffmpegExe){throw 'ffmpeg fehlt; Audio-Spuren können nicht auf den Produktionsstandard normalisiert werden.'}
+  Free-Models $config.ComfyUrl;Free-Models $config.H3Url
+  if($cue.kind -eq 'dialogue' -or $cue.kind -eq 'narration') {
+    $raw=Join-Path $root 'speech-raw.wav'
+    [void](Invoke-QwenSpeech @([pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;language=$cue.language;output=$raw}) $root)
+  } elseif($cue.kind -eq 'sfx' -or $cue.kind -eq 'music' -or $cue.kind -eq 'ambience') {
+    $raw=Invoke-StableAudioCue $cue $root
+  } else { throw "Unbekannter Audio-Cue-Typ: $($cue.kind)" }
+  if(-not (Test-Path -LiteralPath $raw)){throw 'Die Audio-Engine meldete Erfolg, aber die WAV-Datei fehlt.'}
+  $normal=Join-Path $root 'audio-ready.wav'
+  & $ffmpegExe -y -loglevel error -i $raw -ar 48000 -ac 2 -c:a pcm_s16le $normal 2>&1|Out-Null
+  if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $normal)){throw 'ffmpeg konnte die Audio-Spur nicht in 48 kHz Stereo normalisieren.'}
+  $headers=Headers;$headers['x-framecut-cue-id']=[string]$cue.id
+  Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-cue" -Headers $headers -ContentType 'audio/wav' -InFile $normal | Out-Null
+  Write-Host ("Audio-Spur fertig: {0}" -f $cue.id) -ForegroundColor Green
+}
 function Process-AudioPreviewJob($payload) {
   $job=$payload.job;$asset=$payload.asset;$root=Join-Path $runtimeRoot ("jobs\audio-preview-{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $root|Out-Null
   Free-Models $config.ComfyUrl;Free-Models $config.H3Url
@@ -396,14 +440,21 @@ function Process-AudioMixJob($payload) {
   Set-Content -LiteralPath $concat -Value ($clipLines -join "`n") -Encoding utf8
   $video=Join-Path $root 'picture-cut.mp4';& $ffmpegExe -y -loglevel error -f concat -safe 0 -i $concat -map 0:v:0 -c:v copy -an $video 2>&1|Out-Null
   if($LASTEXITCODE -ne 0 -or -not(Test-Path $video)){throw 'Der Bildschnitt für den Audio-Mix konnte nicht erstellt werden.'}
-  $speech=@();$index=0
-  foreach($cue in @($payload.audio.manifest.cues|Where-Object {$_.state -ne 'skipped'})){$index++;$speech += [pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;language=$cue.language;output=(Join-Path $root ("cue-{0:d3}.wav" -f $index));start_ms=[int]$cue.start_ms}}
-  if($speech.Count -eq 0){throw 'Für die gewählte Regie sind keine Sprach-Cues aktiv.'}
-  [void](Invoke-QwenSpeech $speech $root)
-  $args=@('-y','-loglevel','error','-i',$video);foreach($cue in $speech){$args += @('-i',$cue.output)}
-  $filters=@("anullsrc=r=48000:cl=stereo,atrim=duration=$([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture))[base]");$labels=@('[base]')
-  for($i=0;$i -lt $speech.Count;$i++){$n=$i+1;$delay=[int]$speech[$i].start_ms;$filters += "[$n:a]adelay=$delay|$delay,aresample=48000[a$n]";$labels += "[a$n]"}
-  $filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[mix]" -f ($labels -join ''),$labels.Count)
+  $tracks=@($payload.audio.manifest.cues|Where-Object {$_.state -eq 'ready' -and $_.artifact.downloadUrl})
+  if($tracks.Count -eq 0){throw 'Keine bestätigten Audio-Spuren zum Mischen vorhanden.'}
+  $index=0;foreach($cue in $tracks){$index++;$cue|Add-Member -NotePropertyName local_path -NotePropertyValue (Join-Path $root ("cue-{0:d3}.wav" -f $index)) -Force;Invoke-WebRequest -Uri ($config.ServerUrl+$cue.artifact.downloadUrl) -Headers (Headers) -OutFile $cue.local_path}
+  $args=@('-y','-loglevel','error','-i',$video);foreach($cue in $tracks){$args += @('-i',$cue.local_path)}
+  $filters=@("anullsrc=r=48000:cl=stereo,atrim=duration=$([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture))[base]")
+  $musicLabels=@();$foregroundLabels=@('[base]')
+  for($i=0;$i -lt $tracks.Count;$i++){
+    $n=$i+1;$cue=$tracks[$i];$delay=[int]$cue.start_ms;$duration=[Math]::Max(1,([double]$cue.target_duration_ms/1000));$gain=if($null -ne $cue.gain_db){[double]$cue.gain_db}else{0}
+    $loop=if($cue.kind -eq 'music' -or $cue.kind -eq 'ambience'){'aloop=loop=-1:size=2147483647,'}else{''}
+    $filters += "[$n:a]aresample=48000,$loop`atrim=duration=$($duration.ToString([Globalization.CultureInfo]::InvariantCulture)),volume=$($gain.ToString([Globalization.CultureInfo]::InvariantCulture)),adelay=$delay|$delay[a$n]"
+    if($cue.kind -eq 'music' -or $cue.kind -eq 'ambience'){$musicLabels += "[a$n]"}else{$foregroundLabels += "[a$n]"}
+  }
+  if($musicLabels.Count -gt 0){$filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[bed]" -f ($musicLabels -join ''),$musicLabels.Count)}
+  $filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[foreground]" -f ($foregroundLabels -join ''),$foregroundLabels.Count)
+  if($musicLabels.Count -gt 0){$filters += '[bed][foreground]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=450[ducked]';$filters += '[ducked][foreground]amix=inputs=2:duration=longest:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[mix]'}else{$filters += '[foreground]loudnorm=I=-16:TP=-1.5:LRA=11[mix]'}
   $master=Join-Path $root 'audio-master.mp4';$args += @('-filter_complex',($filters -join ';'),'-map','0:v:0','-map','[mix]','-c:v','copy','-c:a','aac','-b:a','192k','-t',([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture)),'-movflags','+faststart',$master)
   & $ffmpegExe @args 2>&1|Out-Null
   if($LASTEXITCODE -ne 0 -or -not(Test-Path $master)){throw 'ffmpeg konnte den Stimmen-Mix nicht erstellen.'}
@@ -572,7 +623,7 @@ try {
       Invoke-ExpiredWorkspaceCleanup
       if (Test-WorkerStorageAvailable) {
         $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)
-        if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload};Remove-ConfirmedJobWorkspace $payload.job}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}
+        if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_cue'){Process-AudioCueJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload};Remove-ConfirmedJobWorkspace $payload.job}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}
       }
     } catch {Write-Host ("Verbindung wartet: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow}
     if(-not $Once){for($i=0;$i -lt 10 -and -not (Test-Path -LiteralPath $stopPath);$i++){Start-Sleep -Seconds 1}}

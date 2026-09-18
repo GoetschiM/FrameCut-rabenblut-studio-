@@ -618,9 +618,24 @@ async function refreshAudioPreflight() {
         </div>
       </div>
       <div style="font-size:12px;line-height:1.55;color:${audio.readyForMaster ? 'var(--emerald)' : '#ffca63'};">${audio.readyForMaster ? 'Der Mix-Worker hat alle erforderlichen Cues bestätigt.' : `<b>Noch nicht exportierbar als Audio-Master:</b><ul style="margin:6px 0 0;padding-left:18px;">${blockers}</ul>`}</div>
+      <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:15px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
+          <div><h4 style="margin:0 0 4px;">Spuren auf der Timeline</h4><p style="margin:0;color:var(--text-muted);font-size:12px;line-height:1.45;">Dialoge und Off-Texte kommen aus den Shots. Musik, Atmosphäre und Effekte kannst du gezielt ergänzen. Jede Spur wird separat erzeugt und bleibt vor dem Mix nachvollziehbar.</p></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;"><button type="button" class="ghost" id="audio-add-sfx">SFX / Atmosphäre hinzufügen</button><button type="button" class="ghost" id="audio-add-music">Musik hinzufügen</button></div>
+        </div>
+        <div style="display:grid;gap:8px;margin-top:12px;">
+          ${(audio.manifest?.cues || []).map(c => {
+            const detail = c.kind === 'dialogue' || c.kind === 'narration' ? c.text : c.prompt;
+            const kind = c.kind === 'dialogue' ? 'Dialog' : c.kind === 'narration' ? 'Off / Erzähler' : c.kind === 'music' ? 'Musik' : c.kind === 'ambience' ? 'Atmosphäre' : 'SFX';
+            const state = c.state === 'ready' ? 'fertig' : c.state === 'rendering' ? 'in Queue' : c.state === 'skipped' ? 'übersprungen' : 'offen';
+            return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg-elevated);"><div style="min-width:0;"><b style="font-size:12px;">${esc(kind)} · ${esc(state)}</b><span style="display:block;margin-top:3px;color:var(--text-muted);font-size:12px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(detail || 'Kein Inhalt')}</span><small style="color:var(--text-dim);font-family:var(--font-mono);">${(Number(c.start_ms || 0) / 1000).toFixed(1)}s · ${(Number(c.target_duration_ms || 0) / 1000).toFixed(1)}s · ${Number(c.gain_db || 0).toFixed(1)} dB</small></div><div style="display:flex;gap:6px;align-items:center;">${c.artifact?.path ? `<audio controls preload="none" src="/media/${encodeURIComponent(c.artifact.path)}" style="width:150px;height:30px;"></audio>` : ''}${['music','ambience','sfx'].includes(c.kind) ? `<button type="button" class="ghost" data-delete-audio-cue="${esc(c.id)}">Entfernen</button>` : ''}</div></div>`;
+          }).join('') || '<p style="margin:0;color:var(--text-dim);font-size:12px;">Noch keine Audio-Spuren geplant.</p>'}
+        </div>
+      </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">
-        <button type="button" class="form-button" id="audio-render" ${audio.readyForMaster ? 'disabled' : ''}>Stimmen & Audio-Master rendern</button>
-        <span style="font-size:11px;color:var(--text-dim);align-self:center;">Der Worker erzeugt Sprache lokal mit Qwen TTS und mischt sie auf den Bildschnitt. Musik/SFX bleiben bewusst separate, optionale Layer.</span>
+        <button type="button" class="form-button" id="audio-render-tracks" ${cue.pending ? 'disabled' : ''}>Alle offenen Spuren rendern</button>
+        <button type="button" class="ghost" id="audio-render" ${(!audio.cuesReady || audio.readyForMaster) ? 'disabled' : ''}>Audio-Master mischen</button>
+        <span style="font-size:11px;color:var(--text-dim);align-self:center;">1. Spuren lokal erzeugen · 2. automatisch oder manuell mischen · 3. MP4-Master mit verständlicher Sprache herunterladen.</span>
       </div>
       ${validation ? `<details style="margin-top:10px;font-size:12px;color:#ff8a80;"><summary>Manifest-Fehler anzeigen</summary><ul style="margin:6px 0 0;padding-left:18px;">${validation}</ul></details>` : ''}
     `;
@@ -638,10 +653,35 @@ async function refreshAudioPreflight() {
         await refreshAudioPreflight();
       } catch (err) { notice(`Sprachregie konnte nicht gespeichert werden: ${err.message}`); }
     };
+    const addCue = kind => showModal(`
+      <h3>${kind === 'music' ? 'Musikspur ergänzen' : 'SFX oder Atmosphäre ergänzen'}</h3>
+      <form><label>Audio-Prompt<textarea name="prompt" required placeholder="${kind === 'music' ? 'z. B. instrumentaler, warmer Neo-Noir-Score, keine Stimmen, subtil, für eine durchgehende Filmszene' : 'z. B. leises nächtliches Stadtambiente, vereinzelter Wind, entfernte Schritte, keine Musik, keine Sprache'}"></textarea></label>
+      <div class="shot-modal-grid"><label>Start in Sekunden<input name="startSeconds" type="number" min="0" step="0.1" value="0"></label><label>Dauer in Sekunden<input name="durationSeconds" type="number" min="1" max="120" step="1" value="${kind === 'music' ? Math.min(120, Math.max(10, Math.ceil(Number(audio.manifest?.timeline?.duration_ms || 10000) / 1000))) : 5}"></label></div>
+      <label>Lautstärke in dB<input name="gainDb" type="number" min="-40" max="12" step="0.5" value="${kind === 'music' ? -20 : -8}"></label><p id="modal-error" class="error"></p><button class="form-button">Spur planen</button></form>`, async form => {
+        const values = fields(form), manifest = structuredClone(audio.manifest), start = Math.max(0, Math.round(Number(values.startSeconds || 0) * 1000)), duration = Math.max(1000, Math.round(Number(values.durationSeconds || 1) * 1000));
+        if (start + duration > Number(manifest.timeline.duration_ms)) throw new Error('Die Spur muss innerhalb der Episoden-Timeline liegen.');
+        manifest.cues.push({ id: `${kind}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`, kind, state:'pending', start_ms:start, target_duration_ms:duration, gain_db:Number(values.gainDb || 0), prompt:String(values.prompt || '').trim() });
+        delete manifest.mix;
+        await api(`/api/episodes/${currentEpisode}/audio-manifest`, { method:'POST', body:JSON.stringify({ manifest }) });
+        await load(); notice('Audio-Spur geplant. Sie wird erst nach „Alle offenen Spuren rendern“ erzeugt.');
+      });
+    const addSfx = $('#audio-add-sfx'); if (addSfx) addSfx.onclick = () => addCue('sfx');
+    const addMusic = $('#audio-add-music'); if (addMusic) addMusic.onclick = () => addCue('music');
+    document.querySelectorAll('[data-delete-audio-cue]').forEach(btn => btn.onclick = async () => {
+      if (!confirm('Diese zusätzliche Audio-Spur wirklich aus dem Plan entfernen?')) return;
+      try { const manifest = structuredClone(audio.manifest); manifest.cues = manifest.cues.filter(c => c.id !== btn.dataset.deleteAudioCue); delete manifest.mix; await api(`/api/episodes/${currentEpisode}/audio-manifest`, { method:'POST', body:JSON.stringify({ manifest }) }); await load(); notice('Audio-Spur entfernt.'); } catch (err) { notice(`Audio-Spur konnte nicht entfernt werden: ${err.message}`); }
+    });
+    const renderTracks = $('#audio-render-tracks'); if (renderTracks) renderTracks.onclick = async () => {
+      try {
+        await api(`/api/episodes/${currentEpisode}/audio-cues/render`, { method: 'POST', body: '{}' });
+        notice('Audio-Spuren sind eingereiht. Sprache wird mit Qwen TTS erstellt, Musik/SFX mit Stable Audio 3; nach der letzten Spur wird der Mix automatisch vorbereitet.');
+        await load();
+      } catch (err) { notice(`Audio-Spuren konnten nicht eingereiht werden: ${err.message}`); }
+    };
     const renderAudio = $('#audio-render'); if (renderAudio) renderAudio.onclick = async () => {
       try {
         await api(`/api/episodes/${currentEpisode}/audio-render`, { method: 'POST', body: '{}' });
-        notice('Audio-Mix ist eingereiht. Der Worker erzeugt zuerst die Stimmen und danach den MP4-Master.');
+        notice('Audio-Mix ist eingereiht. Alle bestätigten Spuren werden auf den Bildschnitt gelegt.');
         await load();
       } catch (err) { notice(`Audio-Mix konnte nicht eingereiht werden: ${err.message}`); }
     };

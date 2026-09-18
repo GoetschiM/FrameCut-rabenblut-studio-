@@ -176,6 +176,35 @@ function applyAudioDirection(manifest, settings) {
 function expectedAudioIdentity(account, episode) {
   return { owner_id: `owner-${account.id}`, project_id: `project-${episode.project_id}`, episode_id: `episode-${episode.id}` };
 }
+function saveAudioManifest(episodeId, ownerId, manifest) {
+  run(`INSERT INTO episode_audio_manifests(episode_id,owner_id,manifest_json,updated_at) VALUES (?,?,?,?)
+    ON CONFLICT(episode_id) DO UPDATE SET owner_id=excluded.owner_id,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at`,
+    episodeId, ownerId, JSON.stringify(manifest), now());
+}
+function isSpeechCue(cue) { return cue?.kind === 'dialogue' || cue?.kind === 'narration'; }
+function cueDetail(cue) {
+  return JSON.stringify({ cue_id: String(cue.id), kind: String(cue.kind), text: String(cue.text || ''), prompt: String(cue.prompt || ''), start_ms: Number(cue.start_ms || 0), target_duration_ms: Number(cue.target_duration_ms || 0), gain_db: Number(cue.gain_db || 0), voice_profile_id: String(cue.voice_profile_id || ''), language: String(cue.language || 'German') });
+}
+function queueReadyAudioMix(episodeId, ownerId) {
+  const audio = audioContextForEpisode(episodeId, ownerId);
+  if (!audio?.cuesReady || !audio.manifestValid || !audio.sourceCurrent) return null;
+  const active = row("SELECT id FROM jobs WHERE episode_id=? AND kind='audio_mix' AND state IN ('wartet','läuft')", episodeId);
+  if (active) return active;
+  const created = run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id) VALUES (?,?,?,?,?,?,?)', episodeId, 'audio_mix', 'Audio-Mix · Episode', 'wartet', 'Alle bestätigten Audio-Spuren werden auf den Bildschnitt gemischt.', now(), ownerId);
+  event('Audio-Mix automatisch eingereiht', `Episode ${episodeId}`);
+  return row('SELECT * FROM jobs WHERE id=?', Number(created.lastInsertRowid));
+}
+function srtTimestamp(milliseconds) {
+  const value = Math.max(0, Math.round(Number(milliseconds || 0)));
+  const hours = Math.floor(value / 3600000), minutes = Math.floor(value / 60000) % 60, seconds = Math.floor(value / 1000) % 60, ms = value % 1000;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+function srtFromManifest(manifest) {
+  return (manifest?.cues || []).filter(cue => isSpeechCue(cue) && cue.state === 'ready' && String(cue.text || '').trim()).map((cue, index) => {
+    const end = Math.min(Number(manifest.timeline?.duration_ms || 0), Number(cue.start_ms || 0) + Number(cue.target_duration_ms || 1));
+    return `${index + 1}\n${srtTimestamp(cue.start_ms)} --> ${srtTimestamp(end)}\n${String(cue.text).trim()}\n`;
+  }).join('\n');
+}
 
 // Negative prompts become part of a model request, so keep them bounded and textual.
 // Returning `undefined` lets PATCH routes distinguish "not touched" from "clear it".
@@ -1482,11 +1511,35 @@ const server = http.createServer(async (req, res) => {
       if (manifest.source_revision !== audio.generated.source_revision) {
         return json(res, 409, { error: 'Die Shot-Timeline oder Dialoge wurden verändert. Bitte zuerst einen aktuellen Audio-Plan herunterladen.' });
       }
-      run(`INSERT INTO episode_audio_manifests(episode_id,owner_id,manifest_json,updated_at) VALUES (?,?,?,?)
-        ON CONFLICT(episode_id) DO UPDATE SET owner_id=excluded.owner_id,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at`, episodeId, account.id, JSON.stringify(manifest), now());
+      saveAudioManifest(episodeId, account.id, manifest);
       event('Audio-Plan gespeichert', `${audio.episode.title} · ${manifest.cues.length} Cue(s)`);
       const refreshed = audioContextForEpisode(episodeId, account.id);
       return json(res, 200, { ok: true, source: refreshed.source, updatedAt: refreshed.updatedAt, manifest: refreshed.manifest, cues: refreshed.cues, blockers: refreshed.blockers, readyForMaster: refreshed.readyForMaster });
+    }
+    if (/^\/api\/episodes\/\d+\/audio-cues\/render$/.test(path) && req.method === 'POST') {
+      const account = guard(req, res); if (!account) return;
+      const episodeId = Number(path.split('/')[3]);
+      const audio = audioContextForEpisode(episodeId, account.id);
+      if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      if (!audio.manifestValid || !audio.sourceCurrent) return json(res, 409, { error: 'Der Audio-Plan ist veraltet oder ungültig. Bitte aktualisiere zuerst die Audio-Ansicht.' });
+      const manifest = structuredClone(audio.manifest);
+      const queued = [];
+      for (const cue of manifest.cues) {
+        if (cue.state === 'skipped' || cue.state === 'ready') continue;
+        const valid = isSpeechCue(cue) ? String(cue.text || '').trim() : String(cue.prompt || '').trim();
+        if (!valid) continue;
+        const active = row("SELECT id FROM jobs WHERE episode_id=? AND kind='audio_cue' AND state IN ('wartet','läuft') AND detail LIKE ?", episodeId, `%\"cue_id\":\"${String(cue.id).replaceAll('%', '').replaceAll('_', '')}\"%`);
+        if (active) { cue.state = 'rendering'; continue; }
+        const label = isSpeechCue(cue) ? `Qwen TTS · ${cue.id}` : `Stable Audio · ${cue.kind}: ${cue.id}`;
+        const created = run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id) VALUES (?,?,?,?,?,?,?)', episodeId, 'audio_cue', label, 'wartet', cueDetail(cue), now(), account.id);
+        cue.state = 'rendering';
+        queued.push(Number(created.lastInsertRowid));
+      }
+      if (!queued.length && !manifest.cues.some(cue => cue.state === 'rendering')) return json(res, 400, { error: 'Es gibt keine offenen Audio-Spuren mit Text bzw. Sound-Prompt.' });
+      delete manifest.mix;
+      saveAudioManifest(episodeId, account.id, manifest);
+      event('Audio-Spuren eingereiht', `Episode ${episodeId} · ${queued.length} neue Spur(en)`);
+      return json(res, 201, { ok: true, queued, pending: manifest.cues.filter(cue => cue.state === 'rendering').length });
     }
     if (/^\/api\/episodes\/\d+\/audio-render$/.test(path) && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
@@ -1494,14 +1547,10 @@ const server = http.createServer(async (req, res) => {
       const audio = audioContextForEpisode(episodeId, account.id);
       if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
       if (!audio.manifestValid || !audio.sourceCurrent) return json(res, 409, { error: 'Der Audio-Plan ist veraltet oder ungültig. Bitte Audio-Ansicht aktualisieren.' });
-      if (!audio.manifest.cues.some(cue => cue.state !== 'skipped')) return json(res, 400, { error: 'Für die gewählte Sprachregie gibt es keine auszugebenden Text-Cues.' });
-      const active = row("SELECT id FROM jobs WHERE episode_id=? AND kind='audio_mix' AND state IN ('wartet','läuft')", episodeId);
-      if (active) return json(res, 409, { error: 'Für diese Episode läuft oder wartet bereits ein Audio-Mix.' });
-      run(`INSERT INTO episode_audio_manifests(episode_id,owner_id,manifest_json,updated_at) VALUES (?,?,?,?)
-        ON CONFLICT(episode_id) DO UPDATE SET owner_id=excluded.owner_id,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at`, episodeId, account.id, JSON.stringify(audio.generated), now());
-      const created = run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id) VALUES (?,?,?,?,?,?,?)', episodeId, 'audio_mix', 'Qwen TTS · Stimmen & Mix', 'wartet', 'Erzeugt Stimmen und mischt sie zeitlich zur Episode.', now(), account.id);
-      event('Audio-Mix eingereiht', `Episode ${episodeId} · ${audio.generated.cues.length} Cue(s)`);
-      return json(res, 201, { ok: true, job: row('SELECT * FROM jobs WHERE id=?', Number(created.lastInsertRowid)) });
+      if (!audio.cuesReady) return json(res, 409, { error: 'Die einzelnen Sprach-/Musik-/SFX-Spuren sind noch nicht fertig. Rendere zuerst die Audio-Spuren; der Mix wird nach der letzten bestätigten Spur automatisch eingereiht.' });
+      const mix = queueReadyAudioMix(episodeId, account.id);
+      if (!mix) return json(res, 409, { error: 'Audio-Mix kann noch nicht eingereiht werden.' });
+      return json(res, 201, { ok: true, job: mix });
     }
     if (/^\/api\/assets\/\d+\/voice-preview$/.test(path) && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
@@ -1589,7 +1638,7 @@ const server = http.createServer(async (req, res) => {
           COALESCE(e.preview_width,p.preview_width) preview_width,COALESCE(e.preview_height,p.preview_height) preview_height,
           COALESCE(e.final_width,p.final_width) final_width,COALESCE(e.final_height,p.final_height) final_height
           FROM jobs j JOIN episodes e ON e.id=j.episode_id JOIN projects p ON p.id=e.project_id
-          WHERE j.state='wartet' AND j.kind IN ('comfyui_reference_preview','caption_asset','minimax_h3','audio_preview','audio_mix')
+          WHERE j.state='wartet' AND j.kind IN ('comfyui_reference_preview','caption_asset','minimax_h3','audio_preview','audio_cue','audio_mix')
             AND (j.kind<>'minimax_h3' OR NOT EXISTS (
               SELECT 1 FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id
               WHERE sa.shot_id=j.shot_id AND (a.file_path IS NULL OR a.file_path='')
@@ -1597,7 +1646,7 @@ const server = http.createServer(async (req, res) => {
           -- Captions of user-supplied reference images are a production prerequisite: they
           -- replace unreliable free-text notes before any more generated asset previews consume
           -- the GPU.  Preview jobs remain queued, rather than being cancelled.
-          ORDER BY CASE j.kind WHEN 'audio_preview' THEN 1 WHEN 'caption_asset' THEN 2 WHEN 'comfyui_reference_preview' THEN 3 WHEN 'minimax_h3' THEN 4 ELSE 5 END,j.id LIMIT 1`);
+          ORDER BY CASE j.kind WHEN 'audio_preview' THEN 1 WHEN 'caption_asset' THEN 2 WHEN 'comfyui_reference_preview' THEN 3 WHEN 'minimax_h3' THEN 4 WHEN 'audio_cue' THEN 5 ELSE 6 END,j.id LIMIT 1`);
         if(job){
           const claimed=run("UPDATE jobs SET state='läuft',started_at=?,worker_id=? WHERE id=? AND state='wartet'",now(),workerId,job.id);
           if(!claimed.changes) job=null;
@@ -1622,6 +1671,13 @@ const server = http.createServer(async (req, res) => {
         let preview = {}; try { preview = JSON.parse(job.detail || '{}'); } catch {}
         return json(res, 200, { job, asset, preview: { text: String(preview.text || ''), voice: String(preview.voice || asset.voice || ''), language: String(preview.language || 'German') } });
       }
+      if (job.kind === 'audio_cue') {
+        let cueRequest = {}; try { cueRequest = JSON.parse(job.detail || '{}'); } catch {}
+        const audio = audioContextForEpisode(job.episode_id, job.owner_id);
+        const cue = audio?.manifest?.cues?.find(item => String(item.id) === String(cueRequest.cue_id));
+        if (!cue || cue.state === 'skipped' || cue.state === 'ready') { run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?", 'Die zugehörige Audio-Spur fehlt oder wurde bereits ersetzt.', now(), job.id); return json(res, 204, {}); }
+        return json(res, 200, { job, cue: { ...cue, artifact: undefined }, audio: { timeline: audio.manifest.timeline } });
+      }
       if (job.kind === 'audio_mix') {
         const audio = audioContextForEpisode(job.episode_id, job.owner_id);
         if (!audio || !audio.manifestValid || !audio.sourceCurrent) { run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?", 'Audio-Plan ist veraltet oder ungültig.', now(), job.id); return json(res, 204, {}); }
@@ -1629,7 +1685,8 @@ const server = http.createServer(async (req, res) => {
           .filter(clip => existsSync(mediaPath(clip.output_video_path)))
           .map(clip => ({ ...clip, output_video_path: undefined, downloadUrl: `/api/worker/shots/${clip.id}/video` }));
         if (!clips.length) { run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?", 'Es gibt noch keine fertigen Video-Clips für den Mix.', now(), job.id); return json(res, 204, {}); }
-        return json(res, 200, { job, audio: { manifest: audio.manifest, settings: audio.settings }, clips });
+        const cues = audio.manifest.cues.map(cue => cue?.artifact?.path ? ({ ...cue, artifact: { ...cue.artifact, downloadUrl: `/api/worker/episodes/${job.episode_id}/audio-cues/${encodeURIComponent(cue.id)}` } }) : cue);
+        return json(res, 200, { job, audio: { manifest: { ...audio.manifest, cues }, settings: audio.settings }, clips });
       }
       const shot=row('SELECT * FROM shots WHERE id=?',job.shot_id);
       if(!shot){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Der zugehörige Shot fehlt.',now(),job.id);return json(res,204,{});}
@@ -1664,6 +1721,30 @@ const server = http.createServer(async (req, res) => {
       run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?", `Stimmprobe fertig: ${portable}`, now(), id);
       event('Stimmprobe fertig', `Job ${id}`); return json(res, 201, { ok: true, path: portable, url: `/media/${encodeURIComponent(portable)}` });
     }
+    if (/^\/api\/worker\/jobs\/\d+\/audio-cue$/.test(path) && req.method === 'POST') {
+      if (!workerGuard(req,res)) return;
+      const id = Number(path.split('/')[4]), job = row('SELECT * FROM jobs WHERE id=?', id);
+      if (!job || job.kind !== 'audio_cue') return json(res, 404, { error: 'Audio-Spurauftrag nicht gefunden.' });
+      if (job.state === 'abgebrochen') return json(res, 409, { error: 'Dieser Auftrag wurde bereits abgebrochen.' });
+      let detail = {}; try { detail = JSON.parse(job.detail || '{}'); } catch {}
+      const cueId = String(req.headers['x-framecut-cue-id'] || detail.cue_id || '').trim();
+      if (!cueId || cueId !== String(detail.cue_id || '')) return json(res, 400, { error: 'Die Audio-Cue-ID passt nicht zum Auftrag.' });
+      const chunks = []; let size = 0; for await (const chunk of req) { size += chunk.length; if (size > 80 * 1024 * 1024) throw new Error('Audio-Spur ist größer als 80 MB.'); chunks.push(chunk); }
+      if (!size) return json(res, 400, { error: 'Audio-Spur ist leer.' }); await mkdir(UPLOADS, { recursive: true });
+      const file = `audio-cue-${job.episode_id}-${randomBytes(5).toString('hex')}.wav`, portable = `data/uploads/${file}`, bytes = Buffer.concat(chunks);
+      await writeFile(join(UPLOADS, file), bytes);
+      const audio = audioContextForEpisode(job.episode_id, job.owner_id);
+      if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      const manifest = structuredClone(audio.manifest), cue = manifest.cues.find(item => String(item.id) === cueId);
+      if (!cue) return json(res, 409, { error: 'Die Audio-Spur wurde inzwischen verändert. Bitte erneut rendern.' });
+      cue.state = 'ready'; cue.artifact = { path: portable, sha256: createHash('sha256').update(bytes).digest('hex') }; cue.rendered_at = now();
+      delete manifest.mix;
+      saveAudioManifest(job.episode_id, job.owner_id, manifest);
+      run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?", `Audio-Spur bestätigt: ${cueId}`, now(), id);
+      event('Audio-Spur fertig', `Episode ${job.episode_id} · ${cueId}`);
+      const mix = queueReadyAudioMix(job.episode_id, job.owner_id);
+      return json(res, 201, { ok: true, path: portable, cueId, mixQueued: Boolean(mix) });
+    }
     if (/^\/api\/worker\/jobs\/\d+\/audio-master$/.test(path) && req.method === 'POST') {
       if (!workerGuard(req,res)) return;
       const id = Number(path.split('/')[4]), job = row('SELECT * FROM jobs WHERE id=?', id);
@@ -1673,13 +1754,28 @@ const server = http.createServer(async (req, res) => {
       const file = `audio-master-${job.episode_id}-${randomBytes(5).toString('hex')}.mp4`, portable = `data/uploads/${file}`;
       await writeFile(join(UPLOADS, file), Buffer.concat(chunks));
       const saved = row('SELECT manifest_json FROM episode_audio_manifests WHERE episode_id=?', job.episode_id);
-      if (saved) { try { const manifest = JSON.parse(saved.manifest_json); manifest.mix = { state: 'ready', artifact: { path: portable }, rendered_at: now() }; run('UPDATE episode_audio_manifests SET manifest_json=?,updated_at=? WHERE episode_id=?', JSON.stringify(manifest), now(), job.episode_id); } catch {} }
+      if (saved) { try {
+        const manifest = JSON.parse(saved.manifest_json); manifest.mix = { state: 'ready', artifact: { path: portable }, rendered_at: now() };
+        const srt = srtFromManifest(manifest);
+        if (srt) { const srtFile = `subtitles-${job.episode_id}-${randomBytes(5).toString('hex')}.srt`; await writeFile(join(UPLOADS, srtFile), srt, 'utf8'); manifest.mix.subtitles = { path: `data/uploads/${srtFile}` }; run('INSERT INTO episode_exports(episode_id,name,file_path,type,created_at) VALUES (?,?,?,?,?)', job.episode_id, `Untertitel · Episode ${job.episode_id}.srt`, `data/uploads/${srtFile}`, 'srt', now()); }
+        saveAudioManifest(job.episode_id, job.owner_id, manifest);
+      } catch {} }
       const name = `Audio-Master · Episode ${job.episode_id}.mp4`; run('INSERT INTO episode_exports(episode_id,name,file_path,type,created_at) VALUES (?,?,?,?,?)', job.episode_id, name, portable, 'mp4', now());
       run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?", 'Stimmen erzeugt und als Audio-Master gemischt.', now(), id);
       event('Audio-Master fertig', `Job ${id}`); return json(res, 201, { ok: true, path: portable, url: `/media/${encodeURIComponent(portable)}` });
     }
     if (/^\/api\/worker\/episodes\/\d+\/final$/.test(path) && req.method === 'POST') { if(!workerGuard(req,res))return;const episodeId=Number(path.split('/')[4]);if(!row('SELECT id FROM episodes WHERE id=?',episodeId))return json(res,404,{error:'Episode nicht gefunden.'});const declared=Number(req.headers['content-length']||0);if(declared>1024*1024*1024)return json(res,413,{error:'Export ist größer als 1 GB.'});const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>1024*1024*1024)throw new Error('Export ist größer als 1 GB.');chunks.push(chunk)}if(!size)return json(res,400,{error:'Export ist leer.'});await mkdir(UPLOADS,{recursive:true});const requested=decodeURIComponent(String(req.headers['x-framecut-name']||'FrameCut-Final.mp4')).replace(/[^a-zA-Z0-9._ -]/g,'').slice(0,120)||'FrameCut-Final.mp4';const file=`final-${episodeId}-${randomBytes(5).toString('hex')}.mp4`;await writeFile(join(UPLOADS,file),Buffer.concat(chunks));const portable=`data/uploads/${file}`;run('INSERT INTO episode_exports(episode_id,name,file_path,type,created_at) VALUES (?,?,?,?,?)',episodeId,requested,portable,'mp4',now());event('Episode exportiert',`${requested} · ${Math.round(size/1024/1024)} MB`);return json(res,201,{ok:true,path:portable,size}); }
     if (/^\/api\/worker\/assets\/\d+\/file$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const asset=row('SELECT * FROM assets WHERE id=?',Number(path.split('/')[4])); if(!asset?.file_path)return json(res,404,{error:'Referenzdatei fehlt.'}); const target=mediaPath(asset.file_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Referenzdatei fehlt.'}); return serveFile(res,target); }
+    if (/^\/api\/worker\/episodes\/\d+\/audio-cues\/[^/]+$/.test(path) && req.method === 'GET') {
+      if (!workerGuard(req,res)) return;
+      const parts = path.split('/'), episodeId = Number(parts[4]), cueId = decodeURIComponent(parts[6] || '');
+      const jobOwner = row('SELECT owner_id FROM episode_audio_manifests WHERE episode_id=?', episodeId);
+      const audio = jobOwner ? audioContextForEpisode(episodeId, jobOwner.owner_id) : null;
+      const cue = audio?.manifest?.cues?.find(item => String(item.id) === cueId);
+      const target = cue?.artifact?.path ? mediaPath(cue.artifact.path) : null;
+      if (!target || !permittedMediaPath(target) || !existsSync(target)) return json(res,404,{error:'Audio-Spur fehlt.'});
+      return serveFile(res,target);
+    }
     if (/^\/api\/worker\/shots\/\d+\/video$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const shot=row('SELECT output_video_path FROM shots WHERE id=?',Number(path.split('/')[4])); if(!shot?.output_video_path)return json(res,404,{error:'Clip fehlt.'}); const target=mediaPath(shot.output_video_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Clip fehlt.'}); return serveFile(res,target); }
     if (/^\/api\/worker\/episodes\/\d+\/status$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return;const episodeId=Number(path.split('/')[4]);const counts=rows('SELECT kind,state,count(*) count FROM jobs WHERE episode_id=? GROUP BY kind,state',episodeId);const shots=row('SELECT count(*) total,sum(CASE WHEN output_video_path IS NOT NULL THEN 1 ELSE 0 END) finished FROM shots WHERE episode_id=?',episodeId);return json(res,200,{episodeId,counts,shots}); }
     if (/^\/api\/worker\/shots\/\d+\/source$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const shot=row('SELECT * FROM shots WHERE id=?',Number(path.split('/')[4])); if(!shot?.source_image_path)return json(res,404,{error:'Startbild fehlt.'}); const target=mediaPath(shot.source_image_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Startbild fehlt.'}); return serveFile(res,target); }
