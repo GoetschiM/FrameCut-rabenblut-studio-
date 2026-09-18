@@ -54,8 +54,11 @@ def main():
         g['cond']['inputs']['first_frame']=['crop',0]
     if a.reference_image:
         g['unet']['inputs']['unet_name']='minimax_h3_ref2va_pruned_int8_convrot.safetensors'
-        g['cond']={'class_type':'MiniMaxH3ReferenceToVideo','inputs':{'clip':['clip',0],'vae':['vae',0],'audio_vae':['avae',0],'prompt':prompt,'width':a.width,'height':a.height,'length':a.frames,'ref_image_size':'match','ref_images.ref_image_0':['image',0]}}
-        for index,refpath in enumerate(a.reference_image,1):
+        # ReferenceToVideo has no first_frame input.  Feeding the scene keyframe into
+        # ref_image_0 therefore made model sheets leak into frame 0.  Keep the scene
+        # frame as an explicit Guide, and reserve the reference channel for identity.
+        g['cond']={'class_type':'MiniMaxH3ReferenceToVideo','inputs':{'clip':['clip',0],'vae':['vae',0],'audio_vae':['avae',0],'prompt':prompt,'width':a.width,'height':a.height,'length':a.frames,'ref_image_size':'max'}}
+        for index,refpath in enumerate(a.reference_image):
             ref=Path(refpath);rb=uuid.uuid4().hex
             rbbody=(f'--{rb}\r\nContent-Disposition: form-data; name="image"; filename="rb_{rb}.png"\r\nContent-Type: image/png\r\n\r\n').encode()+ref.read_bytes()+f'\r\n--{rb}--\r\n'.encode()
             request=urllib.request.Request(base+'/upload/image',data=rbbody,headers={'Content-Type':'multipart/form-data; boundary='+rb})
@@ -63,6 +66,9 @@ def main():
             key='reference_'+str(index)
             g[key]={'class_type':'LoadImage','inputs':{'image':refmeta['name']}}
             g['cond']['inputs']['ref_images.ref_image_'+str(index)]=[key,0]
+        g['anchor']={'class_type':'MiniMaxH3AddGuide','inputs':{'positive':['cond',0],'latent':['cond',1],'frame_idx':0,'vae':['vae',0],'audio_vae':['avae',0],'image':['image',0]}}
+        g['guide']['inputs']['conditioning']=['anchor',0]
+        g['run']['inputs']['latent_image']=['anchor',1]
     (out/(a.name+'.workflow.json')).write_text(json.dumps(g,indent=2),encoding='utf-8')
     result=api('/prompt',{'prompt':g,'client_id':'rabenblut-film-v2'})
     state={'prompt_id':result['prompt_id'],'input':str(image.resolve()),'prompt':prompt,'settings':vars(a),'status':'queued'}
