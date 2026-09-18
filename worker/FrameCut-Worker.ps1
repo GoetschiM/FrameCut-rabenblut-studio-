@@ -21,6 +21,10 @@ $captionClient = if ($config.CaptionClientPath) { $config.CaptionClientPath } el
 $comfyAppPath = if ($config.ComfyAppPath) { $config.ComfyAppPath } else { Join-Path $pinokioHome 'api\comfy.git\app' }
 $comfyOutputRoot = Join-Path $comfyAppPath 'output'
 $comfyPythonExe = Join-Path $comfyAppPath 'env\Scripts\python.exe'
+$qwenAppPath = if ($config.QwenTtsAppPath) { $config.QwenTtsAppPath } else { Join-Path $pinokioHome 'api\Qwen3-TTS-Pinokio.git\app' }
+$qwenPythonExe = if ($config.QwenTtsPythonPath) { $config.QwenTtsPythonPath } else { Join-Path $qwenAppPath 'venv\Scripts\python.exe' }
+$qwenClient = Join-Path $workerRoot 'framecut_qwen_tts.py'
+$qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '1.7B' }
 
 # Clips are delivered without sound by default; set StripAudio to false in worker.config.json
 # to keep whatever the video model generated.
@@ -284,6 +288,58 @@ function Process-CaptionJob($payload) {
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/caption" -Headers (Headers) -ContentType 'application/json' -Body $body | Out-Null
   Write-Host ("Beschreibung gespeichert: {0}" -f $asset.name) -ForegroundColor Green
 }
+function Invoke-QwenSpeech([array]$SpeechJobs,[string]$JobRoot) {
+  if(-not (Test-Path -LiteralPath $qwenClient)){throw 'FrameCut Qwen-TTS-Adapter fehlt.'}
+  if(-not (Test-Path -LiteralPath $qwenAppPath)){throw "Qwen3-TTS ist nicht installiert: $qwenAppPath"}
+  if(-not (Test-Path -LiteralPath $qwenPythonExe)){throw "Qwen3-TTS Python-Umgebung fehlt: $qwenPythonExe"}
+  $specPath=Join-Path $JobRoot 'speech-jobs.json'
+  $SpeechJobs|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $specPath -Encoding utf8
+  $stdoutPath=Join-Path $JobRoot 'qwen-stdout.log';$stderrPath=Join-Path $JobRoot 'qwen-stderr.log'
+  $argLine="`"$qwenClient`" --qwen-app `"$qwenAppPath`" --jobs `"$specPath`" --model-size $qwenModelSize"
+  Write-Host ("Qwen3-TTS erzeugt {0} Stimme(n) ..." -f $SpeechJobs.Count) -ForegroundColor Cyan
+  $proc=Start-Process -FilePath $qwenPythonExe -ArgumentList $argLine -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
+  $timeout=if($config.AudioTimeoutSeconds){[Math]::Max(600,[int]$config.AudioTimeoutSeconds)}else{7200}
+  if(-not $proc.WaitForExit($timeout*1000)){Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue;throw "Qwen3-TTS hat das Zeitlimit von $timeout Sekunden überschritten."}
+  $stdout=if(Test-Path $stdoutPath){(Get-Content $stdoutPath -Raw).Trim()}else{''};$stderr=if(Test-Path $stderrPath){(Get-Content $stderrPath -Raw).Trim()}else{''}
+  if($proc.ExitCode -ne 0){throw "Qwen3-TTS fehlgeschlagen (Code $($proc.ExitCode)). $stderr"}
+  $jsonLine=($stdout -split "`r?`n"|Where-Object {$_ -match '^\{.*\}$'}|Select-Object -Last 1)
+  if(-not $jsonLine){throw "Qwen3-TTS lieferte kein Ergebnis. $stdout $stderr"}
+  return $jsonLine|ConvertFrom-Json
+}
+function Process-AudioPreviewJob($payload) {
+  $job=$payload.job;$asset=$payload.asset;$root=Join-Path $runtimeRoot ("jobs\audio-preview-{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $root|Out-Null
+  Free-Models $config.ComfyUrl;Free-Models $config.H3Url
+  $out=Join-Path $root 'voice-preview.wav'
+  $result=Invoke-QwenSpeech @([pscustomobject]@{id='preview';text=$payload.preview.text;voice=$payload.preview.voice;language=$payload.preview.language;output=$out}) $root
+  if(-not (Test-Path -LiteralPath $out)){throw 'Qwen3-TTS meldete Erfolg, aber die Stimmprobe fehlt.'}
+  Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-preview" -Headers (Headers) -ContentType 'audio/wav' -InFile $out | Out-Null
+  Write-Host ("Stimmprobe fertig: {0}" -f $asset.name) -ForegroundColor Green
+}
+function Process-AudioMixJob($payload) {
+  $job=$payload.job;$root=Join-Path $runtimeRoot ("jobs\audio-mix-{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $root|Out-Null
+  if(-not $ffmpegExe){throw 'ffmpeg fehlt; ein Audio-Master kann nicht gemischt werden.'}
+  Free-Models $config.ComfyUrl;Free-Models $config.H3Url
+  $clips=@($payload.clips|Sort-Object sequence)
+  $concat=Join-Path $root 'clips.txt';$clipLines=@();$total=0.0
+  foreach($clip in $clips){$local=Join-Path $root ("clip-{0:d3}.mp4" -f [int]$clip.sequence);Invoke-WebRequest -Uri ($config.ServerUrl+$clip.downloadUrl) -Headers (Headers) -OutFile $local;$clipLines += "file '$($local.Replace("'","'\''"))'";$total += [double]$clip.duration_seconds}
+  if($total -le 0){throw 'Die Video-Timeline hat keine gültige Dauer.'}
+  Set-Content -LiteralPath $concat -Value ($clipLines -join "`n") -Encoding utf8
+  $video=Join-Path $root 'picture-cut.mp4';& $ffmpegExe -y -loglevel error -f concat -safe 0 -i $concat -map 0:v:0 -c:v copy -an $video 2>&1|Out-Null
+  if($LASTEXITCODE -ne 0 -or -not(Test-Path $video)){throw 'Der Bildschnitt für den Audio-Mix konnte nicht erstellt werden.'}
+  $speech=@();$index=0
+  foreach($cue in @($payload.audio.manifest.cues|Where-Object {$_.state -ne 'skipped'})){$index++;$speech += [pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;language=$cue.language;output=(Join-Path $root ("cue-{0:d3}.wav" -f $index));start_ms=[int]$cue.start_ms}}
+  if($speech.Count -eq 0){throw 'Für die gewählte Regie sind keine Sprach-Cues aktiv.'}
+  [void](Invoke-QwenSpeech $speech $root)
+  $args=@('-y','-loglevel','error','-i',$video);foreach($cue in $speech){$args += @('-i',$cue.output)}
+  $filters=@("anullsrc=r=48000:cl=stereo,atrim=duration=$([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture))[base]");$labels=@('[base]')
+  for($i=0;$i -lt $speech.Count;$i++){$n=$i+1;$delay=[int]$speech[$i].start_ms;$filters += "[$n:a]adelay=$delay|$delay,aresample=48000[a$n]";$labels += "[a$n]"}
+  $filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[mix]" -f ($labels -join ''),$labels.Count)
+  $master=Join-Path $root 'audio-master.mp4';$args += @('-filter_complex',($filters -join ';'),'-map','0:v:0','-map','[mix]','-c:v','copy','-c:a','aac','-b:a','192k','-t',([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture)),'-movflags','+faststart',$master)
+  & $ffmpegExe @args 2>&1|Out-Null
+  if($LASTEXITCODE -ne 0 -or -not(Test-Path $master)){throw 'ffmpeg konnte den Stimmen-Mix nicht erstellen.'}
+  Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-master" -Headers (Headers) -ContentType 'video/mp4' -InFile $master | Out-Null
+  Write-Host 'Audio-Master fertig.' -ForegroundColor Green
+}
 function Process-Job($payload) {
   $job=$payload.job; $shot=$payload.shot
   Write-Host ("Job {0}: {1} / {2} / Shot {3:00} - {4}" -f $job.id,$job.project_title,$job.episode_title,$shot.sequence,$shot.title) -ForegroundColor Green
@@ -437,7 +493,7 @@ try {
     Set-Awake $true
     try {
       $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)
-      if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}else{Process-Job $payload}}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}
+      if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload}}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}
     } catch {Write-Host ("Verbindung wartet: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow}
     if(-not $Once){for($i=0;$i -lt 10 -and -not (Test-Path -LiteralPath $stopPath);$i++){Start-Sleep -Seconds 1}}
   } while(-not $Once)

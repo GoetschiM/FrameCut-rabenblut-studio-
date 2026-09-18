@@ -52,6 +52,14 @@ db.exec(`CREATE TABLE IF NOT EXISTS episode_exports (id INTEGER PRIMARY KEY,epis
 // Stores a reviewed cue plan only. Media artifacts and provider configuration remain
 // on the audio worker, never in the web server database.
 db.exec(`CREATE TABLE IF NOT EXISTS episode_audio_manifests (episode_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, manifest_json TEXT NOT NULL, updated_at TEXT NOT NULL);`);
+// Direction is deliberately stored separately from the generated cue plan.  A user can
+// audition or change a voice without silently rewriting the episode's story timeline.
+db.exec(`CREATE TABLE IF NOT EXISTS episode_audio_settings (
+  episode_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'narrator_and_characters',
+  narrator_voice TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT 'German',
+  updated_at TEXT NOT NULL
+);`);
 db.exec(`CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, last_seen TEXT NOT NULL, first_seen TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS story_versions (id INTEGER PRIMARY KEY, episode_id INTEGER NOT NULL, markdown TEXT NOT NULL, saved_at TEXT NOT NULL);`);
@@ -125,15 +133,44 @@ function audioContextForEpisode(episodeId, ownerId) {
   const dialogue = shots.length ? rows(`SELECT d.id,d.shot_id,d.asset_id,d.sequence,d.text,a.voice
     FROM shot_dialogue d LEFT JOIN assets a ON a.id=d.asset_id
     WHERE d.shot_id IN (${shots.map(() => '?').join(',')}) ORDER BY d.shot_id,d.sequence,d.id`, ...shots.map(shot => shot.id)) : [];
-  const generated = createEpisodeAudioManifest({ ownerId, projectId: episode.project_id, episodeId, shots, dialogue });
+  const settings = row('SELECT mode,narrator_voice,language,updated_at FROM episode_audio_settings WHERE episode_id=? AND owner_id=?', episodeId, ownerId)
+    || { mode: 'narrator_and_characters', narrator_voice: '', language: 'German', updated_at: null };
+  const generated = applyAudioDirection(createEpisodeAudioManifest({ ownerId, projectId: episode.project_id, episodeId, shots, dialogue }), settings);
   const saved = row('SELECT manifest_json,updated_at FROM episode_audio_manifests WHERE episode_id=? AND owner_id=?', episodeId, ownerId);
   let manifest = generated, source = 'automatisch aus Shot-Timeline und Dialogen erstellt', updatedAt = null;
   if (saved) {
     try { manifest = JSON.parse(saved.manifest_json); source = 'gespeicherter Audio-Plan'; updatedAt = saved.updated_at; }
     catch { source = 'beschädigter gespeicherter Audio-Plan'; }
   }
-  const preflight = audioPreflight(manifest, { expectedSourceRevision: generated.source_revision, mixingWorkerAvailable: false });
-  return { episode, generated, manifest, source, updatedAt, ...preflight };
+  const mixPath = manifest?.mix?.artifact?.path;
+  const mixReady = manifest?.mix?.state === 'ready' && typeof mixPath === 'string' && existsSync(mediaPath(mixPath));
+  const preflight = audioPreflight(manifest, { expectedSourceRevision: generated.source_revision, mixingWorkerAvailable: mixReady });
+  return { episode, generated, manifest, source, updatedAt, settings, ...preflight };
+}
+
+function applyAudioDirection(manifest, settings) {
+  const mode = ['narrator_and_characters', 'narrator_only', 'characters_only'].includes(settings?.mode)
+    ? settings.mode : 'narrator_and_characters';
+  const narrator = String(settings?.narrator_voice || '').trim();
+  const language = String(settings?.language || 'German').trim() || 'German';
+  const cues = manifest.cues.map(cue => {
+    const copy = { ...cue, language };
+    const hasCharacter = Boolean(copy.asset_id);
+    if (mode === 'narrator_only') {
+      copy.speaker_role = 'narrator';
+      copy.voice_profile_id = narrator || 'neutral German storyteller';
+    } else if (mode === 'characters_only') {
+      if (!hasCharacter) return { ...copy, state: 'skipped', skip_reason: 'Erzählmodus: nur Figurenstimmen' };
+      copy.voice_profile_id = copy.voice_profile_id || 'character voice';
+    } else if (hasCharacter) {
+      copy.voice_profile_id = copy.voice_profile_id || 'character voice';
+    } else {
+      copy.speaker_role = 'narrator';
+      copy.voice_profile_id = narrator || 'neutral German storyteller';
+    }
+    return copy;
+  });
+  return { ...manifest, direction: { mode, narrator_voice: narrator, language }, cues };
 }
 
 function expectedAudioIdentity(account, episode) {
@@ -1393,7 +1430,29 @@ const server = http.createServer(async (req, res) => {
         generatedManifest: audio.generated, manifestValid: audio.manifestValid, validationErrors: audio.validationErrors,
         sourceCurrent: audio.sourceCurrent, cues: audio.cues, cuesReady: audio.cuesReady,
         readyForMaster: audio.readyForMaster, mixingWorkerAvailable: audio.mixingWorkerAvailable, blockers: audio.blockers,
+        settings: audio.settings,
       });
+    }
+    if (/^\/api\/episodes\/\d+\/audio-settings$/.test(path) && req.method === 'PUT') {
+      const account = guard(req, res); if (!account) return;
+      const episodeId = Number(path.split('/')[3]);
+      const episode = row('SELECT id FROM episodes WHERE id=?', episodeId);
+      if (!episode) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      const d = await body(req);
+      const mode = ['narrator_and_characters', 'narrator_only', 'characters_only'].includes(d.mode) ? d.mode : 'narrator_and_characters';
+      const narratorVoice = String(d.narratorVoice || '').trim().slice(0, 600);
+      const language = String(d.language || 'German').trim().slice(0, 60) || 'German';
+      run(`INSERT INTO episode_audio_settings(episode_id,owner_id,mode,narrator_voice,language,updated_at) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(episode_id) DO UPDATE SET owner_id=excluded.owner_id,mode=excluded.mode,narrator_voice=excluded.narrator_voice,language=excluded.language,updated_at=excluded.updated_at`,
+        episodeId, account.id, mode, narratorVoice, language, now());
+      // A previous ready mix no longer represents this direction. Preserve the plan but
+      // force a conscious re-render rather than exporting it under the new voice choice.
+      // Rebuild the deterministic draft with the new direction.  Retaining an older
+      // reviewed manifest here would make narrator-only render with yesterday's
+      // character mapping even though the UI displays the new setting.
+      run('DELETE FROM episode_audio_manifests WHERE episode_id=?', episodeId);
+      event('Audio-Regie aktualisiert', `Episode ${episodeId} · ${mode}`);
+      return json(res, 200, { ok: true, settings: { mode, narrator_voice: narratorVoice, language } });
     }
     if (/^\/api\/episodes\/\d+\/audio-manifest$/.test(path) && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
@@ -1416,6 +1475,39 @@ const server = http.createServer(async (req, res) => {
       event('Audio-Plan gespeichert', `${audio.episode.title} · ${manifest.cues.length} Cue(s)`);
       const refreshed = audioContextForEpisode(episodeId, account.id);
       return json(res, 200, { ok: true, source: refreshed.source, updatedAt: refreshed.updatedAt, manifest: refreshed.manifest, cues: refreshed.cues, blockers: refreshed.blockers, readyForMaster: refreshed.readyForMaster });
+    }
+    if (/^\/api\/episodes\/\d+\/audio-render$/.test(path) && req.method === 'POST') {
+      const account = guard(req, res); if (!account) return;
+      const episodeId = Number(path.split('/')[3]);
+      const audio = audioContextForEpisode(episodeId, account.id);
+      if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      if (!audio.manifestValid || !audio.sourceCurrent) return json(res, 409, { error: 'Der Audio-Plan ist veraltet oder ungültig. Bitte Audio-Ansicht aktualisieren.' });
+      if (!audio.manifest.cues.some(cue => cue.state !== 'skipped')) return json(res, 400, { error: 'Für die gewählte Sprachregie gibt es keine auszugebenden Text-Cues.' });
+      const active = row("SELECT id FROM jobs WHERE episode_id=? AND kind='audio_mix' AND state IN ('wartet','läuft')", episodeId);
+      if (active) return json(res, 409, { error: 'Für diese Episode läuft oder wartet bereits ein Audio-Mix.' });
+      run(`INSERT INTO episode_audio_manifests(episode_id,owner_id,manifest_json,updated_at) VALUES (?,?,?,?)
+        ON CONFLICT(episode_id) DO UPDATE SET owner_id=excluded.owner_id,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at`, episodeId, account.id, JSON.stringify(audio.generated), now());
+      const created = run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id) VALUES (?,?,?,?,?,?,?)', episodeId, 'audio_mix', 'Qwen TTS · Stimmen & Mix', 'wartet', 'Erzeugt Stimmen und mischt sie zeitlich zur Episode.', now(), account.id);
+      event('Audio-Mix eingereiht', `Episode ${episodeId} · ${audio.generated.cues.length} Cue(s)`);
+      return json(res, 201, { ok: true, job: row('SELECT * FROM jobs WHERE id=?', Number(created.lastInsertRowid)) });
+    }
+    if (/^\/api\/assets\/\d+\/voice-preview$/.test(path) && req.method === 'POST') {
+      const account = guard(req, res); if (!account) return;
+      const assetId = Number(path.split('/')[3]);
+      const asset = row("SELECT * FROM assets WHERE id=? AND kind='character'", assetId);
+      if (!asset) return json(res, 404, { error: 'Figur nicht gefunden.' });
+      const d = await body(req);
+      const episodeId = Number(d.episodeId);
+      if (!row('SELECT id FROM episodes WHERE id=? AND project_id=?', episodeId, asset.project_id)) return json(res, 400, { error: 'Bitte wähle eine Episode dieses Projekts.' });
+      const text = String(d.text || `Hallo, ich bin ${asset.name}.`).trim().slice(0, 600);
+      const voice = String(d.voice ?? asset.voice ?? '').trim().slice(0, 600);
+      if (!text) return json(res, 400, { error: 'Bitte gib einen kurzen Vorschautext ein.' });
+      const active = row("SELECT id FROM jobs WHERE asset_id=? AND kind='audio_preview' AND state IN ('wartet','läuft')", assetId);
+      if (active) return json(res, 409, { error: 'Für diese Figur wird bereits eine Stimmprobe erzeugt.' });
+      const detail = JSON.stringify({ text, voice, language: String(d.language || 'German').trim().slice(0, 60) || 'German' });
+      const created = run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id,asset_id) VALUES (?,?,?,?,?,?,?,?)', episodeId, 'audio_preview', `Qwen TTS · Stimmprobe: ${asset.name}`, 'wartet', detail, now(), account.id, assetId);
+      event('Stimmprobe eingereiht', asset.name);
+      return json(res, 201, { ok: true, job: row('SELECT * FROM jobs WHERE id=?', Number(created.lastInsertRowid)) });
     }
     if (/^\/api\/episodes\/\d+\/assemble$/.test(path) && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
@@ -1477,7 +1569,7 @@ const server = http.createServer(async (req, res) => {
           COALESCE(e.preview_width,p.preview_width) preview_width,COALESCE(e.preview_height,p.preview_height) preview_height,
           COALESCE(e.final_width,p.final_width) final_width,COALESCE(e.final_height,p.final_height) final_height
           FROM jobs j JOIN episodes e ON e.id=j.episode_id JOIN projects p ON p.id=e.project_id
-          WHERE j.state='wartet' AND j.kind IN ('comfyui_reference_preview','caption_asset','minimax_h3')
+          WHERE j.state='wartet' AND j.kind IN ('comfyui_reference_preview','caption_asset','minimax_h3','audio_preview','audio_mix')
             AND (j.kind<>'minimax_h3' OR NOT EXISTS (
               SELECT 1 FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id
               WHERE sa.shot_id=j.shot_id AND (a.file_path IS NULL OR a.file_path='')
@@ -1485,7 +1577,7 @@ const server = http.createServer(async (req, res) => {
           -- Captions of user-supplied reference images are a production prerequisite: they
           -- replace unreliable free-text notes before any more generated asset previews consume
           -- the GPU.  Preview jobs remain queued, rather than being cancelled.
-          ORDER BY CASE j.kind WHEN 'caption_asset' THEN 1 WHEN 'comfyui_reference_preview' THEN 2 ELSE 3 END,j.id LIMIT 1`);
+          ORDER BY CASE j.kind WHEN 'audio_preview' THEN 1 WHEN 'caption_asset' THEN 2 WHEN 'comfyui_reference_preview' THEN 3 WHEN 'minimax_h3' THEN 4 ELSE 5 END,j.id LIMIT 1`);
         if(job){
           const claimed=run("UPDATE jobs SET state='läuft',started_at=?,worker_id=? WHERE id=? AND state='wartet'",now(),workerId,job.id);
           if(!claimed.changes) job=null;
@@ -1503,6 +1595,21 @@ const server = http.createServer(async (req, res) => {
         const asset=row('SELECT id,name,kind,summary,visual_notes,file_path FROM assets WHERE id=?',job.asset_id);
         if(!asset||!asset.file_path){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Das zugehörige Asset oder Foto fehlt.',now(),job.id);return json(res,204,{});}
         return json(res,200,{job,asset,downloadUrl:`/api/worker/assets/${asset.id}/file`});
+      }
+      if (job.kind === 'audio_preview') {
+        const asset = row('SELECT id,name,voice FROM assets WHERE id=?', job.asset_id);
+        if (!asset) { run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?", 'Die zugehörige Figur fehlt.', now(), job.id); return json(res, 204, {}); }
+        let preview = {}; try { preview = JSON.parse(job.detail || '{}'); } catch {}
+        return json(res, 200, { job, asset, preview: { text: String(preview.text || ''), voice: String(preview.voice || asset.voice || ''), language: String(preview.language || 'German') } });
+      }
+      if (job.kind === 'audio_mix') {
+        const audio = audioContextForEpisode(job.episode_id, job.owner_id);
+        if (!audio || !audio.manifestValid || !audio.sourceCurrent) { run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?", 'Audio-Plan ist veraltet oder ungültig.', now(), job.id); return json(res, 204, {}); }
+        const clips = rows('SELECT id,sequence,title,duration_seconds,output_video_path FROM shots WHERE episode_id=? AND output_video_path IS NOT NULL ORDER BY sequence,id', job.episode_id)
+          .filter(clip => existsSync(mediaPath(clip.output_video_path)))
+          .map(clip => ({ ...clip, output_video_path: undefined, downloadUrl: `/api/worker/shots/${clip.id}/video` }));
+        if (!clips.length) { run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?", 'Es gibt noch keine fertigen Video-Clips für den Mix.', now(), job.id); return json(res, 204, {}); }
+        return json(res, 200, { job, audio: { manifest: audio.manifest, settings: audio.settings }, clips });
       }
       const shot=row('SELECT * FROM shots WHERE id=?',job.shot_id);
       if(!shot){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Der zugehörige Shot fehlt.',now(),job.id);return json(res,204,{});}
@@ -1526,8 +1633,34 @@ const server = http.createServer(async (req, res) => {
       return json(res, 201, { ok: true });
     }
     if (/^\/api\/worker\/jobs\/\d+\/video$/.test(path) && req.method === 'POST') { if(!workerGuard(req,res))return; const id=Number(path.split('/')[4]),job=row('SELECT * FROM jobs WHERE id=?',id);if(!job?.shot_id)return json(res,404,{error:'Videoauftrag nicht gefunden.'});if(job.state==='abgebrochen')return json(res,409,{error:'Dieser Auftrag wurde bereits abgebrochen.'});const declared=Number(req.headers['content-length']||0);if(declared>100*1024*1024)return json(res,413,{error:'Clip ist größer als 100 MB.'});const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>100*1024*1024)throw new Error('Clip ist größer als 100 MB.');chunks.push(chunk)}if(!size)return json(res,400,{error:'Clip ist leer.'});await mkdir(UPLOADS,{recursive:true});const file=`clip-${job.episode_id}-${job.shot_id}-${randomBytes(5).toString('hex')}.mp4`;await writeFile(join(UPLOADS,file),Buffer.concat(chunks));const portable=`data/uploads/${file}`;run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?",'Clip lokal gerendert und ins Projekt hochgeladen.',now(),id);run('UPDATE shots SET status=?,output_video_path=? WHERE id=?','Gerendert',portable,job.shot_id);event('Video-Job fertig',`Job ${id} · Benutzer ${job.owner_id||'unbekannt'}`);return json(res,201,{ok:true,path:portable,size}); }
+    if (/^\/api\/worker\/jobs\/\d+\/audio-preview$/.test(path) && req.method === 'POST') {
+      if (!workerGuard(req,res)) return;
+      const id = Number(path.split('/')[4]), job = row('SELECT * FROM jobs WHERE id=?', id);
+      if (!job || job.kind !== 'audio_preview') return json(res, 404, { error: 'Stimmprobenauftrag nicht gefunden.' });
+      const chunks = []; let size = 0; for await (const chunk of req) { size += chunk.length; if (size > 25 * 1024 * 1024) throw new Error('Stimmprobe ist größer als 25 MB.'); chunks.push(chunk); }
+      if (!size) return json(res, 400, { error: 'Stimmprobe ist leer.' }); await mkdir(UPLOADS, { recursive: true });
+      const file = `voice-preview-${job.asset_id}-${randomBytes(5).toString('hex')}.wav`, portable = `data/uploads/${file}`;
+      await writeFile(join(UPLOADS, file), Buffer.concat(chunks));
+      run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?", `Stimmprobe fertig: ${portable}`, now(), id);
+      event('Stimmprobe fertig', `Job ${id}`); return json(res, 201, { ok: true, path: portable, url: `/media/${encodeURIComponent(portable)}` });
+    }
+    if (/^\/api\/worker\/jobs\/\d+\/audio-master$/.test(path) && req.method === 'POST') {
+      if (!workerGuard(req,res)) return;
+      const id = Number(path.split('/')[4]), job = row('SELECT * FROM jobs WHERE id=?', id);
+      if (!job || job.kind !== 'audio_mix') return json(res, 404, { error: 'Audio-Mix-Auftrag nicht gefunden.' });
+      const chunks = []; let size = 0; for await (const chunk of req) { size += chunk.length; if (size > 1024 * 1024 * 1024) throw new Error('Audio-Master ist größer als 1 GB.'); chunks.push(chunk); }
+      if (!size) return json(res, 400, { error: 'Audio-Master ist leer.' }); await mkdir(UPLOADS, { recursive: true });
+      const file = `audio-master-${job.episode_id}-${randomBytes(5).toString('hex')}.mp4`, portable = `data/uploads/${file}`;
+      await writeFile(join(UPLOADS, file), Buffer.concat(chunks));
+      const saved = row('SELECT manifest_json FROM episode_audio_manifests WHERE episode_id=?', job.episode_id);
+      if (saved) { try { const manifest = JSON.parse(saved.manifest_json); manifest.mix = { state: 'ready', artifact: { path: portable }, rendered_at: now() }; run('UPDATE episode_audio_manifests SET manifest_json=?,updated_at=? WHERE episode_id=?', JSON.stringify(manifest), now(), job.episode_id); } catch {} }
+      const name = `Audio-Master · Episode ${job.episode_id}.mp4`; run('INSERT INTO episode_exports(episode_id,name,file_path,type,created_at) VALUES (?,?,?,?,?)', job.episode_id, name, portable, 'mp4', now());
+      run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?", 'Stimmen erzeugt und als Audio-Master gemischt.', now(), id);
+      event('Audio-Master fertig', `Job ${id}`); return json(res, 201, { ok: true, path: portable, url: `/media/${encodeURIComponent(portable)}` });
+    }
     if (/^\/api\/worker\/episodes\/\d+\/final$/.test(path) && req.method === 'POST') { if(!workerGuard(req,res))return;const episodeId=Number(path.split('/')[4]);if(!row('SELECT id FROM episodes WHERE id=?',episodeId))return json(res,404,{error:'Episode nicht gefunden.'});const declared=Number(req.headers['content-length']||0);if(declared>1024*1024*1024)return json(res,413,{error:'Export ist größer als 1 GB.'});const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>1024*1024*1024)throw new Error('Export ist größer als 1 GB.');chunks.push(chunk)}if(!size)return json(res,400,{error:'Export ist leer.'});await mkdir(UPLOADS,{recursive:true});const requested=decodeURIComponent(String(req.headers['x-framecut-name']||'FrameCut-Final.mp4')).replace(/[^a-zA-Z0-9._ -]/g,'').slice(0,120)||'FrameCut-Final.mp4';const file=`final-${episodeId}-${randomBytes(5).toString('hex')}.mp4`;await writeFile(join(UPLOADS,file),Buffer.concat(chunks));const portable=`data/uploads/${file}`;run('INSERT INTO episode_exports(episode_id,name,file_path,type,created_at) VALUES (?,?,?,?,?)',episodeId,requested,portable,'mp4',now());event('Episode exportiert',`${requested} · ${Math.round(size/1024/1024)} MB`);return json(res,201,{ok:true,path:portable,size}); }
     if (/^\/api\/worker\/assets\/\d+\/file$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const asset=row('SELECT * FROM assets WHERE id=?',Number(path.split('/')[4])); if(!asset?.file_path)return json(res,404,{error:'Referenzdatei fehlt.'}); const target=mediaPath(asset.file_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Referenzdatei fehlt.'}); return serveFile(res,target); }
+    if (/^\/api\/worker\/shots\/\d+\/video$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const shot=row('SELECT output_video_path FROM shots WHERE id=?',Number(path.split('/')[4])); if(!shot?.output_video_path)return json(res,404,{error:'Clip fehlt.'}); const target=mediaPath(shot.output_video_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Clip fehlt.'}); return serveFile(res,target); }
     if (/^\/api\/worker\/episodes\/\d+\/status$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return;const episodeId=Number(path.split('/')[4]);const counts=rows('SELECT kind,state,count(*) count FROM jobs WHERE episode_id=? GROUP BY kind,state',episodeId);const shots=row('SELECT count(*) total,sum(CASE WHEN output_video_path IS NOT NULL THEN 1 ELSE 0 END) finished FROM shots WHERE episode_id=?',episodeId);return json(res,200,{episodeId,counts,shots}); }
     if (/^\/api\/worker\/shots\/\d+\/source$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const shot=row('SELECT * FROM shots WHERE id=?',Number(path.split('/')[4])); if(!shot?.source_image_path)return json(res,404,{error:'Startbild fehlt.'}); const target=mediaPath(shot.source_image_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Startbild fehlt.'}); return serveFile(res,target); }
     if (/^\/api\/worker\/jobs\/\d+\/(complete|fail)$/.test(path) && req.method === 'POST') { if (!workerGuard(req,res)) return; const id=Number(path.split('/')[4]),action=path.split('/')[5],d=await body(req),job=row('SELECT * FROM jobs WHERE id=?',id); if(!job)return json(res,404,{error:'Job nicht gefunden.'}); if(job.state==='abgebrochen')return json(res,409,{error:'Dieser Auftrag wurde bereits abgebrochen.'}); const state=action==='complete'?'fertig':'fehlgeschlagen'; run('UPDATE jobs SET state=?,detail=?,completed_at=? WHERE id=?',state,String(d.detail||'').slice(0,4000),now(),id); if(action==='complete'&&job.shot_id){run('UPDATE shots SET status=?,output_video_path=COALESCE(?,output_video_path) WHERE id=?','Gerendert',String(d.outputPath||'').trim()||null,job.shot_id);} if(action==='fail'&&job.shot_id){const shot=row('SELECT output_video_path FROM shots WHERE id=?',job.shot_id);run('UPDATE shots SET status=? WHERE id=?',shot?.output_video_path?'Gerendert':'Entwurf',job.shot_id);} event(action==='complete'?'Video-Job fertig':'Video-Job fehlgeschlagen',`Job ${id} · Benutzer ${job.owner_id||'unbekannt'}`); return json(res,200,{ok:true}); }

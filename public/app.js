@@ -577,6 +577,8 @@ async function refreshAudioPreflight() {
     const blockers = (audio.blockers || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>Keine Blocker erkannt.</li>';
     const validation = (audio.validationErrors || []).map(item => `<li>${esc(item)}</li>`).join('');
     const stateColor = audio.readyForMaster ? 'var(--emerald)' : '#ffb703';
+    const settings = audio.settings || {};
+    const mode = settings.mode || 'narrator_and_characters';
     target.innerHTML = `
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
         <div>
@@ -595,7 +597,31 @@ async function refreshAudioPreflight() {
         <div style="padding:9px;border:1px solid var(--line);border-radius:8px;"><b>${cue.ready || 0}</b><br><span style="font-size:11px;color:var(--text-muted);">fertig</span></div>
         <div style="padding:9px;border:1px solid var(--line);border-radius:8px;"><b>${cue.pending || 0}</b><br><span style="font-size:11px;color:var(--text-muted);">offen</span></div>
       </div>
+      <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:15px;">
+        <div class="eyebrow" style="color:var(--emerald);">SPRACHREGIE</div>
+        <p style="margin:5px 0 11px;color:var(--text-muted);font-size:12px;line-height:1.5;">Entscheidet, welche Stimme die vorhandenen Text-Cues trägt. Figuren-Stimmprofile bearbeitest und testest du unter <b>Besetzung & Welten</b>.</p>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;align-items:end;">
+          <label style="font-size:12px;display:grid;gap:5px;">Regiemodus
+            <select id="audio-direction-mode">
+              <option value="narrator_and_characters" ${mode === 'narrator_and_characters' ? 'selected' : ''}>Erzähler + Figuren</option>
+              <option value="narrator_only" ${mode === 'narrator_only' ? 'selected' : ''}>Nur Erzähler</option>
+              <option value="characters_only" ${mode === 'characters_only' ? 'selected' : ''}>Nur Figuren</option>
+            </select>
+          </label>
+          <label style="font-size:12px;display:grid;gap:5px;">Erzähler-Stimmprofil
+            <input id="audio-narrator-voice" value="${esc(settings.narrator_voice || '')}" placeholder="z. B. warm, ruhig, kinoreif, Deutsch">
+          </label>
+          <label style="font-size:12px;display:grid;gap:5px;">Sprache
+            <select id="audio-language"><option value="German" ${(settings.language || 'German') === 'German' ? 'selected' : ''}>Deutsch</option><option value="English" ${settings.language === 'English' ? 'selected' : ''}>English</option></select>
+          </label>
+          <button type="button" class="ghost" id="audio-direction-save">Regie speichern</button>
+        </div>
+      </div>
       <div style="font-size:12px;line-height:1.55;color:${audio.readyForMaster ? 'var(--emerald)' : '#ffca63'};">${audio.readyForMaster ? 'Der Mix-Worker hat alle erforderlichen Cues bestätigt.' : `<b>Noch nicht exportierbar als Audio-Master:</b><ul style="margin:6px 0 0;padding-left:18px;">${blockers}</ul>`}</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">
+        <button type="button" class="form-button" id="audio-render" ${audio.readyForMaster ? 'disabled' : ''}>Stimmen & Audio-Master rendern</button>
+        <span style="font-size:11px;color:var(--text-dim);align-self:center;">Der Worker erzeugt Sprache lokal mit Qwen TTS und mischt sie auf den Bildschnitt. Musik/SFX bleiben bewusst separate, optionale Layer.</span>
+      </div>
       ${validation ? `<details style="margin-top:10px;font-size:12px;color:#ff8a80;"><summary>Manifest-Fehler anzeigen</summary><ul style="margin:6px 0 0;padding-left:18px;">${validation}</ul></details>` : ''}
     `;
     $('#audio-preflight-refresh').onclick = refreshAudioPreflight;
@@ -604,6 +630,20 @@ async function refreshAudioPreflight() {
       const url = URL.createObjectURL(blob), link = document.createElement('a');
       link.href = url; link.download = `framecut-episode-${currentEpisode}-audio-plan.json`; link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+    $('#audio-direction-save').onclick = async () => {
+      try {
+        await api(`/api/episodes/${currentEpisode}/audio-settings`, { method: 'PUT', body: JSON.stringify({ mode: $('#audio-direction-mode').value, narratorVoice: $('#audio-narrator-voice').value, language: $('#audio-language').value }) });
+        notice('Sprachregie gespeichert. Ein vorhandener Audio-Master wird dadurch bewusst ungültig.');
+        await refreshAudioPreflight();
+      } catch (err) { notice(`Sprachregie konnte nicht gespeichert werden: ${err.message}`); }
+    };
+    const renderAudio = $('#audio-render'); if (renderAudio) renderAudio.onclick = async () => {
+      try {
+        await api(`/api/episodes/${currentEpisode}/audio-render`, { method: 'POST', body: '{}' });
+        notice('Audio-Mix ist eingereiht. Der Worker erzeugt zuerst die Stimmen und danach den MP4-Master.');
+        await load();
+      } catch (err) { notice(`Audio-Mix konnte nicht eingereiht werden: ${err.message}`); }
     };
   } catch (error) {
     target.innerHTML = `<span style="color:#ff8a80;">Audio-Prefight konnte nicht geladen werden: ${esc(error.message)}</span>`;
@@ -1233,8 +1273,9 @@ async function editAsset(a) {
         <textarea name="visualNotes">${esc(a.visual_notes || '')}</textarea>
       </label>
       ${a.kind === 'character' ? `
-      <label>Stimme (für spätere Sprachausgabe)
-        <input name="voice" value="${esc(a.voice || '')}" placeholder="z. B. männlich, ruhig und tief">
+      <label>Stimmprofil
+        <textarea name="voice" placeholder="z. B. junge, helle Schweizerdeutsche Kinderstimme; neugierig, warm, klar und natürlich">${esc(a.voice || '')}</textarea>
+        <span style="display:block;margin-top:4px;color:var(--text-dim);font-size:11px;">Diese Beschreibung wird nur an den lokalen Qwen-TTS-Adapter übergeben. Kein Klonen einer echten Stimme ohne Referenzton.</span>
       </label>
       ` : ''}
       <label>${photos.length ? 'Weiteres Foto zur Galerie hinzufügen' : 'Foto hochladen'}
@@ -1245,6 +1286,7 @@ async function editAsset(a) {
         <button type="submit" class="form-button" style="flex:2;">Änderungen speichern</button>
         <button type="button" id="modal-create-preview" class="form-button" style="background:var(--bg-elevated);color:#fff;border:1px solid var(--line);flex:2;">Foto per KI erstellen</button>
         ${a.url ? '<button type="button" id="modal-caption-asset" class="form-button" style="background:var(--bg-elevated);color:#fff;border:1px solid var(--line);flex:2;">Beschreibung per KI erstellen</button>' : ''}
+        ${a.kind === 'character' ? '<button type="button" id="modal-voice-preview" class="form-button" style="background:var(--bg-elevated);color:#fff;border:1px solid var(--line);flex:2;">Stimmprobe erzeugen</button>' : ''}
         <button type="button" id="modal-delete-asset" class="form-button" style="background:rgba(255,82,82,0.15);color:#ff5252;border:1px solid rgba(255,82,82,0.3);flex:1;">Löschen</button>
       </div>
     </form>
@@ -1316,6 +1358,20 @@ async function editAsset(a) {
       } catch (err) {
         $('#modal-error').textContent = err.message;
       }
+    };
+  }
+
+  const voiceBtn = $('#modal-voice-preview');
+  if (voiceBtn) {
+    voiceBtn.onclick = async () => {
+      try {
+        const form = voiceBtn.closest('form');
+        const voice = String(form.elements.voice?.value || '').trim();
+        await api(`/api/assets/${a.id}/voice-preview`, { method: 'POST', body: JSON.stringify({ episodeId: currentEpisode, voice, text: `Hallo, ich bin ${a.name}. Das ist meine Stimmprobe.`, language: 'German' }) });
+        closeModal();
+        notice('Stimmprobe ist eingereiht. Der lokale Worker erzeugt sie, sobald die GPU frei ist.');
+        await load();
+      } catch (err) { $('#modal-error').textContent = err.message; }
     };
   }
 }
