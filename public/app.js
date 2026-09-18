@@ -977,6 +977,12 @@ window.cancelQueueItem = cancelQueueItem;
 
 function updateQueueBulkUi(queue) {
   const selected = queue.filter(item => selectedQueueJobIds.has(item.id));
+  // Browsers may restore checked controls after a reload. Reapply our in-memory selection on
+  // every queue refresh so a destructive bulk action can only target deliberate clicks made in
+  // this FrameCut session.
+  document.querySelectorAll('[data-queue-select]').forEach(input => {
+    input.checked = selectedQueueJobIds.has(Number(input.dataset.queueSelect));
+  });
   const toggle = $('#queue-select-all');
   const cancel = $('#queue-cancel-selected');
   const count = $('#queue-selection-count');
