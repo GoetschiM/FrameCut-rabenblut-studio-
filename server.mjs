@@ -469,7 +469,7 @@ async function serveFile(res, file, cacheable = false) { try { const info = awai
 setInterval(() => {
   try {
     const orphaned = rows(`SELECT j.id, j.shot_id FROM jobs j WHERE j.state='läuft' AND j.worker_id IS NOT NULL
-      AND EXISTS (SELECT 1 FROM jobs newer WHERE newer.worker_id = j.worker_id AND newer.id > j.id AND newer.started_at IS NOT NULL)`);
+      AND EXISTS (SELECT 1 FROM jobs newer WHERE newer.worker_id = j.worker_id AND newer.started_at > j.started_at)`);
     const timedOut = rows(`SELECT id, shot_id FROM jobs WHERE state='läuft' AND started_at IS NOT NULL AND started_at < ?`,
       new Date(Date.now() - 90 * 60 * 1000).toISOString());
     const seen = new Set();
