@@ -1533,6 +1533,13 @@ const server = http.createServer(async (req, res) => {
       const outFile = `final-${episodeId}-${randomBytes(5).toString('hex')}.mp4`;
       const outPath = join(UPLOADS, outFile);
       try {
+        // The local audio worker already produced the authoritative picture+sound MP4.
+        // Re-concatenating the silent source clips here would throw that mix away while
+        // still labelling the export an Audio-Master.
+        if (!pictureOnly && audio.readyForMaster) {
+          const mixedPath = mediaPath(audio.manifest.mix.artifact.path);
+          await copyFile(mixedPath, outPath);
+        } else {
         await new Promise((resolve, reject) => {
           const ffArgs = pictureOnly
             ? ['-f', 'concat', '-safe', '0', '-i', listFile, '-map', '0:v:0', '-c:v', 'copy', '-an', '-y', outPath]
@@ -1543,6 +1550,7 @@ const server = http.createServer(async (req, res) => {
           ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exit code ${code}: ${err.slice(-500)}`)));
           ff.on('error', reject);
         });
+        }
         const statInfo = await stat(outPath);
         const portable = `data/uploads/${outFile}`;
         const exportName = `${ep.project_title} - ${ep.title}${pictureOnly ? ' [Bildschnitt ohne Ton]' : ''} (${validShots.length} Clips).mp4`;
