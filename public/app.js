@@ -518,23 +518,16 @@ function render() {
   $('#view-audio').innerHTML = `
     <div class="section-headline">
       <h3>Audio, Ton & Stimmen</h3>
-      <p>Synchrones Foley, Voiceover und Soundtrack.</p>
+      <p>Audio-Plan prüfen, bevor ein Film-Master entsteht.</p>
     </div>
     <div style="display:grid;gap:14px;max-width:800px;">
-      <div style="background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);padding:18px;">
-        <div class="eyebrow" style="color:var(--emerald);">1. NATIVES AMBIENT & FOLEY (MINIMAX H3)</div>
-        <h4 style="margin:6px 0 8px;">Synchroner Sound</h4>
-        <p style="color:var(--text-muted);font-size:13px;line-height:1.5;">Jedes gerenderte Video enthält bereits eine synchron generierte Stereo-Audiospur (Schritte, Motoren, Regen, Umgebungsgeräusche).</p>
+      <div id="audio-preflight" style="background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);padding:18px;color:var(--text-muted);font-size:13px;">
+        Audio-Plan wird geprüft …
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);padding:18px;">
-        <div class="eyebrow" style="color:var(--emerald);">2. STIMMEN & SPRACHE (SPEECHT5)</div>
-        <h4 style="margin:6px 0 8px;">Voiceover & Dialoge</h4>
-        <p style="color:var(--text-muted);font-size:13px;line-height:1.5;">Dialogtexte aus dem Storyboard werden an SpeechT5 übergeben und auf den fertigen Videoschnitt gemischt.</p>
-      </div>
-      <div style="background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);padding:18px;">
-        <div class="eyebrow" style="color:var(--emerald);">3. MUSIK & SCORE (STABLE AUDIO OPEN)</div>
-        <h4 style="margin:6px 0 8px;">Hintergrundmusik</h4>
-        <p style="color:var(--text-muted);font-size:13px;line-height:1.5;">Liegt unter <code>C:\\Users\\Miche\\Documents\\Pinokio\\api\\stable-audio-open-3-small</code> für durchgehende Scores.</p>
+        <div class="eyebrow" style="color:var(--emerald);">VERBINDLICHE REIHENFOLGE</div>
+        <h4 style="margin:6px 0 8px;">Plan → Stimmen/Sound → Mix → Master</h4>
+        <p style="color:var(--text-muted);font-size:13px;line-height:1.5;margin:0;">FrameCut erstellt aus den Dialogen einen versionierten Cue-Plan. Erst wenn ein Audio-Worker die Sprach-, Musik- und Effektdateien erzeugt und gemischt hat, darf ein Audio-Master entstehen. Ein Bildschnitt ohne Ton ist weiterhin möglich, aber nur nach einer bewussten Bestätigung.</p>
       </div>
     </div>
   `;
@@ -575,8 +568,51 @@ function render() {
   bindDynamic();
 }
 
+async function refreshAudioPreflight() {
+  const target = $('#audio-preflight');
+  if (!target || !currentEpisode) return;
+  try {
+    const audio = await api(`/api/episodes/${currentEpisode}/audio-preflight`);
+    const cue = audio.cues || {};
+    const blockers = (audio.blockers || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>Keine Blocker erkannt.</li>';
+    const validation = (audio.validationErrors || []).map(item => `<li>${esc(item)}</li>`).join('');
+    const stateColor = audio.readyForMaster ? 'var(--emerald)' : '#ffb703';
+    target.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+        <div>
+          <div class="eyebrow" style="color:${stateColor};">AUDIO-PREFLIGHT</div>
+          <h4 style="margin:6px 0 7px;">${audio.readyForMaster ? 'Bereit für Audio-Master' : 'Audio-Master noch blockiert'}</h4>
+          <p style="margin:0;color:var(--text-muted);font-size:12px;">Quelle: ${esc(audio.source)}${audio.updatedAt ? ` · aktualisiert ${esc(new Date(audio.updatedAt).toLocaleString('de-CH'))}` : ''}</p>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button type="button" class="ghost" id="audio-preflight-refresh">↻ Aktualisieren</button>
+          <button type="button" class="ghost" id="audio-manifest-download">↓ Audio-Plan JSON</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:14px 0;">
+        <div style="padding:9px;border:1px solid var(--line);border-radius:8px;"><b>${cue.total || 0}</b><br><span style="font-size:11px;color:var(--text-muted);">Cues geplant</span></div>
+        <div style="padding:9px;border:1px solid var(--line);border-radius:8px;"><b>${cue.speech || 0}</b><br><span style="font-size:11px;color:var(--text-muted);">Dialog / Off</span></div>
+        <div style="padding:9px;border:1px solid var(--line);border-radius:8px;"><b>${cue.ready || 0}</b><br><span style="font-size:11px;color:var(--text-muted);">fertig</span></div>
+        <div style="padding:9px;border:1px solid var(--line);border-radius:8px;"><b>${cue.pending || 0}</b><br><span style="font-size:11px;color:var(--text-muted);">offen</span></div>
+      </div>
+      <div style="font-size:12px;line-height:1.55;color:${audio.readyForMaster ? 'var(--emerald)' : '#ffca63'};">${audio.readyForMaster ? 'Der Mix-Worker hat alle erforderlichen Cues bestätigt.' : `<b>Noch nicht exportierbar als Audio-Master:</b><ul style="margin:6px 0 0;padding-left:18px;">${blockers}</ul>`}</div>
+      ${validation ? `<details style="margin-top:10px;font-size:12px;color:#ff8a80;"><summary>Manifest-Fehler anzeigen</summary><ul style="margin:6px 0 0;padding-left:18px;">${validation}</ul></details>` : ''}
+    `;
+    $('#audio-preflight-refresh').onclick = refreshAudioPreflight;
+    $('#audio-manifest-download').onclick = () => {
+      const blob = new Blob([JSON.stringify(audio.generatedManifest || audio.manifest, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob), link = document.createElement('a');
+      link.href = url; link.download = `framecut-episode-${currentEpisode}-audio-plan.json`; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+  } catch (error) {
+    target.innerHTML = `<span style="color:#ff8a80;">Audio-Prefight konnte nicht geladen werden: ${esc(error.message)}</span>`;
+  }
+}
+
 function bindDynamic() {
   const npMobile = $('#new-project-mobile'); if (npMobile) npMobile.onclick = newProject;
+  if ($('#audio-preflight')) refreshAudioPreflight();
   const missingPhotoToggle = $('#toggle-missing-photo-filter'); if (missingPhotoToggle) missingPhotoToggle.onclick = () => { assetFilter = assetFilter === 'missing' ? 'all' : 'missing'; render(); };
   document.querySelectorAll('[data-go]').forEach(x => x.onclick = () => openView(x.dataset.go));
   document.querySelectorAll('.filter-tab').forEach(x => x.onclick = () => { if (x.dataset.shotFilter) { shotFilter = x.dataset.shotFilter; render(); } });
@@ -688,6 +724,9 @@ function bindDynamic() {
   // Assemble episode with sound check modal
   const assembleHandler = async () => {
     const d = data.selected;
+    let audio;
+    try { audio = await api(`/api/episodes/${currentEpisode}/audio-preflight`); }
+    catch (err) { notice(`Audio-Preflight konnte nicht geladen werden: ${err.message}`); return; }
     const totalShots = (d?.shots || []).length;
     const doneShots = (d?.shots || []).filter(s => s.output_video_path).length;
     const openShots = totalShots - doneShots;
@@ -702,27 +741,28 @@ function bindDynamic() {
         Alle fertig gerenderten Video-Clips werden nahtlos zu einem finalen MP4 zusammengefügt (reiner Schnitt, keine erneute Kodierung).
       </p>
       ${incompleteWarning}
-      <div style="background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px;margin-bottom:16px;font-size:12px;">
-        <div style="color:var(--emerald);font-weight:700;margin-bottom:4px;">Audio-Status:</div>
-        <div>• Ambience & Foley: bereits fest in jedem Clip enthalten (vom Render-Modell erzeugt)</div>
-        <div>• Separate Dialog-, Stimm- und Musikspuren: noch nicht implementiert — es wird nur das Audio verwendet, das bereits im Clip steckt</div>
+      <div style="background:var(--bg-card);border:1px solid ${audio.readyForMaster ? 'var(--emerald)' : 'rgba(255,193,7,0.45)'};border-radius:var(--radius-sm);padding:12px;margin-bottom:16px;font-size:12px;">
+        <div style="color:${audio.readyForMaster ? 'var(--emerald)' : '#ffc107'};font-weight:700;margin-bottom:4px;">Audio-Status: ${audio.readyForMaster ? 'Audio-Master bereit' : 'Audio-Master blockiert'}</div>
+        ${audio.readyForMaster ? '<div>Alle Cue-Dateien wurden vom Mix-Worker bestätigt.</div>' : `<div>${esc((audio.blockers || []).join(' · ') || 'Audio-Plan ist noch nicht vollständig.')}</div><div style="margin-top:5px;color:var(--text-muted);">Ein Bildschnitt entfernt Tonspuren bewusst und wird klar so bezeichnet.</div>`}
       </div>
       <div style="display:flex;gap:10px;">
-        <button type="button" id="confirm-assemble-btn" class="form-button" style="flex:1;">${openShots > 0 ? `Trotzdem mit ${doneShots}/${totalShots} Shots schneiden` : 'Video jetzt schneiden'}</button>
+        ${audio.readyForMaster ? `<button type="button" id="confirm-assemble-btn" class="form-button" style="flex:1;">${openShots > 0 ? `Trotzdem mit ${doneShots}/${totalShots} Shots mischen` : 'Audio-Master jetzt erstellen'}</button>` : `<button type="button" id="confirm-picture-only-btn" class="form-button" style="background:var(--bg-elevated);border:1px solid var(--line);color:#fff;flex:1;">Bildschnitt ohne Ton erstellen</button>`}
         <button type="button" class="form-button" style="background:var(--bg-elevated);border:1px solid var(--line);color:#fff;flex:1;" onclick="closeModal()">Abbrechen</button>
       </div>
     `, () => {});
 
-    $('#confirm-assemble-btn').onclick = async () => {
+    const assemble = async pictureOnly => {
       closeModal();
       try {
-        notice('Füge alle Szenen zu einem durchgehenden Film zusammen...');
-        const res = await api(`/api/episodes/${currentEpisode}/assemble`, { method: 'POST' });
-        notice(`Film fertiggestellt: ${res.name}!`);
+        notice(pictureOnly ? 'Erstelle ausdrücklich einen Bildschnitt ohne Ton …' : 'Mische alle Szenen zu einem Audio-Master …');
+        const res = await api(`/api/episodes/${currentEpisode}/assemble`, { method: 'POST', body: JSON.stringify({ pictureOnly }) });
+        notice(`${pictureOnly ? 'Bildschnitt' : 'Film'} fertiggestellt: ${res.name}!`);
         await load();
         openView('exports');
       } catch (err) { notice(err.message); }
     };
+    const audioBtn = $('#confirm-assemble-btn'); if (audioBtn) audioBtn.onclick = () => assemble(false);
+    const pictureBtn = $('#confirm-picture-only-btn'); if (pictureBtn) pictureBtn.onclick = () => assemble(true);
   };
   const aBtn = $('#assemble-episode'); if (aBtn) aBtn.onclick = assembleHandler;
   const eBtn = $('#exports-assemble-btn'); if (eBtn) eBtn.onclick = assembleHandler;
