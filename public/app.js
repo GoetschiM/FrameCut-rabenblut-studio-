@@ -910,6 +910,7 @@ async function renderArchivedEpisodes() {
 
 // SHARED RENDER QUEUE — everyone renders through the same serial worker, so make that visible.
 let queuePollHandle = null;
+const selectedQueueJobIds = new Set();
 
 function queueRowLabel(item) {
   const place = [item.project_title, item.episode_title ? `EP ${String(item.episode_number).padStart(2, '0')} · ${item.episode_title}` : null].filter(Boolean).join(' · ');
@@ -974,6 +975,37 @@ async function cancelQueueItem(jobId) {
 }
 window.cancelQueueItem = cancelQueueItem;
 
+function updateQueueBulkUi(queue) {
+  const selected = queue.filter(item => selectedQueueJobIds.has(item.id));
+  const toggle = $('#queue-select-all');
+  const cancel = $('#queue-cancel-selected');
+  const count = $('#queue-selection-count');
+  if (toggle) {
+    toggle.checked = queue.length > 0 && selected.length === queue.length;
+    toggle.indeterminate = selected.length > 0 && selected.length < queue.length;
+  }
+  if (count) count.textContent = selected.length ? `${selected.length} ausgewählt` : 'Nichts ausgewählt';
+  if (cancel) {
+    cancel.disabled = selected.length === 0;
+    cancel.textContent = selected.length ? `Auswahl abbrechen · ${selected.length}` : 'Auswahl abbrechen';
+  }
+}
+
+async function cancelSelectedQueueItems(queue) {
+  const selected = queue.filter(item => selectedQueueJobIds.has(item.id));
+  if (!selected.length) return;
+  const hasRunning = selected.some(item => item.state === 'läuft');
+  const warning = hasRunning ? '\nDer aktuell laufende Auftrag wird beim nächsten Worker-Kontakt abgebrochen.' : '';
+  if (!confirm(`${selected.length} ausgewählte Aufträge aus der Warteschlange entfernen? Bereits fertige Clips bleiben unverändert im Projekt.${warning}`)) return;
+  try {
+    const result = await api('/api/jobs/cancel', { method: 'POST', body: JSON.stringify({ ids: selected.map(item => item.id) }) });
+    selectedQueueJobIds.clear();
+    notice(`${result.canceled} Auftrag/Aufträge abgebrochen. Fertige Ergebnisse wurden nicht gelöscht.`);
+    await pollQueueStatus();
+    await load();
+  } catch (err) { notice(err.message); }
+}
+
 function updateWorkerPill(worker, queueLength) {
   const runner = document.querySelector('.runner');
   if (!runner) return;
@@ -1000,6 +1032,7 @@ async function pollQueueStatus() {
   if (!el) return;
   try {
     const { queue, avgSeconds, worker, runningCount = 0, waitingCount = 0 } = await api('/api/queue');
+    for (const id of [...selectedQueueJobIds]) if (!queue.some(item => item.id === id)) selectedQueueJobIds.delete(id);
     toggleStopButtons(queue.length > 0);
     updateWorkerPill(worker, queue.length);
     if (!queue.length) { el.innerHTML = ''; return; }
@@ -1037,6 +1070,11 @@ async function pollQueueStatus() {
         ` : `
           <div class="render-idle-note">Der Worker ist verbunden und übernimmt den nächsten Auftrag automatisch.</div>
         `}
+        <div class="render-queue-bulk" aria-label="Sammelaktionen für die Warteschlange">
+          <label class="queue-select-all"><input id="queue-select-all" type="checkbox"> <span>Alle sichtbaren markieren</span></label>
+          <span id="queue-selection-count" class="queue-selection-count">Nichts ausgewählt</span>
+          <button id="queue-cancel-selected" class="queue-bulk-cancel" type="button" disabled>Auswahl abbrechen</button>
+        </div>
         <div class="render-queue-list" aria-label="Wartende und laufende Aufträge">
         ${queue.map(item => {
           const running = item.state === 'läuft';
@@ -1044,6 +1082,7 @@ async function pollQueueStatus() {
           const phase = renderJobPhase(item);
           return `
           <div class="render-queue-row ${running ? 'is-running' : ''}">
+            <label class="queue-row-select"><input type="checkbox" data-queue-select="${item.id}" aria-label="${esc(queueRowLabel(item))} auswählen" ${selectedQueueJobIds.has(item.id) ? 'checked' : ''}></label>
             ${running
               ? '<span class="shot-badge running" style="position:static;"><span class="pulse" style="width:6px;height:6px;margin:0;"></span> RENDERT</span>'
               : `<span class="shot-badge queued" style="position:static;">#${item.position}</span>`}
@@ -1065,6 +1104,19 @@ async function pollQueueStatus() {
         ${avgSeconds ? `<p class="render-queue-footnote">Vergleichswert: durchschnittlich ${formatEta(avgSeconds)} pro fertigem Video. Referenzbilder und ein frischer Modellstart können länger dauern.</p>` : '<p class="render-queue-footnote">Nach den ersten fertigen Videos zeigt FrameCut hier eine realistische durchschnittliche Dauer.</p>'}
       </section>
     `;
+    document.querySelectorAll('[data-queue-select]').forEach(input => input.onchange = () => {
+      const id = Number(input.dataset.queueSelect);
+      if (input.checked) selectedQueueJobIds.add(id); else selectedQueueJobIds.delete(id);
+      updateQueueBulkUi(queue);
+    });
+    $('#queue-select-all').onchange = event => {
+      if (event.target.checked) queue.forEach(item => selectedQueueJobIds.add(item.id));
+      else queue.forEach(item => selectedQueueJobIds.delete(item.id));
+      document.querySelectorAll('[data-queue-select]').forEach(input => { input.checked = event.target.checked; });
+      updateQueueBulkUi(queue);
+    };
+    $('#queue-cancel-selected').onclick = () => cancelSelectedQueueItems(queue);
+    updateQueueBulkUi(queue);
   } catch (e) { /* transient — keep the last known state on screen */ }
 }
 

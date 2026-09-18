@@ -1182,6 +1182,24 @@ const server = http.createServer(async (req, res) => {
       event('Auftrag abgebrochen', job.label);
       return json(res, 200, { ok: true });
     }
+    if (path === '/api/jobs/cancel' && req.method === 'POST') {
+      if (!guard(req, res)) return;
+      const d = await body(req);
+      const ids = [...new Set((Array.isArray(d.ids) ? d.ids : []).map(Number).filter(id => Number.isSafeInteger(id) && id > 0))].slice(0, 200);
+      if (!ids.length) return json(res, 400, { error: 'Wähle mindestens einen Auftrag aus.' });
+      const marks = ids.map(() => '?').join(',');
+      const targets = rows(`SELECT id, shot_id, label FROM jobs WHERE id IN (${marks}) AND state IN ('wartet','läuft')`, ...ids);
+      if (!targets.length) return json(res, 404, { error: 'Die ausgewählten Aufträge sind nicht mehr aktiv.' });
+      for (const job of targets) {
+        run("UPDATE jobs SET state='abgebrochen', detail='Aus der Mehrfachauswahl abgebrochen.', completed_at=? WHERE id=?", now(), job.id);
+        if (job.shot_id) {
+          const shot = row('SELECT output_video_path FROM shots WHERE id=?', job.shot_id);
+          run('UPDATE shots SET status=? WHERE id=?', shot?.output_video_path ? 'Gerendert' : 'Entwurf', job.shot_id);
+        }
+      }
+      event('Ausgewählte Aufträge abgebrochen', `${targets.length} von ${ids.length} markierten Aufträgen.`);
+      return json(res, 200, { ok: true, canceled: targets.length });
+    }
     if (path === '/api/trash' && req.method === 'GET') {
       if (!guard(req, res)) return;
       return json(res, 200, { items: rows('SELECT id, kind, label, deleted_at FROM trash ORDER BY id DESC') });
