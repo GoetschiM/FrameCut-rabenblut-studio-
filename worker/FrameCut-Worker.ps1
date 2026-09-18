@@ -171,11 +171,13 @@ function Stop-OwnedComfy {
   }
   Remove-Item -LiteralPath $ownedPidPath -Force -ErrorAction SilentlyContinue
 }
-function Invoke-ZImage([string]$Prompt,[string]$Prefix,[int]$Seed,[int]$Steps=12) {
+function Invoke-ZImage([string]$Prompt,[string]$Prefix,[int]$Seed,[int]$Steps=12,[string]$NegativePrompt='') {
   Ensure-Comfy
   $env:COMFY_URL=$config.ComfyUrl
   $imageTimeout=if($config.ImageTimeoutSeconds){[Math]::Max(120,[int]$config.ImageTimeoutSeconds)}else{900}
-  try { Invoke-BoundedPython @($imageClient,$Prompt,'--negativ','contact sheet, storyboard grid, collage, split screen, multiple panels, model sheet, turnaround sheet, white background, text, caption, watermark, logo, malformed anatomy, duplicate people, extra limbs, flat lighting, open door on a moving vehicle, laptop outside a vehicle, physically impossible vehicle, floating objects','--breite','768','--hoehe','448','--schritte',[string]$Steps,'--seed',[string]$Seed,'--name',$Prefix) $imageTimeout 'ComfyUI Z-Image' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
+  $baseNegative='contact sheet, storyboard grid, collage, split screen, multiple panels, model sheet, turnaround sheet, white background, text, caption, watermark, logo, malformed anatomy, duplicate people, extra limbs, flat lighting, open door on a moving vehicle, laptop outside a vehicle, physically impossible vehicle, floating objects'
+  $effectiveNegative=if($NegativePrompt){"$baseNegative, $NegativePrompt"}else{$baseNegative}
+  try { Invoke-BoundedPython @($imageClient,$Prompt,'--negativ',$effectiveNegative,'--breite','768','--hoehe','448','--schritte',[string]$Steps,'--seed',[string]$Seed,'--name',$Prefix) $imageTimeout 'ComfyUI Z-Image' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
   $folder=Split-Path $Prefix -Parent
   $leaf=Split-Path $Prefix -Leaf
   $result=Get-ChildItem -LiteralPath (Join-Path $comfyOutputRoot $folder) -Filter "$leaf*.png"|Sort-Object LastWriteTime -Descending|Select-Object -First 1
@@ -280,7 +282,8 @@ function Process-Job($payload) {
   $visualRefs=@($keyframeRefs|Where-Object {$_.kind -ne 'source'}|Select-Object -First 3)
   $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {"$($_.name): $($_.visual_notes)"}) -join ' | ' } else { 'None' }
   $teslaRequested=($shot.prompt -match '(?i)\btesla\b') -or (($visualRefs|Where-Object {$_.name -match '(?i)\btesla\b'}).Count -gt 0)
-  $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'Do not show a Tesla, an electric car or a parked vehicle in this shot.'}
+  $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'ABSOLUTE EXCLUSION: this is a car-free, vehicle-free frame. Show zero cars or other vehicles anywhere: no Tesla, no automobile, no sedan, no SUV, no parked traffic and no road traffic.'}
+  $vehicleNegative=if($teslaRequested){''}else{'Tesla, car, automobile, sedan, SUV, vehicle, electric car, parked car, traffic, road traffic'}
   $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage. Opening instant of this exact shot: {0}. Camera: {1}. Continuity metadata only (do not visualize biography, occupations or props unless the shot action explicitly asks for them): {2}. Show only the subjects and objects required by the stated action. {3} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {4}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout." -f $shot.prompt,$shot.camera,$assetText,$teslaRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
   $approvedKeyframe=Join-Path $runtimeRoot ("approved-keyframes\shot-{0}.png" -f [int]$shot.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
@@ -288,7 +291,7 @@ function Process-Job($payload) {
     Write-Host ("Geprueften Keyframe wiederverwenden: {0}" -f $approvedKeyframe) -ForegroundColor Cyan
     $sceneKeyframe=$approvedKeyframe
   } else {
-    $sceneKeyframe=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}" -f [int]$job.id) ([int]$shot.seed) $photoSteps
+    $sceneKeyframe=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}" -f [int]$job.id) ([int]$shot.seed) $photoSteps $vehicleNegative
   }
   Copy-Item -LiteralPath $sceneKeyframe -Destination (Join-Path $jobRoot 'scene-keyframe.png') -Force
   $cleanRefs=@()
