@@ -24,7 +24,8 @@ $comfyPythonExe = Join-Path $comfyAppPath 'env\Scripts\python.exe'
 $qwenAppPath = if ($config.QwenTtsAppPath) { $config.QwenTtsAppPath } else { Join-Path $pinokioHome 'api\Qwen3-TTS-Pinokio.git\app' }
 $qwenPythonExe = if ($config.QwenTtsPythonPath) { $config.QwenTtsPythonPath } else { Join-Path $qwenAppPath 'venv\Scripts\python.exe' }
 $qwenClient = Join-Path $workerRoot 'framecut_qwen_tts.py'
-$qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '1.7B' }
+$qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '0.6B' }
+$qwenVoiceMode = if ($config.QwenTtsVoiceMode) { [string]$config.QwenTtsVoiceMode } else { 'custom' }
 $stableAudioClient = Join-Path $workerRoot 'framecut_stable_audio.py'
 $stableAudioPython = if ($config.StableAudioPythonPath) { $config.StableAudioPythonPath } else { $qwenPythonExe }
 $stableAudioRef = if ($config.StableAudioRef) { [string]$config.StableAudioRef } else { '' }
@@ -416,7 +417,7 @@ function Invoke-QwenSpeech([array]$SpeechJobs,[string]$JobRoot) {
     # the array shape and avoids a silent scalar job specification.
     ConvertTo-Json -InputObject @($SpeechJobs) -Depth 8 | Set-Content -LiteralPath $specPath -Encoding utf8
     $stdoutPath=Join-Path $JobRoot 'qwen-stdout.log';$stderrPath=Join-Path $JobRoot 'qwen-stderr.log'
-    $argLine="`"$qwenClient`" --qwen-app `"$qwenAppPath`" --jobs `"$specPath`" --model-size $qwenModelSize"
+    $argLine="`"$qwenClient`" --qwen-app `"$qwenAppPath`" --jobs `"$specPath`" --model-size $qwenModelSize --voice-mode $qwenVoiceMode"
     Write-Host ("Qwen3-TTS erzeugt {0} Stimme(n) ..." -f $SpeechJobs.Count) -ForegroundColor Cyan
     $proc=Start-Process -FilePath $qwenPythonExe -ArgumentList $argLine -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
     if($null -eq $proc){throw 'Qwen3-TTS-Prozess konnte nicht gestartet werden.'}
