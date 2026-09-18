@@ -46,9 +46,9 @@ public static class FrameCutPower {
   [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
   private struct ReasonContext { public uint Version; public uint Flags; [MarshalAs(UnmanagedType.LPWStr)] public string Reason; }
   private static IntPtr request = IntPtr.Zero;
-  [DllImport("powrprof.dll", SetLastError = true)] private static extern IntPtr PowerCreateRequest(ref ReasonContext context);
-  [DllImport("powrprof.dll", SetLastError = true)] private static extern bool PowerSetRequest(IntPtr handle, int requestType);
-  [DllImport("powrprof.dll", SetLastError = true)] private static extern bool PowerClearRequest(IntPtr handle, int requestType);
+  [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr PowerCreateRequest(ref ReasonContext context);
+  [DllImport("kernel32.dll", SetLastError = true)] private static extern bool PowerSetRequest(IntPtr handle, int requestType);
+  [DllImport("kernel32.dll", SetLastError = true)] private static extern bool PowerClearRequest(IntPtr handle, int requestType);
   [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
 
   // SystemRequired=1 and ExecutionRequired=3 are process-bound requests understood by
