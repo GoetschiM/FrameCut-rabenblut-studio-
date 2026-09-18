@@ -1026,6 +1026,22 @@ function renderJobPhase(item) {
         : 'Startet automatisch, sobald alle verknüpften Referenzbilder fertig sind und die GPU frei ist.',
     };
   }
+  if (item.kind === 'audio_cue') {
+    return {
+      label: 'Audio-Spur',
+      text: item.state === 'läuft'
+        ? 'Der Worker erzeugt diese einzelne Stimme, Musik- oder Effektspur und bestätigt sie vor dem Mix.'
+        : 'Wartet als eigene, bearbeitbare Spur auf den lokalen Audio-Worker.',
+    };
+  }
+  if (item.kind === 'audio_mix') {
+    return {
+      label: 'Audio-Mix',
+      text: item.state === 'läuft'
+        ? 'Bestätigte Spuren werden zeitlich gemischt, Sprache über Musik geduckt und als MP4-Master gespeichert.'
+        : 'Startet erst, wenn alle vorgesehenen Audio-Spuren bestätigt sind.',
+    };
+  }
   return { label: 'Auftrag', text: item.state === 'läuft' ? 'Der lokale Worker verarbeitet diesen Auftrag.' : 'Wartet auf den lokalen Worker.' };
 }
 
