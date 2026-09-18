@@ -25,6 +25,13 @@ $qwenAppPath = if ($config.QwenTtsAppPath) { $config.QwenTtsAppPath } else { Joi
 $qwenPythonExe = if ($config.QwenTtsPythonPath) { $config.QwenTtsPythonPath } else { Join-Path $qwenAppPath 'venv\Scripts\python.exe' }
 $qwenClient = Join-Path $workerRoot 'framecut_qwen_tts.py'
 $qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '1.7B' }
+$jobWorkspaceRoot = Join-Path $runtimeRoot 'jobs'
+# Working folders only contain copies, logs and intermediate render results. They are
+# deliberately separate from approved keyframes and central project media, which must
+# never be removed by the local worker cleanup routine.
+$failedJobRetentionHours = if ($config.FailedJobRetentionHours -ne $null) { [Math]::Max(1, [int]$config.FailedJobRetentionHours) } else { 168 }
+$minimumFreeDiskGb = if ($config.MinimumFreeDiskGb -ne $null) { [Math]::Max(1, [double]$config.MinimumFreeDiskGb) } else { 12 }
+$script:storageWarned = $false
 
 # Clips are delivered without sound by default; set StripAudio to false in worker.config.json
 # to keep whatever the video model generated.
@@ -82,6 +89,67 @@ function Set-Awake([bool]$Enabled) {
     [FrameCutPower]::ReleasePowerRequest()
     [void][FrameCutPower]::SetThreadExecutionState([Convert]::ToUInt32('80000000',16))
   }
+}
+function Get-FreeDiskGb([string]$Path) {
+  try {
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $driveRoot = [IO.Path]::GetPathRoot($fullPath)
+    if (-not $driveRoot) { return $null }
+    $disk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $driveRoot.TrimEnd('\\')) -ErrorAction Stop
+    if ($disk -and $null -ne $disk.FreeSpace) { return [Math]::Round(([double]$disk.FreeSpace / 1GB), 2) }
+  } catch {
+    Write-Host ("Warnung: Freien Worker-Speicher konnte nicht ermittelt werden: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+  }
+  return $null
+}
+function Get-JobWorkspace($Job) {
+  switch ([string]$Job.kind) {
+    'caption_asset' { return Join-Path $jobWorkspaceRoot ("caption-{0}" -f $Job.id) }
+    'audio_preview' { return Join-Path $jobWorkspaceRoot ("audio-preview-{0}" -f $Job.id) }
+    'audio_mix' { return Join-Path $jobWorkspaceRoot ("audio-mix-{0}" -f $Job.id) }
+    'minimax_h3' { return Join-Path $jobWorkspaceRoot ([string]$Job.id) }
+    default { return $null }
+  }
+}
+function Remove-ConfirmedJobWorkspace($Job) {
+  $workspace = Get-JobWorkspace $Job
+  if (-not $workspace -or -not (Test-Path -LiteralPath $workspace)) { return }
+  try {
+    # This function is reached only after the server accepted the result endpoint or
+    # completed a report call. Never call it from an error path: failed workspaces are
+    # retained for diagnosis and the scheduled expiry sweep below.
+    Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction Stop
+    Write-Host ("Lokaler Arbeitsordner nach bestätigtem Upload entfernt: {0}" -f (Split-Path $workspace -Leaf)) -ForegroundColor DarkGray
+  } catch {
+    Write-Host ("Warnung: Arbeitsordner konnte nicht bereinigt werden: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+  }
+}
+function Invoke-ExpiredWorkspaceCleanup {
+  New-Item -ItemType Directory -Force -Path $jobWorkspaceRoot | Out-Null
+  $cutoff = (Get-Date).AddHours(-$failedJobRetentionHours)
+  $removed = 0
+  foreach ($workspace in @(Get-ChildItem -LiteralPath $jobWorkspaceRoot -Directory -ErrorAction SilentlyContinue)) {
+    if ($workspace.LastWriteTime -ge $cutoff) { continue }
+    try {
+      Remove-Item -LiteralPath $workspace.FullName -Recurse -Force -ErrorAction Stop
+      $removed++
+    } catch {
+      Write-Host ("Warnung: Alter Arbeitsordner konnte nicht bereinigt werden ({0}): {1}" -f $workspace.Name,$_.Exception.Message) -ForegroundColor Yellow
+    }
+  }
+  if ($removed -gt 0) { Write-Host ("Storage-Cleanup: {0} abgelaufene Fehler-Arbeitsordner entfernt." -f $removed) -ForegroundColor DarkGray }
+}
+function Test-WorkerStorageAvailable {
+  $freeGb = Get-FreeDiskGb $runtimeRoot
+  if ($null -eq $freeGb -or $freeGb -ge $minimumFreeDiskGb) {
+    $script:storageWarned = $false
+    return $true
+  }
+  if (-not $script:storageWarned) {
+    Write-Host ("WORKER PAUSIERT: Nur noch {0:N2} GB frei; mindestens {1:N2} GB sind konfiguriert. Es werden keine neuen Jobs beansprucht, bis Speicher freigegeben wurde." -f $freeGb,$minimumFreeDiskGb) -ForegroundColor Red
+    $script:storageWarned = $true
+  }
+  return $false
 }
 function Get-ClipDurationSeconds([string]$Path) {
   if(-not $ffprobeExe -or -not (Test-Path -LiteralPath $ffprobeExe)){return $null}
@@ -250,6 +318,8 @@ function Process-ImageJob($payload) {
   $encoded=[Convert]::ToBase64String([IO.File]::ReadAllBytes($result.FullName))
   $body=@{data="data:image/png;base64,$encoded"}|ConvertTo-Json -Compress
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/image" -Headers (Headers) -ContentType 'application/json' -Body $body | Out-Null
+  # The asset has been persisted centrally. This ComfyUI output is only an upload copy.
+  Remove-Item -LiteralPath $result.FullName -Force -ErrorAction SilentlyContinue
   Write-Host ("Referenz online gespeichert: {0}" -f $asset.name) -ForegroundColor Green
 }
 function Process-CaptionJob($payload) {
@@ -442,10 +512,17 @@ function Process-Job($payload) {
     if($delta -gt 0.35){$durationDetail += (" · Abweichung: {0:N2}s (H3-Frame-Raster)" -f $delta)}
     Report-Job $job.id 'complete' $durationDetail
   }
+  # The server has acknowledged the uploaded project clip. The H3 original inside
+  # outputs-v2 is now only a local duplicate, so remove that single file as well.
+  # The job workspace is removed by the caller after this function returns.
+  if ($result -and (Test-Path -LiteralPath $result.FullName)) {
+    Remove-Item -LiteralPath $result.FullName -Force -ErrorAction SilentlyContinue
+  }
   Write-Host ("Fertig: {0}" -f $result.FullName) -ForegroundColor Green
 }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
+Invoke-ExpiredWorkspaceCleanup
 $transcriptStarted=$false
 try { Start-Transcript -LiteralPath (Join-Path $runtimeRoot 'worker.log') -Append | Out-Null; $transcriptStarted=$true } catch {}
 # Two workers would fight over the same jobs and the same GPU.  A named mutex is the
@@ -492,8 +569,11 @@ try {
     # or vendor power-management software, but both together keep a remote render host awake.
     Set-Awake $true
     try {
-      $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)
-      if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload}}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}
+      Invoke-ExpiredWorkspaceCleanup
+      if (Test-WorkerStorageAvailable) {
+        $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)
+        if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload};Remove-ConfirmedJobWorkspace $payload.job}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}
+      }
     } catch {Write-Host ("Verbindung wartet: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow}
     if(-not $Once){for($i=0;$i -lt 10 -and -not (Test-Path -LiteralPath $stopPath);$i++){Start-Sleep -Seconds 1}}
   } while(-not $Once)

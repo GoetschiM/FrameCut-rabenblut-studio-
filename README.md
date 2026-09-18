@@ -27,6 +27,16 @@ Git. Runtime data is intentionally ignored by `.gitignore`.
 The worker claims jobs serially. A job retains its project, episode, shot and owner metadata,
 so multiple users can safely submit work to one GPU queue.
 
+### Local storage lifecycle
+
+Only centrally confirmed uploads are considered final project media. After the server accepts
+a video, image, audio preview or audio master, the worker removes its corresponding local job
+workspace and the duplicated H3 output. Failed workspaces remain available for diagnosis for
+`FailedJobRetentionHours` (default: 168 hours) and are then removed on the worker's next poll.
+`MinimumFreeDiskGb` (default: 12 GB) pauses claims for new jobs before the local render disk
+becomes full. It never deletes approved keyframes, reference caches or any project media on the
+server; those need an explicit project retention/deletion policy.
+
 ## Current production baseline
 
 This initial commit is a source snapshot of the FrameCut service running on the Proxmox LXC

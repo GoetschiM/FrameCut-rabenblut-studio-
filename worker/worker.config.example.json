@@ -10,6 +10,8 @@
   "QwenTtsPythonPath": "C:\\Users\\YOUR_USER\\Documents\\Pinokio\\api\\Qwen3-TTS-Pinokio.git\\app\\venv\\Scripts\\python.exe",
   "QwenTtsModelSize": "1.7B",
   "AudioTimeoutSeconds": 7200,
+  "FailedJobRetentionHours": 168,
+  "MinimumFreeDiskGb": 12,
   "FfmpegPath": "C:\\Path\\To\\ffmpeg.exe",
   "StripAudio": true
 }
