@@ -27,6 +27,8 @@ $qwenClient = Join-Path $workerRoot 'framecut_qwen_tts.py'
 $qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '1.7B' }
 $stableAudioClient = Join-Path $workerRoot 'framecut_stable_audio.py'
 $stableAudioPython = if ($config.StableAudioPythonPath) { $config.StableAudioPythonPath } else { $qwenPythonExe }
+$stableAudioRef = if ($config.StableAudioRef) { [string]$config.StableAudioRef } else { '' }
+$stableAudioLaunchScript = if ($config.StableAudioLaunchScript) { [string]$config.StableAudioLaunchScript } else { 'start.js' }
 $stableAudioMusicUrl = if ($config.StableAudioMusicUrl) { [string]$config.StableAudioMusicUrl } else { '' }
 $stableAudioSfxUrl = if ($config.StableAudioSfxUrl) { [string]$config.StableAudioSfxUrl } else { '' }
 $stableAudioTimeout = if ($config.StableAudioTimeoutSeconds) { [Math]::Max(120, [int]$config.StableAudioTimeoutSeconds) } else { 1800 }
@@ -178,11 +180,13 @@ function Report-Job([int]$Id,[string]$Action,[string]$Detail,[string]$OutputPath
   $payload=@{detail=$Detail}; if($OutputPath){$payload.outputPath=$OutputPath}
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$Id/$Action" -Headers (Headers) -ContentType 'application/json' -Body ($payload|ConvertTo-Json) | Out-Null
 }
-function Get-H3Status {
-  try { return (& $pterm status $config.H3Ref --probe | ConvertFrom-Json) } catch { return $null }
+function Get-PinokioStatus([string]$Ref) {
+  if (-not $Ref) { return $null }
+  try { return (& $pterm status $Ref --probe | ConvertFrom-Json) } catch { return $null }
 }
-function Invoke-PtermBounded([string]$Action,[int]$TimeoutSeconds=90) {
-  $command=Start-Job -ScriptBlock { param($ptermPath,$verb,$ref) & $ptermPath $verb $ref 2>&1 } -ArgumentList $pterm,$Action,$config.H3Ref
+function Get-H3Status { return Get-PinokioStatus $config.H3Ref }
+function Invoke-PtermBounded([string]$Action,[int]$TimeoutSeconds=90,[string]$Ref=$config.H3Ref,[string[]]$ExtraArgs=@()) {
+  $command=Start-Job -ScriptBlock { param($ptermPath,$verb,$ref,$extra) & $ptermPath $verb $ref @extra 2>&1 } -ArgumentList $pterm,$Action,$Ref,$ExtraArgs
   $finished=Wait-Job -Job $command -Timeout $TimeoutSeconds
   if(-not $finished){
     Stop-Job -Job $command -ErrorAction SilentlyContinue
@@ -193,14 +197,15 @@ function Invoke-PtermBounded([string]$Action,[int]$TimeoutSeconds=90) {
   Remove-Job -Job $command -Force -ErrorAction SilentlyContinue
   return [pscustomobject]@{TimedOut=$false;Output=$output}
 }
-function Wait-H3Ready([int]$TimeoutSeconds=600) {
+function Wait-PinokioReady([string]$Ref,[int]$TimeoutSeconds=600) {
   for($elapsed=0;$elapsed -lt $TimeoutSeconds;$elapsed+=5){
-    $status=Get-H3Status
+    $status=Get-PinokioStatus $Ref
     if($status -and $status.ready){return $true}
     Start-Sleep -Seconds 5
   }
   return $false
 }
+function Wait-H3Ready([int]$TimeoutSeconds=600) { return Wait-PinokioReady $config.H3Ref $TimeoutSeconds }
 function Reset-H3 {
   Write-Host 'MiniMax H3 wird kontrolliert zurueckgesetzt ...' -ForegroundColor Yellow
   $stop=Invoke-PtermBounded 'stop' 90
@@ -208,6 +213,14 @@ function Reset-H3 {
   Start-Sleep -Seconds 8
 }
 function Ensure-H3 {
+  # Stable Audio owns the same local GPU. Stop it before H3 starts rather than
+  # letting two heavyweight models contend for a few GB of VRAM.
+  $stable=Get-PinokioStatus $stableAudioRef
+  if($stable -and $stable.running){
+    Write-Host 'Stable Audio wird für den nächsten Video-Job freigegeben ...' -ForegroundColor DarkGray
+    [void](Invoke-PtermBounded 'stop' 90 $stableAudioRef)
+    Start-Sleep -Seconds 4
+  }
   $status=Get-H3Status
   if($status -and $status.ready){return}
 
@@ -233,6 +246,31 @@ function Ensure-H3 {
     if($attempt -lt 2){Reset-H3}
   }
   throw 'MiniMax H3 konnte nach einem kontrollierten Reset nicht gestartet werden.'
+}
+function Ensure-StableAudio {
+  if(-not $stableAudioRef){throw 'Stable Audio ist nicht konfiguriert. Setze StableAudioRef im Worker-Setup.'}
+  # Render jobs are serial, nevertheless H3 can remain resident after the last clip.
+  # Explicitly stop it before starting Stable Audio to make the GPU hand-over reliable.
+  $h3=Get-H3Status
+  if($h3 -and $h3.running){
+    Write-Host 'MiniMax H3 wird für die Audio-Spur freigegeben ...' -ForegroundColor DarkGray
+    [void](Invoke-PtermBounded 'stop' 90 $config.H3Ref)
+    Start-Sleep -Seconds 5
+  }
+  $status=Get-PinokioStatus $stableAudioRef
+  if($status -and $status.ready -and $status.ready_url){return [string]$status.ready_url}
+  if($status -and $status.running){
+    Write-Host 'Stable Audio startet bereits; warte auf die lokale API ...' -ForegroundColor Cyan
+    if(Wait-PinokioReady $stableAudioRef 900){return [string](Get-PinokioStatus $stableAudioRef).ready_url}
+    throw 'Stable Audio wurde nicht rechtzeitig bereit.'
+  }
+  Write-Host 'Stable Audio 3 wird über Pinokio gestartet ...' -ForegroundColor Cyan
+  $start=Invoke-PtermBounded 'run' 120 $stableAudioRef @('--default',$stableAudioLaunchScript)
+  if($start.TimedOut){throw 'Pinokio konnte Stable Audio nicht rechtzeitig starten.'}
+  if(-not (Wait-PinokioReady $stableAudioRef 900)){throw 'Stable Audio wurde nicht rechtzeitig bereit.'}
+  $ready=[string](Get-PinokioStatus $stableAudioRef).ready_url
+  if(-not $ready){throw 'Stable Audio meldet keine lokale API-URL.'}
+  return $ready
 }
 function Free-Models([string]$Url) {
   try { Invoke-RestMethod -Method Post -Uri "$Url/free" -ContentType 'application/json' -Body '{"unload_models":true,"free_memory":true}' | Out-Null } catch {}
@@ -387,8 +425,7 @@ function Invoke-StableAudioCue($Cue,[string]$JobRoot) {
   if (-not (Test-Path -LiteralPath $stableAudioPython)) { throw "Stable-Audio Python-Umgebung fehlt: $stableAudioPython" }
   $baseUrl = if ($Cue.kind -eq 'music') { $stableAudioMusicUrl } else { $stableAudioSfxUrl }
   if (-not $baseUrl) {
-    $needed = if ($Cue.kind -eq 'music') { 'StableAudioMusicUrl' } else { 'StableAudioSfxUrl' }
-    throw "Stable Audio 3 ist für $($Cue.kind) nicht eingerichtet. Setze $needed im Worker-Setup; die Audio-Spur wurde nicht stillschweigend übersprungen."
+    $baseUrl = Ensure-StableAudio
   }
   $spec = Join-Path $JobRoot 'stable-audio-cue.json'
   $output = Join-Path $JobRoot 'generated-audio.wav'
