@@ -42,12 +42,40 @@ using System.Runtime.InteropServices;
 public static class FrameCutPower {
   [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
   public static extern uint SetThreadExecutionState(uint esFlags);
+
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  private struct ReasonContext { public uint Version; public uint Flags; [MarshalAs(UnmanagedType.LPWStr)] public string Reason; }
+  private static IntPtr request = IntPtr.Zero;
+  [DllImport("powrprof.dll", SetLastError = true)] private static extern IntPtr PowerCreateRequest(ref ReasonContext context);
+  [DllImport("powrprof.dll", SetLastError = true)] private static extern bool PowerSetRequest(IntPtr handle, int requestType);
+  [DllImport("powrprof.dll", SetLastError = true)] private static extern bool PowerClearRequest(IntPtr handle, int requestType);
+  [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
+
+  // SystemRequired=1 and ExecutionRequired=3 are process-bound requests understood by
+  // Modern Standby. They remain in force while a long ComfyUI/MiniMax child process runs.
+  public static void AcquirePowerRequest() {
+    if (request != IntPtr.Zero) return;
+    var context = new ReasonContext { Version = 0, Flags = 1, Reason = "FrameCut local render worker is processing queued media" };
+    request = PowerCreateRequest(ref context);
+    if (request != IntPtr.Zero && request.ToInt64() != -1) { PowerSetRequest(request, 1); PowerSetRequest(request, 3); }
+    else request = IntPtr.Zero;
+  }
+  public static void ReleasePowerRequest() {
+    if (request == IntPtr.Zero) return;
+    PowerClearRequest(request, 3); PowerClearRequest(request, 1); CloseHandle(request); request = IntPtr.Zero;
+  }
 }
 '@
 
 function Set-Awake([bool]$Enabled) {
-  if ($Enabled) { [void][FrameCutPower]::SetThreadExecutionState([Convert]::ToUInt32('80000001',16)) }
-  else { [void][FrameCutPower]::SetThreadExecutionState([Convert]::ToUInt32('80000000',16)) }
+  if ($Enabled) {
+    [FrameCutPower]::AcquirePowerRequest()
+    # Away mode is a second independent request for Modern Standby hosts.
+    [void][FrameCutPower]::SetThreadExecutionState([Convert]::ToUInt32('80000041',16))
+  } else {
+    [FrameCutPower]::ReleasePowerRequest()
+    [void][FrameCutPower]::SetThreadExecutionState([Convert]::ToUInt32('80000000',16))
+  }
 }
 function Read-WorkerToken {
   $hex = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
