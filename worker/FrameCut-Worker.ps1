@@ -263,7 +263,11 @@ function Process-CaptionJob($payload) {
   # files lets Qwen emit non-fatal HuggingFace notices without discarding the actual caption.
   $stdoutFile=Join-Path $jobRoot 'caption-stdout.log'
   $stderrFile=Join-Path $jobRoot 'caption-stderr.log'
-  $captionProcess=Start-Process -FilePath $comfyPythonExe -ArgumentList @($captionClient,$localImage) -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -NoNewWindow -PassThru
+  # Start-Process re-joins an argument array without preserving Windows paths containing
+  # spaces. Pass a deliberately quoted command line so both the script and uploaded image
+  # remain exactly one Python argument each.
+  $captionArgs="`"$captionClient`" `"$localImage`""
+  $captionProcess=Start-Process -FilePath $comfyPythonExe -ArgumentList $captionArgs -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -NoNewWindow -PassThru
   $captionTimeout=if($config.CaptionTimeoutSeconds){[Math]::Max(120,[int]$config.CaptionTimeoutSeconds)}else{1800}
   if(-not $captionProcess.WaitForExit($captionTimeout*1000)){
     Stop-Process -Id $captionProcess.Id -Force -ErrorAction SilentlyContinue
