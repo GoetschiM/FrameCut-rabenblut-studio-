@@ -410,7 +410,10 @@ function Invoke-QwenSpeech([array]$SpeechJobs,[string]$JobRoot) {
   if(-not (Test-Path -LiteralPath $qwenAppPath)){throw "Qwen3-TTS ist nicht installiert: $qwenAppPath"}
   if(-not (Test-Path -LiteralPath $qwenPythonExe)){throw "Qwen3-TTS Python-Umgebung fehlt: $qwenPythonExe"}
   $specPath=Join-Path $JobRoot 'speech-jobs.json'
-  $SpeechJobs|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $specPath -Encoding utf8
+  # ConvertTo-Json writes a single PowerShell object as `{...}`, but the Python
+  # adapter intentionally accepts a list, even for one cue.  InputObject preserves
+  # the array shape and avoids a silent scalar job specification.
+  ConvertTo-Json -InputObject @($SpeechJobs) -Depth 8 | Set-Content -LiteralPath $specPath -Encoding utf8
   $stdoutPath=Join-Path $JobRoot 'qwen-stdout.log';$stderrPath=Join-Path $JobRoot 'qwen-stderr.log'
   $argLine="`"$qwenClient`" --qwen-app `"$qwenAppPath`" --jobs `"$specPath`" --model-size $qwenModelSize"
   Write-Host ("Qwen3-TTS erzeugt {0} Stimme(n) ..." -f $SpeechJobs.Count) -ForegroundColor Cyan
@@ -448,7 +451,7 @@ function Process-AudioCueJob($payload) {
   Free-Models $config.ComfyUrl;Free-Models $config.H3Url
   if($cue.kind -eq 'dialogue' -or $cue.kind -eq 'narration') {
     $raw=Join-Path $root 'speech-raw.wav'
-    [void](Invoke-QwenSpeech @([pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;language=$cue.language;output=$raw}) $root)
+    [void](Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;language=$cue.language;output=$raw}) -JobRoot $root)
   } elseif($cue.kind -eq 'sfx' -or $cue.kind -eq 'music' -or $cue.kind -eq 'ambience') {
     $raw=Invoke-StableAudioCue $cue $root
   } else { throw "Unbekannter Audio-Cue-Typ: $($cue.kind)" }
@@ -464,7 +467,7 @@ function Process-AudioPreviewJob($payload) {
   $job=$payload.job;$asset=$payload.asset;$root=Join-Path $runtimeRoot ("jobs\audio-preview-{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $root|Out-Null
   Free-Models $config.ComfyUrl;Free-Models $config.H3Url
   $out=Join-Path $root 'voice-preview.wav'
-  $result=Invoke-QwenSpeech @([pscustomobject]@{id='preview';text=$payload.preview.text;voice=$payload.preview.voice;language=$payload.preview.language;output=$out}) $root
+  $result=Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id='preview';text=$payload.preview.text;voice=$payload.preview.voice;language=$payload.preview.language;output=$out}) -JobRoot $root
   if(-not (Test-Path -LiteralPath $out)){throw 'Qwen3-TTS meldete Erfolg, aber die Stimmprobe fehlt.'}
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-preview" -Headers (Headers) -ContentType 'audio/wav' -InFile $out | Out-Null
   Write-Host ("Stimmprobe fertig: {0}" -f $asset.name) -ForegroundColor Green
