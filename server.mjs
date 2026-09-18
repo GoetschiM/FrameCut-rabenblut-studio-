@@ -126,13 +126,25 @@ const row = (query, ...params) => db.prepare(query).get(...params);
 const rows = (query, ...params) => db.prepare(query).all(...params);
 const run = (query, ...params) => db.prepare(query).run(...params);
 
+function inferredVoiceProfile(line) {
+  // A saved cast voice is always intentional.  These profiles only make a first
+  // auto-plan usable when the editor has not yet chosen one for that character.
+  if (String(line?.voice || '').trim()) return String(line.voice).trim();
+  const hint = `${line?.asset_name || ''} ${line?.asset_summary || ''} ${line?.asset_notes || ''}`.toLowerCase();
+  if (/chronobot|roboter|robot|polo/.test(hint)) return 'Freundliche, klar verständliche deutsche Roboterstimme; leicht synthetisch, aber warm und eindeutig von menschlichen Stimmen unterscheidbar.';
+  if (/leo|kind|junge|sohn|tochter/.test(hint)) return 'Helle, aufgeweckte deutschsprachige Kinderstimme; natürlich, klar verständlich, keine Erwachsenenlage.';
+  if (/mami|mama|mutter|grosi|oma|frau|weiblich/.test(hint)) return 'Warme erwachsene deutschsprachige Frauenstimme; natürlich und klar verständlich.';
+  if (/papi|papa|vater|opi|herr|mann|männlich/.test(hint)) return 'Ruhige erwachsene deutschsprachige Männerstimme; natürlich, klar verständlich und von den anderen Figuren unterscheidbar.';
+  return `Unverwechselbare, natürlich klingende deutschsprachige Figurenstimme für ${String(line?.asset_name || 'diese Figur')}; klar verständlich und nicht wie der Erzähler.`;
+}
+
 function audioContextForEpisode(episodeId, ownerId) {
   const episode = row('SELECT e.*,p.id project_id FROM episodes e JOIN projects p ON p.id=e.project_id WHERE e.id=?', episodeId);
   if (!episode) return null;
   const shots = rows('SELECT id,sequence,duration_seconds FROM shots WHERE episode_id=? ORDER BY sequence,id', episodeId);
-  const dialogue = shots.length ? rows(`SELECT d.id,d.shot_id,d.asset_id,d.sequence,d.text,a.voice
+  const dialogue = shots.length ? rows(`SELECT d.id,d.shot_id,d.asset_id,d.sequence,d.text,a.voice,a.name asset_name,a.summary asset_summary,a.visual_notes asset_notes
     FROM shot_dialogue d LEFT JOIN assets a ON a.id=d.asset_id
-    WHERE d.shot_id IN (${shots.map(() => '?').join(',')}) ORDER BY d.shot_id,d.sequence,d.id`, ...shots.map(shot => shot.id)) : [];
+    WHERE d.shot_id IN (${shots.map(() => '?').join(',')}) ORDER BY d.shot_id,d.sequence,d.id`, ...shots.map(shot => shot.id)).map(line => ({ ...line, voice: inferredVoiceProfile(line) })) : [];
   const settings = row('SELECT mode,narrator_voice,language,updated_at FROM episode_audio_settings WHERE episode_id=? AND owner_id=?', episodeId, ownerId)
     || { mode: 'narrator_and_characters', narrator_voice: '', language: 'German', updated_at: null };
   const generated = applyAudioDirection(createEpisodeAudioManifest({ ownerId, projectId: episode.project_id, episodeId, shots, dialogue }), settings);
