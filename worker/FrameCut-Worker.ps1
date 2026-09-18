@@ -347,7 +347,7 @@ try { Start-Transcript -LiteralPath (Join-Path $runtimeRoot 'worker.log') -Appen
 # Two workers would fight over the same jobs and the same GPU.  A named mutex is the
 # authority here: unlike a PID file it cannot be removed by an older worker that is
 # only just finishing while a new one is starting.
-$workerMutex = New-Object System.Threading.Mutex($false, 'Local\\FrameCutLocalRenderWorker')
+$workerMutex = New-Object System.Threading.Mutex($false, 'Local\FrameCutLocalRenderWorker')
 $ownsWorkerMutex = $false
 try {
   $ownsWorkerMutex = $workerMutex.WaitOne(0, $false)
