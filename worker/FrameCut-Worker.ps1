@@ -341,8 +341,24 @@ function Process-Job($payload) {
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
 $transcriptStarted=$false
 try { Start-Transcript -LiteralPath (Join-Path $runtimeRoot 'worker.log') -Append | Out-Null; $transcriptStarted=$true } catch {}
-# Two workers would fight over the same jobs and the same GPU, so refuse to start a
-# second instance while a previous one is still alive.
+# Two workers would fight over the same jobs and the same GPU.  A named mutex is the
+# authority here: unlike a PID file it cannot be removed by an older worker that is
+# only just finishing while a new one is starting.
+$workerMutex = New-Object System.Threading.Mutex($false, 'Local\\FrameCutLocalRenderWorker')
+$ownsWorkerMutex = $false
+try {
+  $ownsWorkerMutex = $workerMutex.WaitOne(0, $false)
+} catch [System.Threading.AbandonedMutexException] {
+  # The previous process crashed, so Windows hands ownership to this process.
+  $ownsWorkerMutex = $true
+}
+if (-not $ownsWorkerMutex) {
+  Write-Host 'Es laeuft bereits ein FrameCut-Worker. Dieser Start wird beendet.' -ForegroundColor Yellow
+  if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch {} }
+  $workerMutex.Dispose()
+  exit 0
+}
+# Keep the PID file as a human-readable diagnostic, but never use it as the lock.
 if (Test-Path -LiteralPath $pidPath) {
   $existingPid = 0
   [int]::TryParse((Get-Content -LiteralPath $pidPath -Raw).Trim(), [ref]$existingPid) | Out-Null
@@ -377,8 +393,15 @@ try {
 } finally {
   Stop-OwnedComfy
   Set-Awake $false
-  Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+  # An old process must never remove a PID written by a newer process.
+  $pidToRemove = 0
+  if (Test-Path -LiteralPath $pidPath) {
+    [int]::TryParse((Get-Content -LiteralPath $pidPath -Raw).Trim(), [ref]$pidToRemove) | Out-Null
+    if ($pidToRemove -eq $PID) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue }
+  }
   Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
+  if ($ownsWorkerMutex) { try { $workerMutex.ReleaseMutex() } catch {} }
+  if ($workerMutex) { $workerMutex.Dispose() }
   Write-Host 'FrameCut Worker wurde sauber beendet. Normaler Energiesparmodus ist wieder aktiv.' -ForegroundColor Gray
   if($transcriptStarted){try{Stop-Transcript|Out-Null}catch{}}
 }
