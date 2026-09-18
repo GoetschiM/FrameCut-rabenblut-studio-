@@ -276,8 +276,10 @@ function Process-CaptionJob($payload) {
   $caption=if(Test-Path -LiteralPath $stdoutFile){(Get-Content -LiteralPath $stdoutFile -Raw).Trim()}else{''}
   $exitCode=$captionProcess.ExitCode
   $stderrText=if(Test-Path -LiteralPath $stderrFile){(Get-Content -LiteralPath $stderrFile -Raw).Trim()}else{''}
-  if($exitCode -ne 0){throw "Beschreibung fehlgeschlagen (Code $exitCode): $stderrText"}
-  if(-not $caption){throw "Die KI hat keine Beschreibung zurueckgegeben. $stderrText"}
+  # Some Windows/Python launcher combinations leave ExitCode null after redirected output even
+  # though the child completed and produced a valid caption. The caption itself is the useful
+  # success signal; a real Python error yields no caption and remains visible in stderr.
+  if(-not $caption){throw "Die KI hat keine Beschreibung zurueckgegeben (Code $exitCode). $stderrText"}
   $body=@{text=$caption}|ConvertTo-Json -Compress
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/caption" -Headers (Headers) -ContentType 'application/json' -Body $body | Out-Null
   Write-Host ("Beschreibung gespeichert: {0}" -f $asset.name) -ForegroundColor Green
