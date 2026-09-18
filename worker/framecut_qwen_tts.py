@@ -38,7 +38,11 @@ def main() -> int:
     # VoiceDesign accepts natural-language voice direction, which maps directly to the
     # character and narrator fields in FrameCut.  It is intentionally not a voice clone.
     repo_id = f"Qwen/Qwen3-TTS-12Hz-{args.model_size}-VoiceDesign"
-    model_path = snapshot_download(repo_id)
+    # The normal Hugging Face cache uses symbolic links on Windows.  This worker
+    # deliberately runs without admin privileges, so use an app-local snapshot
+    # directory instead.  It contains ordinary files and is reusable afterwards.
+    model_dir = app_dir / "framecut-models" / repo_id.replace("/", "--")
+    model_path = snapshot_download(repo_id, local_dir=str(model_dir), local_dir_use_symlinks=False)
     model = Qwen3TTSModel.from_pretrained(model_path, device_map="cuda", dtype=torch.bfloat16)
 
     results = []
