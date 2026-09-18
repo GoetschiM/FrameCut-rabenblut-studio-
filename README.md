@@ -27,6 +27,18 @@ Git. Runtime data is intentionally ignored by `.gitignore`.
 The worker claims jobs serially. A job retains its project, episode, shot and owner metadata,
 so multiple users can safely submit work to one GPU queue.
 
+### Audio production
+
+Open an episode's **Audio, Ton & Stimmen** view to review its generated dialogue plan,
+choose the narration mode and add score, ambience or SFX cues. **Alle offenen Spuren
+rendern** queues one independent cue job per line or sound: Qwen3-TTS generates dialogue and
+narration; Stable Audio 3 generates music, ambience and effects. The worker automatically
+releases MiniMax H3 before an audio job and starts Stable Audio through Pinokio when needed;
+it switches back before the next video job. Once every cue and every video clip is confirmed,
+the worker creates a ducked AAC master MP4 and an SRT subtitle export. A master is deliberately
+blocked while the picture cut or an individual cue is incomplete, rather than exporting a
+silently partial film.
+
 ### Local storage lifecycle
 
 Only centrally confirmed uploads are considered final project media. After the server accepts
