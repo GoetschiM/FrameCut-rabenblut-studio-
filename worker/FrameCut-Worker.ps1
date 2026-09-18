@@ -186,7 +186,10 @@ function Get-PinokioStatus([string]$Ref) {
 }
 function Get-H3Status { return Get-PinokioStatus $config.H3Ref }
 function Invoke-PtermBounded([string]$Action,[int]$TimeoutSeconds=90,[string]$Ref=$config.H3Ref,[string[]]$ExtraArgs=@()) {
-  $command=Start-Job -ScriptBlock { param($ptermPath,$verb,$ref,$extra) & $ptermPath $verb $ref @extra 2>&1 } -ArgumentList $pterm,$Action,$Ref,$ExtraArgs
+  # Serialize trailing pterm arguments. Start-Job otherwise flattens an array on
+  # some Windows PowerShell versions and loses --default/start.js.
+  $extraJson = @($ExtraArgs) | ConvertTo-Json -Compress
+  $command=Start-Job -ScriptBlock { param($ptermPath,$verb,$ref,$extraJson) $extra=@(ConvertFrom-Json -InputObject $extraJson); & $ptermPath $verb $ref @extra 2>&1 } -ArgumentList $pterm,$Action,$Ref,$extraJson
   $finished=Wait-Job -Job $command -Timeout $TimeoutSeconds
   if(-not $finished){
     Stop-Job -Job $command -ErrorAction SilentlyContinue
