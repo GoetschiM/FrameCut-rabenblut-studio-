@@ -1464,7 +1464,10 @@ const server = http.createServer(async (req, res) => {
               SELECT 1 FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id
               WHERE sa.shot_id=j.shot_id AND (a.file_path IS NULL OR a.file_path='')
             ))
-          ORDER BY CASE j.kind WHEN 'comfyui_reference_preview' THEN 1 WHEN 'caption_asset' THEN 2 ELSE 3 END,j.id LIMIT 1`);
+          -- Captions of user-supplied reference images are a production prerequisite: they
+          -- replace unreliable free-text notes before any more generated asset previews consume
+          -- the GPU.  Preview jobs remain queued, rather than being cancelled.
+          ORDER BY CASE j.kind WHEN 'caption_asset' THEN 1 WHEN 'comfyui_reference_preview' THEN 2 ELSE 3 END,j.id LIMIT 1`);
         if(job){
           const claimed=run("UPDATE jobs SET state='läuft',started_at=?,worker_id=? WHERE id=? AND state='wartet'",now(),workerId,job.id);
           if(!claimed.changes) job=null;
