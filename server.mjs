@@ -185,9 +185,18 @@ function isSpeechCue(cue) { return cue?.kind === 'dialogue' || cue?.kind === 'na
 function cueDetail(cue) {
   return JSON.stringify({ cue_id: String(cue.id), kind: String(cue.kind), text: String(cue.text || ''), prompt: String(cue.prompt || ''), start_ms: Number(cue.start_ms || 0), target_duration_ms: Number(cue.target_duration_ms || 0), gain_db: Number(cue.gain_db || 0), voice_profile_id: String(cue.voice_profile_id || ''), language: String(cue.language || 'German') });
 }
+function pictureCutIsComplete(episodeId) {
+  const progress = row(`SELECT COUNT(*) AS total,
+    SUM(CASE WHEN output_video_path IS NOT NULL AND length(trim(output_video_path)) > 0 THEN 1 ELSE 0 END) AS finished
+    FROM shots WHERE episode_id=?`, episodeId);
+  return Number(progress?.total || 0) > 0 && Number(progress?.finished || 0) === Number(progress?.total || 0);
+}
 function queueReadyAudioMix(episodeId, ownerId) {
   const audio = audioContextForEpisode(episodeId, ownerId);
   if (!audio?.cuesReady || !audio.manifestValid || !audio.sourceCurrent) return null;
+  // A master must represent the full editorial cut.  Do not silently create a
+  // half-episode just because dialogue or music happened to finish first.
+  if (!pictureCutIsComplete(episodeId)) return null;
   const active = row("SELECT id FROM jobs WHERE episode_id=? AND kind='audio_mix' AND state IN ('wartet','läuft')", episodeId);
   if (active) return active;
   const created = run('INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id) VALUES (?,?,?,?,?,?,?)', episodeId, 'audio_mix', 'Audio-Mix · Episode', 'wartet', 'Alle bestätigten Audio-Spuren werden auf den Bildschnitt gemischt.', now(), ownerId);
@@ -1548,6 +1557,7 @@ const server = http.createServer(async (req, res) => {
       if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
       if (!audio.manifestValid || !audio.sourceCurrent) return json(res, 409, { error: 'Der Audio-Plan ist veraltet oder ungültig. Bitte Audio-Ansicht aktualisieren.' });
       if (!audio.cuesReady) return json(res, 409, { error: 'Die einzelnen Sprach-/Musik-/SFX-Spuren sind noch nicht fertig. Rendere zuerst die Audio-Spuren; der Mix wird nach der letzten bestätigten Spur automatisch eingereiht.' });
+      if (!pictureCutIsComplete(episodeId)) return json(res, 409, { error: 'Der Bildschnitt ist noch nicht vollständig. Der Audio-Master wird erst nach dem letzten fertigen Video-Clip gemischt.' });
       const mix = queueReadyAudioMix(episodeId, account.id);
       if (!mix) return json(res, 409, { error: 'Audio-Mix kann noch nicht eingereiht werden.' });
       return json(res, 201, { ok: true, job: mix });
