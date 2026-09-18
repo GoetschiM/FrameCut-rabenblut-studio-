@@ -25,7 +25,9 @@ $comfyPythonExe = Join-Path $comfyAppPath 'env\Scripts\python.exe'
 # Clips are delivered without sound by default; set StripAudio to false in worker.config.json
 # to keep whatever the video model generated.
 $stripAudio = -not ($config.PSObject.Properties.Name -contains 'StripAudio' -and $config.StripAudio -eq $false)
+$useH3ReferenceConditioning = $config.PSObject.Properties.Name -contains 'UseH3ReferenceConditioning' -and $config.UseH3ReferenceConditioning -eq $true
 $ffmpegExe = if ($config.FfmpegPath) { $config.FfmpegPath } else { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }
+$ffprobeExe = if ($config.FfprobePath) { $config.FfprobePath } elseif ($ffmpegExe) { Join-Path (Split-Path -Parent $ffmpegExe) 'ffprobe.exe' } else { (Get-Command ffprobe -ErrorAction SilentlyContinue).Source }
 if ($stripAudio -and -not $ffmpegExe) {
   Write-Host 'Hinweis: ffmpeg wurde nicht gefunden - Clips behalten ihre Original-Tonspur.' -ForegroundColor Yellow
   $stripAudio = $false
@@ -76,6 +78,15 @@ function Set-Awake([bool]$Enabled) {
     [FrameCutPower]::ReleasePowerRequest()
     [void][FrameCutPower]::SetThreadExecutionState([Convert]::ToUInt32('80000000',16))
   }
+}
+function Get-ClipDurationSeconds([string]$Path) {
+  if(-not $ffprobeExe -or -not (Test-Path -LiteralPath $ffprobeExe)){return $null}
+  try {
+    $raw=(& $ffprobeExe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $Path 2>$null | Out-String).Trim()
+    $duration=0.0
+    if([double]::TryParse($raw,[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$duration) -and $duration -gt 0){return $duration}
+  } catch { Write-Host ("Warnung: Clipdauer nicht lesbar: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
+  return $null
 }
 function Read-WorkerToken {
   $hex = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
@@ -247,13 +258,19 @@ function Process-CaptionJob($payload) {
   Invoke-WebRequest -Uri ($config.ServerUrl+$payload.downloadUrl) -Headers (Headers) -OutFile $localImage
   Free-Models $config.ComfyUrl
   Free-Models $config.H3Url
-  # 2>&1 must never be used here: under $ErrorActionPreference='Stop', PowerShell 5.1 wraps
-  # every merged stderr line from a native command in a terminating ErrorRecord - so a harmless
-  # library warning (e.g. the HuggingFace "no HF_TOKEN" notice) killed the call before the real
-  # caption text was ever read, and any genuine Python traceback was silently lost with it.
+  # Do not invoke Python directly: Windows PowerShell 5.1 turns a harmless stderr warning into
+  # a terminating ErrorRecord when $ErrorActionPreference='Stop'.  Keeping both streams in
+  # files lets Qwen emit non-fatal HuggingFace notices without discarding the actual caption.
+  $stdoutFile=Join-Path $jobRoot 'caption-stdout.log'
   $stderrFile=Join-Path $jobRoot 'caption-stderr.log'
-  $caption=((& $comfyPythonExe $captionClient $localImage 2>$stderrFile)|Out-String).Trim()
-  $exitCode=$LASTEXITCODE
+  $captionProcess=Start-Process -FilePath $comfyPythonExe -ArgumentList @($captionClient,$localImage) -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -NoNewWindow -PassThru
+  $captionTimeout=if($config.CaptionTimeoutSeconds){[Math]::Max(120,[int]$config.CaptionTimeoutSeconds)}else{1800}
+  if(-not $captionProcess.WaitForExit($captionTimeout*1000)){
+    Stop-Process -Id $captionProcess.Id -Force -ErrorAction SilentlyContinue
+    throw "Beschreibung hat das Zeitlimit von $captionTimeout Sekunden überschritten."
+  }
+  $caption=if(Test-Path -LiteralPath $stdoutFile){(Get-Content -LiteralPath $stdoutFile -Raw).Trim()}else{''}
+  $exitCode=$captionProcess.ExitCode
   $stderrText=if(Test-Path -LiteralPath $stderrFile){(Get-Content -LiteralPath $stderrFile -Raw).Trim()}else{''}
   if($exitCode -ne 0){throw "Beschreibung fehlgeschlagen (Code $exitCode): $stderrText"}
   if(-not $caption){throw "Die KI hat keine Beschreibung zurueckgegeben. $stderrText"}
@@ -301,19 +318,24 @@ function Process-Job($payload) {
     $sceneKeyframe=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}" -f [int]$job.id) ([int]$shot.seed) $photoSteps $negativePrompt
   }
   Copy-Item -LiteralPath $sceneKeyframe -Destination (Join-Path $jobRoot 'scene-keyframe.png') -Force
+  # H3's reference-to-video graph does not have a real first-frame input. It can reinterpret a
+  # character sheet as the opening composition, which caused contact sheets and duplicate people
+  # to leak into delivered clips. Keep it disabled unless deliberately enabled in worker config.
   $cleanRefs=@()
-  foreach($item in $visualRefs){
-    $localRef=Join-Path $jobRoot ("identity-{0}" -f [int]$item.id)
-    Invoke-WebRequest -Uri ($config.ServerUrl+$item.downloadUrl) -Headers (Headers) -OutFile $localRef
-    $cleanRefs+=$localRef
+  if($useH3ReferenceConditioning){
+    foreach($item in $visualRefs){
+      $localRef=Join-Path $jobRoot ("identity-{0}" -f [int]$item.id)
+      Invoke-WebRequest -Uri ($config.ServerUrl+$item.downloadUrl) -Headers (Headers) -OutFile $localRef
+      $cleanRefs+=$localRef
+    }
   }
   Free-Models $config.ComfyUrl
   Stop-OwnedComfy
   Ensure-H3
   $promptFile=Join-Path $jobRoot 'prompt.txt'
   $conditioning='The supplied first frame is the exact full-screen composition and opening moment.'
-  $identityNote=if($cleanRefs.Count -gt 0){' The additional reference images define the exact appearance of the named people, objects and environments - preserve those faces, clothing, vehicles, architecture and atmosphere.'}else{''}
-  $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change, never add an unrequested person. {4} {5} Project style: {6}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$negativeRule,$job.style_profile)
+  $identityNote=if($cleanRefs.Count -gt 0){' The additional reference images define the exact appearance of the named people, objects and environments - preserve those faces, clothing, vehicles, architecture and atmosphere.'}else{' The supplied opening frame is the sole visual identity source; preserve every depicted face, hairstyle, outfit, prop and environment exactly.'}
+  $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change. Show exactly one instance of each named character unless the stated action explicitly requires more; never add, clone, replace or merge people. {4} {5} Project style: {6}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$negativeRule,$job.style_profile)
   Set-Content -LiteralPath $promptFile -Value $fullPrompt -Encoding utf8
   $outputDir=Join-Path $runtimeRoot ("outputs-v2\project-{0}\episode-{1}" -f $job.project_id,$job.episode_number);New-Item -ItemType Directory -Force -Path $outputDir|Out-Null
   $frames=5+(17*[Math]::Max(1,[Math]::Round(([Math]::Min(15,[double]$shot.duration_seconds)*24-5)/17)))
@@ -324,10 +346,12 @@ function Process-Job($payload) {
   $videoSteps = if($job.video_steps){[int]$job.video_steps}else{4}
   Write-Host ("Qualitaet: {0} ({1}x{2}, {3} Steps)" -f $shot.render_tier,$renderWidth,$renderHeight,$videoSteps) -ForegroundColor DarkCyan
   $renderArgs=@($renderClient,'--base-url',$config.H3Url,'--image',(Join-Path $jobRoot 'scene-keyframe.png'),'--prompt-file',$promptFile,'--output-dir',$outputDir,'--name',$name,'--width',[string]$renderWidth,'--height',[string]$renderHeight,'--frames',[string]$frames,'--steps',[string]$videoSteps,'--seed',[string]([int]$shot.seed),'--low-vram')
-  # Hand every explicitly linked production reference to the model, preventing faces,
-  # vehicles and recurring locations from drifting between shots.
-  foreach($refPath in $cleanRefs){ $renderArgs += @('--reference-image',$refPath) }
-  if($cleanRefs.Count -gt 0){ Write-Host ("Referenzbilder: {0}" -f $cleanRefs.Count) -ForegroundColor DarkCyan }
+  if($useH3ReferenceConditioning){
+    foreach($refPath in $cleanRefs){ $renderArgs += @('--reference-image',$refPath) }
+    if($cleanRefs.Count -gt 0){ Write-Host ("H3-Referenzmodus aktiv: {0} Bild(er)" -f $cleanRefs.Count) -ForegroundColor DarkCyan }
+  } elseif($visualRefs.Count -gt 0) {
+    Write-Host 'H3 bleibt im stabilen Bildstart-Modus; Besetzungsbilder steuern den Keyframe, nicht den ersten Videoframe.' -ForegroundColor DarkCyan
+  }
   $renderTimeout=if($config.RenderTimeoutSeconds){[Math]::Max(300,[int]$config.RenderTimeoutSeconds)}else{1800}
   Invoke-BoundedPython $renderArgs $renderTimeout 'MiniMax H3'
   $result=Get-ChildItem -LiteralPath $outputDir -Filter "$name*.mp4"|Sort-Object LastWriteTime -Descending|Select-Object -First 1
@@ -344,7 +368,15 @@ function Process-Job($payload) {
       Write-Host 'Warnung: Tonspur konnte nicht entfernt werden, Clip wird mit Originalton geliefert.' -ForegroundColor Yellow
     }
   }
+  $actualDuration=Get-ClipDurationSeconds $result.FullName
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/video" -Headers (Headers) -ContentType 'video/mp4' -InFile $result.FullName | Out-Null
+  if($null -ne $actualDuration){
+    $requestedDuration=[double]$shot.duration_seconds
+    $delta=[Math]::Abs($actualDuration-$requestedDuration)
+    $durationDetail=("Clip lokal gerendert. Gewünscht: {0:N1}s · tatsächlich: {1:N2}s" -f $requestedDuration,$actualDuration)
+    if($delta -gt 0.35){$durationDetail += (" · Abweichung: {0:N2}s (H3-Frame-Raster)" -f $delta)}
+    Report-Job $job.id 'complete' $durationDetail
+  }
   Write-Host ("Fertig: {0}" -f $result.FullName) -ForegroundColor Green
 }
 
