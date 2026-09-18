@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { buildReferencePrompt } from './lib/reference-prompt.mjs';
+import { audioPreflight, createEpisodeAudioManifest, validateAudioManifest } from './lib/audio-manifest.mjs';
 
 const APP = resolve(import.meta.dirname);
 const WORKSPACE = resolve(APP, '..');
@@ -48,6 +49,9 @@ CREATE TABLE IF NOT EXISTS shots (id INTEGER PRIMARY KEY, episode_id INTEGER NOT
 db.exec(`CREATE TABLE IF NOT EXISTS user_provider_keys (user_id INTEGER NOT NULL, provider TEXT NOT NULL, encrypted_key TEXT NOT NULL, model TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,provider));
 CREATE TABLE IF NOT EXISTS auto_plan_drafts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, episode_id INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT, target_seconds REAL NOT NULL, recommended_seconds REAL NOT NULL, style_profile TEXT NOT NULL DEFAULT '', adaptation_mode TEXT NOT NULL DEFAULT 'cinematic', reference_asset_ids TEXT NOT NULL DEFAULT '[]', analysis_json TEXT NOT NULL, created_at TEXT NOT NULL, committed_at TEXT);`);
 db.exec(`CREATE TABLE IF NOT EXISTS episode_exports (id INTEGER PRIMARY KEY,episode_id INTEGER NOT NULL,name TEXT NOT NULL,file_path TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'mp4',created_at TEXT NOT NULL);`);
+// Stores a reviewed cue plan only. Media artifacts and provider configuration remain
+// on the audio worker, never in the web server database.
+db.exec(`CREATE TABLE IF NOT EXISTS episode_audio_manifests (episode_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, manifest_json TEXT NOT NULL, updated_at TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, last_seen TEXT NOT NULL, first_seen TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS story_versions (id INTEGER PRIMARY KEY, episode_id INTEGER NOT NULL, markdown TEXT NOT NULL, saved_at TEXT NOT NULL);`);
@@ -82,6 +86,11 @@ try { db.exec("ALTER TABLE jobs ADD COLUMN shot_id INTEGER"); } catch { /* colum
 try { db.exec("ALTER TABLE jobs ADD COLUMN asset_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE projects ADD COLUMN style_profile TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
+// A project can define a default exclusion list; an episode may override it.  Keep the
+// episode column nullable so an empty episode setting means "inherit", rather than an
+// accidental global empty override.
+try { db.exec("ALTER TABLE projects ADD COLUMN negative_prompt TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE episodes ADD COLUMN negative_prompt TEXT"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE projects ADD COLUMN video_steps INTEGER NOT NULL DEFAULT 4"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE projects ADD COLUMN photo_steps INTEGER NOT NULL DEFAULT 8"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE projects ADD COLUMN preview_width INTEGER NOT NULL DEFAULT 384"); } catch { /* column already exists */ }
@@ -108,6 +117,39 @@ const now = () => new Date().toISOString();
 const row = (query, ...params) => db.prepare(query).get(...params);
 const rows = (query, ...params) => db.prepare(query).all(...params);
 const run = (query, ...params) => db.prepare(query).run(...params);
+
+function audioContextForEpisode(episodeId, ownerId) {
+  const episode = row('SELECT e.*,p.id project_id FROM episodes e JOIN projects p ON p.id=e.project_id WHERE e.id=?', episodeId);
+  if (!episode) return null;
+  const shots = rows('SELECT id,sequence,duration_seconds FROM shots WHERE episode_id=? ORDER BY sequence,id', episodeId);
+  const dialogue = shots.length ? rows(`SELECT d.id,d.shot_id,d.asset_id,d.sequence,d.text,a.voice
+    FROM shot_dialogue d LEFT JOIN assets a ON a.id=d.asset_id
+    WHERE d.shot_id IN (${shots.map(() => '?').join(',')}) ORDER BY d.shot_id,d.sequence,d.id`, ...shots.map(shot => shot.id)) : [];
+  const generated = createEpisodeAudioManifest({ ownerId, projectId: episode.project_id, episodeId, shots, dialogue });
+  const saved = row('SELECT manifest_json,updated_at FROM episode_audio_manifests WHERE episode_id=? AND owner_id=?', episodeId, ownerId);
+  let manifest = generated, source = 'automatisch aus Shot-Timeline und Dialogen erstellt', updatedAt = null;
+  if (saved) {
+    try { manifest = JSON.parse(saved.manifest_json); source = 'gespeicherter Audio-Plan'; updatedAt = saved.updated_at; }
+    catch { source = 'beschädigter gespeicherter Audio-Plan'; }
+  }
+  const preflight = audioPreflight(manifest, { expectedSourceRevision: generated.source_revision, mixingWorkerAvailable: false });
+  return { episode, generated, manifest, source, updatedAt, ...preflight };
+}
+
+function expectedAudioIdentity(account, episode) {
+  return { owner_id: `owner-${account.id}`, project_id: `project-${episode.project_id}`, episode_id: `episode-${episode.id}` };
+}
+
+// Negative prompts become part of a model request, so keep them bounded and textual.
+// Returning `undefined` lets PATCH routes distinguish "not touched" from "clear it".
+function optionalNegativePrompt(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return '';
+  if (typeof value !== 'string') throw new Error('Der Negativ-Prompt muss Text sein.');
+  const text = value.replaceAll('\u0000', '').trim();
+  if (text.length > 2400) throw new Error('Der Negativ-Prompt darf höchstens 2400 Zeichen haben.');
+  return text;
+}
 function event(label, detail = '') { run('INSERT INTO activity(label,detail,created_at) VALUES (?,?,?)', label, detail, now()); }
 function missingReferenceAssets(shotIds) {
   if (!shotIds.length) return [];
@@ -179,10 +221,16 @@ function encryptionKey() { if (!KEY_ENCRYPTION) throw new Error('Die sichere Sch
 function encryptSecret(value) { const iv=randomBytes(12), cipher=createCipheriv('aes-256-gcm',encryptionKey(),iv); const payload=Buffer.concat([cipher.update(String(value),'utf8'),cipher.final()]); return `${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${payload.toString('base64')}`; }
 function decryptSecret(value) { const [iv,tag,payload]=String(value||'').split('.'); if(!iv||!tag||!payload) throw new Error('Gespeicherter API-Schlüssel ist ungültig.'); const decipher=createDecipheriv('aes-256-gcm',encryptionKey(),Buffer.from(iv,'base64')); decipher.setAuthTag(Buffer.from(tag,'base64')); return Buffer.concat([decipher.update(Buffer.from(payload,'base64')),decipher.final()]).toString('utf8'); }
 function providerKey(accountId, provider) { const saved=row('SELECT * FROM user_provider_keys WHERE user_id=? AND provider=?',accountId,provider); return saved ? {...saved,key:decryptSecret(saved.encrypted_key)} : null; }
+function cleanDialogue(raw) {
+  return (Array.isArray(raw) ? raw : []).slice(0, 10).map(line => ({
+    assetName: String(line?.assetName || '').trim().slice(0, 100),
+    text: String(line?.text || '').trim().slice(0, 1000),
+  })).filter(line => line.text);
+}
 function cleanPlan(raw) {
   if (!raw || typeof raw !== 'object') throw new Error('Die KI lieferte keinen lesbaren Produktionsplan.');
   const assets=(Array.isArray(raw.assets)?raw.assets:[]).slice(0,30).map(x=>({kind:['character','location','prop'].includes(x?.kind)?x.kind:'prop',name:String(x?.name||'').trim().slice(0,100),summary:String(x?.summary||'').trim().slice(0,1400),visualNotes:String(x?.visualNotes||'').trim().slice(0,2200)})).filter(x=>x.name);
-  const shots=(Array.isArray(raw.shots)?raw.shots:[]).slice(0,80).map((x,index)=>({title:String(x?.title||`Shot ${index+1}`).trim().slice(0,120),durationSeconds:Math.max(1,Math.min(15,Number(x?.durationSeconds)||5)),camera:String(x?.camera||'Stabile filmische Einstellung.').trim().slice(0,1400),prompt:String(x?.prompt||'').trim().slice(0,5000),assetNames:Array.isArray(x?.assetNames)?x.assetNames.map(v=>String(v).trim()).filter(Boolean).slice(0,10):[]}));
+  const shots=(Array.isArray(raw.shots)?raw.shots:[]).slice(0,80).map((x,index)=>({title:String(x?.title||`Shot ${index+1}`).trim().slice(0,120),durationSeconds:Math.max(1,Math.min(15,Number(x?.durationSeconds)||5)),camera:String(x?.camera||'Stabile filmische Einstellung.').trim().slice(0,1400),prompt:String(x?.prompt||'').trim().slice(0,5000),assetNames:Array.isArray(x?.assetNames)?x.assetNames.map(v=>String(v).trim()).filter(Boolean).slice(0,10):[],dialogue:cleanDialogue(x?.dialogue)}));
   if (!shots.length) throw new Error('Die KI hat keine Shots vorgeschlagen. Bitte die Story etwas konkreter beschreiben.');
   return {summary:String(raw.summary||'').trim().slice(0,1600),assets,shots};
 }
@@ -922,8 +970,8 @@ const server = http.createServer(async (req, res) => {
 
         const number = (row('SELECT MAX(number) max FROM episodes WHERE project_id=?', projectId)?.max || 0) + 1;
         const baseTitle = String(manifest.episode.title || 'Importierte Folge').slice(0, 90);
-        const insertedEp = run('INSERT INTO episodes(project_id,number,title,duration_seconds,manifest_path,created_at) VALUES (?,?,?,?,?,?)',
-          projectId, number, `${baseTitle} (Import)`, manifest.episode.duration_seconds || 0, '', now());
+        const insertedEp = run('INSERT INTO episodes(project_id,number,title,duration_seconds,manifest_path,created_at,style_profile,negative_prompt,video_steps,photo_steps,preview_width,preview_height,final_width,final_height) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          projectId, number, `${baseTitle} (Import)`, manifest.episode.duration_seconds || 0, '', now(), manifest.episode.style_profile || null, manifest.episode.negative_prompt || null, manifest.episode.video_steps || null, manifest.episode.photo_steps || null, manifest.episode.preview_width || null, manifest.episode.preview_height || null, manifest.episode.final_width || null, manifest.episode.final_height || null);
         const newEpId = Number(insertedEp.lastInsertRowid);
         for (const story of manifest.stories || []) run('INSERT INTO story_documents(episode_id,markdown,updated_at) VALUES (?,?,?)', newEpId, story.markdown || '', now());
         for (const link of manifest.episodeAssets || []) { const assetId = assetIdMap.get(link.asset_id); if (assetId) run('INSERT OR IGNORE INTO episode_assets(episode_id,asset_id) VALUES (?,?)', newEpId, assetId); }
@@ -957,7 +1005,8 @@ const server = http.createServer(async (req, res) => {
       const previewHeight=clampDimension(d.previewHeight,p.preview_height);
       const finalWidth=clampDimension(d.finalWidth,p.final_width);
       const finalHeight=clampDimension(d.finalHeight,p.final_height);
-      run('UPDATE projects SET title=?, synopsis=?, video_steps=?, photo_steps=?, preview_width=?, preview_height=?, final_width=?, final_height=? WHERE id=?',assertText(d.title ?? p.title,'Projekttitel',100),String(d.synopsis ?? p.synopsis ?? '').trim(),videoSteps,photoSteps,previewWidth,previewHeight,finalWidth,finalHeight,id);
+      const negativePrompt = optionalNegativePrompt(d.negativePrompt);
+      run('UPDATE projects SET title=?, synopsis=?, negative_prompt=?, video_steps=?, photo_steps=?, preview_width=?, preview_height=?, final_width=?, final_height=? WHERE id=?',assertText(d.title ?? p.title,'Projekttitel',100),String(d.synopsis ?? p.synopsis ?? '').trim(),negativePrompt ?? p.negative_prompt ?? '',videoSteps,photoSteps,previewWidth,previewHeight,finalWidth,finalHeight,id);
       event('Projekt aktualisiert',p.title); return json(res,200,{ok:true}); }
     if (/^\/api\/projects\/\d+$/.test(path) && req.method === 'DELETE') {
       const account = guard(req, res); if (!account) return;
@@ -1003,8 +1052,11 @@ const server = http.createServer(async (req, res) => {
       const clampStepsOrNull=(value)=>{if(value===''||value==null)return null;const n=Number(value);return Number.isFinite(n)?Math.max(1,Math.min(40,Math.round(n))):null;};
       const clampDimensionOrNull=(value)=>{if(value===''||value==null)return null;const n=Number(value);return Number.isFinite(n)?Math.max(160,Math.min(2048,Math.round(n/32)*32)):null;};
       const styleProfile=(d.styleProfile===''||d.styleProfile==null)?null:String(d.styleProfile).trim().slice(0,2400);
-      run('UPDATE episodes SET style_profile=?, video_steps=?, photo_steps=?, preview_width=?, preview_height=?, final_width=?, final_height=? WHERE id=?',
-        styleProfile,clampStepsOrNull(d.videoSteps),clampStepsOrNull(d.photoSteps),clampDimensionOrNull(d.previewWidth),clampDimensionOrNull(d.previewHeight),clampDimensionOrNull(d.finalWidth),clampDimensionOrNull(d.finalHeight),id);
+      const negativePrompt = optionalNegativePrompt(d.negativePrompt);
+      // For episodes an empty value intentionally returns to the project default.
+      const episodeNegativePrompt = negativePrompt === undefined ? ep.negative_prompt : (negativePrompt || null);
+      run('UPDATE episodes SET style_profile=?, negative_prompt=?, video_steps=?, photo_steps=?, preview_width=?, preview_height=?, final_width=?, final_height=? WHERE id=?',
+        styleProfile,episodeNegativePrompt,clampStepsOrNull(d.videoSteps),clampStepsOrNull(d.photoSteps),clampDimensionOrNull(d.previewWidth),clampDimensionOrNull(d.previewHeight),clampDimensionOrNull(d.finalWidth),clampDimensionOrNull(d.finalHeight),id);
       event('Episoden-Einstellungen aktualisiert',ep.title); return json(res,200,{ok:true}); }
     if (/^\/api\/projects\/\d+\/episodes$/.test(path) && req.method === 'POST') { if (!guard(req,res)) return; const projectId=Number(path.split('/')[3]),d=await body(req),p=row('SELECT * FROM projects WHERE id=?',projectId); if(!p)return json(res,404,{error:'Projekt nicht gefunden.'}); const number=(row('SELECT MAX(number) max FROM episodes WHERE project_id=?',projectId)?.max||0)+1; const title=assertText(d.title||`Episode ${number}`,'Episodentitel',100); const ep=run('INSERT INTO episodes(project_id,number,title,duration_seconds,manifest_path,created_at) VALUES (?,?,?,?,?,?)',projectId,number,title,0,'',now()); const newEpisodeId=Number(ep.lastInsertRowid); run('INSERT INTO story_documents(episode_id,markdown,updated_at) VALUES (?,?,?)',newEpisodeId,'# Neue Episode\n\nWorum geht es in dieser Geschichte?',now()); for(const existingAsset of rows('SELECT id FROM assets WHERE project_id=?',projectId)){run('INSERT OR IGNORE INTO episode_assets(episode_id,asset_id) VALUES (?,?)',newEpisodeId,existingAsset.id);} event('Neue Episode',`${p.title} · ${title}`); return json(res,201,{episode:row('SELECT * FROM episodes WHERE id=?',newEpisodeId)}); }
     if (/^\/api\/episodes\/\d+$/.test(path) && req.method === 'DELETE') {
@@ -1173,8 +1225,8 @@ const server = http.createServer(async (req, res) => {
       if (entry.kind === 'episode') {
         const { episode, story, shots, shotAssets, episodeAssets, finals } = data;
         if (!row('SELECT id FROM projects WHERE id=?', episode.project_id)) return json(res, 409, { error: 'Das zugehörige Projekt existiert nicht mehr.' });
-        const insertedEp = run('INSERT INTO episodes(project_id,number,title,duration_seconds,manifest_path,created_at) VALUES (?,?,?,?,?,?)',
-          episode.project_id, episode.number, episode.title, episode.duration_seconds || 0, episode.manifest_path || '', now());
+        const insertedEp = run('INSERT INTO episodes(project_id,number,title,duration_seconds,manifest_path,created_at,style_profile,negative_prompt,video_steps,photo_steps,preview_width,preview_height,final_width,final_height) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          episode.project_id, episode.number, episode.title, episode.duration_seconds || 0, episode.manifest_path || '', now(), episode.style_profile || null, episode.negative_prompt || null, episode.video_steps || null, episode.photo_steps || null, episode.preview_width || null, episode.preview_height || null, episode.final_width || null, episode.final_height || null);
         const newEpId = Number(insertedEp.lastInsertRowid);
         if (story?.markdown) run('INSERT INTO story_documents(episode_id,markdown,updated_at) VALUES (?,?,?)', newEpId, story.markdown, now());
         for (const assetId of episodeAssets || []) { if (row('SELECT id FROM assets WHERE id=?', assetId)) run('INSERT OR IGNORE INTO episode_assets(episode_id,asset_id) VALUES (?,?)', newEpId, assetId); }
@@ -1196,8 +1248,8 @@ const server = http.createServer(async (req, res) => {
       if (entry.kind === 'project') {
         const { project, episodes: oldEpisodes, shots: oldShots, shotAssets: oldShotAssets, episodeAssets: oldEpisodeAssets, storyDocuments, storyVersions, episodeExports, assets: oldAssets, assetPhotos } = data;
         const slug = createHash('sha1').update(`${project.title}-${now()}`).digest('hex').slice(0, 10);
-        const insertedProject = run('INSERT INTO projects(slug,title,synopsis,source_path,created_at,style_profile,video_steps,photo_steps,preview_width,preview_height,final_width,final_height) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-          slug, project.title, project.synopsis, project.source_path, now(), project.style_profile, project.video_steps, project.photo_steps, project.preview_width, project.preview_height, project.final_width, project.final_height);
+        const insertedProject = run('INSERT INTO projects(slug,title,synopsis,source_path,created_at,style_profile,negative_prompt,video_steps,photo_steps,preview_width,preview_height,final_width,final_height) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          slug, project.title, project.synopsis, project.source_path, now(), project.style_profile, project.negative_prompt || '', project.video_steps, project.photo_steps, project.preview_width, project.preview_height, project.final_width, project.final_height);
         const newProjectId = Number(insertedProject.lastInsertRowid);
         const assetIdMap = new Map();
         for (const asset of oldAssets || []) {
@@ -1211,8 +1263,8 @@ const server = http.createServer(async (req, res) => {
         }
         const episodeIdMap = new Map();
         for (const episode of oldEpisodes || []) {
-          const inserted = run('INSERT INTO episodes(project_id,number,title,duration_seconds,manifest_path,created_at,style_profile,video_steps,photo_steps,preview_width,preview_height,final_width,final_height) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            newProjectId, episode.number, episode.title, episode.duration_seconds || 0, episode.manifest_path || '', now(), episode.style_profile, episode.video_steps, episode.photo_steps, episode.preview_width, episode.preview_height, episode.final_width, episode.final_height);
+          const inserted = run('INSERT INTO episodes(project_id,number,title,duration_seconds,manifest_path,created_at,style_profile,negative_prompt,video_steps,photo_steps,preview_width,preview_height,final_width,final_height) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            newProjectId, episode.number, episode.title, episode.duration_seconds || 0, episode.manifest_path || '', now(), episode.style_profile, episode.negative_prompt || null, episode.video_steps, episode.photo_steps, episode.preview_width, episode.preview_height, episode.final_width, episode.final_height);
           episodeIdMap.set(episode.id, Number(inserted.lastInsertRowid));
         }
         for (const doc of storyDocuments || []) { const newEpId = episodeIdMap.get(doc.episode_id); if (newEpId) run('INSERT INTO story_documents(episode_id,markdown,updated_at) VALUES (?,?,?)', newEpId, doc.markdown, now()); }
@@ -1313,11 +1365,54 @@ const server = http.createServer(async (req, res) => {
       event('Renderauftrag eingereiht', `${shot.title} (Shot ${shot.sequence})${referenceResult.queued ? `, davor ${referenceResult.queued} fehlende Referenzfotos` : ''}`);
       return json(res, 201, { job: row('SELECT * FROM jobs WHERE id=?', Number(job.lastInsertRowid)), shot, photosQueued:referenceResult.queued });
     }
+    if (/^\/api\/episodes\/\d+\/audio-preflight$/.test(path) && req.method === 'GET') {
+      const account = guard(req, res); if (!account) return;
+      const episodeId = Number(path.split('/')[3]);
+      const audio = audioContextForEpisode(episodeId, account.id);
+      if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      return json(res, 200, {
+        episodeId, source: audio.source, updatedAt: audio.updatedAt, manifest: audio.manifest,
+        generatedManifest: audio.generated, manifestValid: audio.manifestValid, validationErrors: audio.validationErrors,
+        sourceCurrent: audio.sourceCurrent, cues: audio.cues, cuesReady: audio.cuesReady,
+        readyForMaster: audio.readyForMaster, mixingWorkerAvailable: audio.mixingWorkerAvailable, blockers: audio.blockers,
+      });
+    }
+    if (/^\/api\/episodes\/\d+\/audio-manifest$/.test(path) && req.method === 'POST') {
+      const account = guard(req, res); if (!account) return;
+      const episodeId = Number(path.split('/')[3]);
+      const audio = audioContextForEpisode(episodeId, account.id);
+      if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      const d = await body(req);
+      const manifest = d?.manifest;
+      const errors = validateAudioManifest(manifest);
+      if (errors.length) return json(res, 400, { error: 'Der Audio-Plan ist ungültig.', validationErrors: errors });
+      const expected = expectedAudioIdentity(account, audio.episode);
+      if (manifest.owner_id !== expected.owner_id || manifest.project_id !== expected.project_id || manifest.episode_id !== expected.episode_id) {
+        return json(res, 400, { error: 'Der Audio-Plan gehört nicht zu diesem Benutzer, Projekt und dieser Episode.' });
+      }
+      if (manifest.source_revision !== audio.generated.source_revision) {
+        return json(res, 409, { error: 'Die Shot-Timeline oder Dialoge wurden verändert. Bitte zuerst einen aktuellen Audio-Plan herunterladen.' });
+      }
+      run(`INSERT INTO episode_audio_manifests(episode_id,owner_id,manifest_json,updated_at) VALUES (?,?,?,?)
+        ON CONFLICT(episode_id) DO UPDATE SET owner_id=excluded.owner_id,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at`, episodeId, account.id, JSON.stringify(manifest), now());
+      event('Audio-Plan gespeichert', `${audio.episode.title} · ${manifest.cues.length} Cue(s)`);
+      const refreshed = audioContextForEpisode(episodeId, account.id);
+      return json(res, 200, { ok: true, source: refreshed.source, updatedAt: refreshed.updatedAt, manifest: refreshed.manifest, cues: refreshed.cues, blockers: refreshed.blockers, readyForMaster: refreshed.readyForMaster });
+    }
     if (/^\/api\/episodes\/\d+\/assemble$/.test(path) && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
       const episodeId = Number(path.split('/')[3]);
       const ep = row('SELECT e.*, p.title project_title FROM episodes e JOIN projects p ON p.id=e.project_id WHERE e.id=?', episodeId);
       if (!ep) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      const d = await body(req);
+      const audio = audioContextForEpisode(episodeId, account.id);
+      const pictureOnly = d.pictureOnly === true;
+      // A concat copy used to silently produce an alleged "final film" without the
+      // planned dialogue/music. Until an audio mix worker is registered, require an
+      // explicit picture-only choice. The returned MP4 then has no accidental audio.
+      if (!audio.readyForMaster && !pictureOnly) {
+        return json(res, 409, { error: 'Audio-Master ist noch nicht bereit. Erstelle zuerst die Audio-Cues und mische sie mit einem Audio-Worker – oder bestätige bewusst einen Bildschnitt ohne Ton.', audio: { cues: audio.cues, blockers: audio.blockers, validationErrors: audio.validationErrors, sourceCurrent: audio.sourceCurrent } });
+      }
       const shots = rows('SELECT * FROM shots WHERE episode_id=? AND output_video_path IS NOT NULL AND length(output_video_path)>0 ORDER BY sequence', episodeId);
       const validShots = shots.filter(s => existsSync(mediaPath(s.output_video_path)));
       if (!validShots.length) return json(res, 400, { error: 'Noch keine gerenderten Clips für diese Episode vorhanden.' });
@@ -1329,7 +1424,10 @@ const server = http.createServer(async (req, res) => {
       const outPath = join(UPLOADS, outFile);
       try {
         await new Promise((resolve, reject) => {
-          const ff = spawn('ffmpeg', ['-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', '-y', outPath]);
+          const ffArgs = pictureOnly
+            ? ['-f', 'concat', '-safe', '0', '-i', listFile, '-map', '0:v:0', '-c:v', 'copy', '-an', '-y', outPath]
+            : ['-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', '-y', outPath];
+          const ff = spawn('ffmpeg', ffArgs);
           let err = '';
           ff.stderr.on('data', d => err += d.toString());
           ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exit code ${code}: ${err.slice(-500)}`)));
@@ -1337,10 +1435,10 @@ const server = http.createServer(async (req, res) => {
         });
         const statInfo = await stat(outPath);
         const portable = `data/uploads/${outFile}`;
-        const exportName = `${ep.project_title} - ${ep.title} (${validShots.length} Clips).mp4`;
+        const exportName = `${ep.project_title} - ${ep.title}${pictureOnly ? ' [Bildschnitt ohne Ton]' : ''} (${validShots.length} Clips).mp4`;
         run('INSERT INTO episode_exports(episode_id,name,file_path,type,created_at) VALUES (?,?,?,?,?)', episodeId, exportName, portable, 'mp4', now());
-        event('Episode exportiert', `${exportName} · ${Math.round(statInfo.size/1024/1024)} MB`);
-        return json(res, 201, { ok: true, name: exportName, path: portable, count: validShots.length, size: statInfo.size });
+        event(pictureOnly ? 'Bildschnitt exportiert' : 'Episode exportiert', `${exportName} · ${Math.round(statInfo.size/1024/1024)} MB`);
+        return json(res, 201, { ok: true, name: exportName, path: portable, count: validShots.length, size: statInfo.size, pictureOnly });
       } catch (err) {
         console.error('Assemble error:', err);
         return json(res, 500, { error: 'Export fehlgeschlagen: ' + err.message });
@@ -1356,6 +1454,7 @@ const server = http.createServer(async (req, res) => {
         recoverQueuedReferenceGaps();
         job=row(`SELECT j.*,e.project_id,e.number episode_number,e.title episode_title,p.title project_title,
           COALESCE(e.style_profile,p.style_profile) style_profile,
+          COALESCE(NULLIF(e.negative_prompt,''),p.negative_prompt,'') negative_prompt,
           COALESCE(e.video_steps,p.video_steps) video_steps,COALESCE(e.photo_steps,p.photo_steps) photo_steps,
           COALESCE(e.preview_width,p.preview_width) preview_width,COALESCE(e.preview_height,p.preview_height) preview_height,
           COALESCE(e.final_width,p.final_width) final_width,COALESCE(e.final_height,p.final_height) final_height

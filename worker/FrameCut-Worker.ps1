@@ -284,14 +284,21 @@ function Process-Job($payload) {
   $teslaRequested=($shot.prompt -match '(?i)\btesla\b') -or (($visualRefs|Where-Object {$_.name -match '(?i)\btesla\b'}).Count -gt 0)
   $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'ABSOLUTE EXCLUSION: this is a car-free, vehicle-free frame. Show zero cars or other vehicles anywhere: no Tesla, no automobile, no sedan, no SUV, no parked traffic and no road traffic.'}
   $vehicleNegative=if($teslaRequested){''}else{'Tesla, car, automobile, sedan, SUV, vehicle, electric car, parked car, traffic, road traffic'}
-  $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage. Opening instant of this exact shot: {0}. Camera: {1}. Continuity metadata only (do not visualize biography, occupations or props unless the shot action explicitly asks for them): {2}. Show only the subjects and objects required by the stated action. {3} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {4}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout." -f $shot.prompt,$shot.camera,$assetText,$teslaRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
+  # The server resolves project defaults and episode overrides before handing us a job.
+  # Send it to Z-Image as an actual negative conditioning prompt, and phrase it as an
+  # explicit exclusion for H3 (which only exposes a positive text field).
+  $configuredNegative=if($null -ne $job.negative_prompt){([string]$job.negative_prompt).Replace("`r",' ').Replace("`n",' ').Trim()}else{''}
+  $effectiveNegative=@($vehicleNegative,$configuredNegative)|Where-Object {$_}|ForEach-Object {$_.Trim()}|Select-Object -Unique
+  $negativePrompt=$effectiveNegative -join ', '
+  $negativeRule=if($configuredNegative){"ABSOLUTE USER EXCLUSIONS: Do not show or introduce any of these: $configuredNegative."}else{''}
+  $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage. Opening instant of this exact shot: {0}. Camera: {1}. Continuity metadata only (do not visualize biography, occupations or props unless the shot action explicitly asks for them): {2}. Show only the subjects and objects required by the stated action. {3} {4} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {5}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout." -f $shot.prompt,$shot.camera,$assetText,$teslaRule,$negativeRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
   $approvedKeyframe=Join-Path $runtimeRoot ("approved-keyframes\shot-{0}.png" -f [int]$shot.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
   if(Test-Path -LiteralPath $approvedKeyframe){
     Write-Host ("Geprueften Keyframe wiederverwenden: {0}" -f $approvedKeyframe) -ForegroundColor Cyan
     $sceneKeyframe=$approvedKeyframe
   } else {
-    $sceneKeyframe=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}" -f [int]$job.id) ([int]$shot.seed) $photoSteps $vehicleNegative
+    $sceneKeyframe=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}" -f [int]$job.id) ([int]$shot.seed) $photoSteps $negativePrompt
   }
   Copy-Item -LiteralPath $sceneKeyframe -Destination (Join-Path $jobRoot 'scene-keyframe.png') -Force
   $cleanRefs=@()
@@ -306,7 +313,7 @@ function Process-Job($payload) {
   $promptFile=Join-Path $jobRoot 'prompt.txt'
   $conditioning='The supplied first frame is the exact full-screen composition and opening moment.'
   $identityNote=if($cleanRefs.Count -gt 0){' The additional reference images define the exact appearance of the named people, objects and environments - preserve those faces, clothing, vehicles, architecture and atmosphere.'}else{''}
-  $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change, never add an unrequested person. {4} Project style: {5}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$job.style_profile)
+  $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change, never add an unrequested person. {4} {5} Project style: {6}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$negativeRule,$job.style_profile)
   Set-Content -LiteralPath $promptFile -Value $fullPrompt -Encoding utf8
   $outputDir=Join-Path $runtimeRoot ("outputs-v2\project-{0}\episode-{1}" -f $job.project_id,$job.episode_number);New-Item -ItemType Directory -Force -Path $outputDir|Out-Null
   $frames=5+(17*[Math]::Max(1,[Math]::Round(([Math]::Min(15,[double]$shot.duration_seconds)*24-5)/17)))
