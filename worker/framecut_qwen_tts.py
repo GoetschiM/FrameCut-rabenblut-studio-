@@ -29,7 +29,9 @@ def main() -> int:
     from huggingface_hub import snapshot_download
     from qwen_tts import Qwen3TTSModel
 
-    jobs = json.loads(Path(args.jobs).read_text(encoding="utf-8"))
+    # Windows PowerShell 5.1 writes UTF-8 text with a BOM.  Accept either
+    # representation so worker job specs do not fail before Qwen is invoked.
+    jobs = json.loads(Path(args.jobs).read_text(encoding="utf-8-sig"))
     if not isinstance(jobs, list) or not jobs:
         raise RuntimeError("No speech jobs were supplied.")
 

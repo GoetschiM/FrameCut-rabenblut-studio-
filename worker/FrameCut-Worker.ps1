@@ -663,7 +663,11 @@ try {
       Invoke-ExpiredWorkspaceCleanup
       if (Test-WorkerStorageAvailable) {
         $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)
-        if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_cue'){Process-AudioCueJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload};Remove-ConfirmedJobWorkspace $payload.job}catch{Write-Host $_.Exception.Message -ForegroundColor Red;Report-Job $payload.job.id 'fail' $_.Exception.Message}}
+        if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_cue'){Process-AudioCueJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload};Remove-ConfirmedJobWorkspace $payload.job}catch{
+          $failure = if ($_ -and $_.Exception -and $_.Exception.Message) { [string]$_.Exception.Message } elseif ($_){ [string]$_ } else { 'Unbekannter Worker-Fehler.' }
+          Write-Host $failure -ForegroundColor Red
+          try { Report-Job $payload.job.id 'fail' $failure } catch { Write-Host ("Fehlerstatus konnte nicht an FrameCut gemeldet werden: {0}" -f ([string]$_)) -ForegroundColor Red }
+        }}
       }
     } catch {Write-Host ("Verbindung wartet: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow}
     if(-not $Once){for($i=0;$i -lt 10 -and -not (Test-Path -LiteralPath $stopPath);$i++){Start-Sleep -Seconds 1}}
