@@ -174,12 +174,8 @@ function Stop-OwnedComfy {
 function Invoke-ZImage([string]$Prompt,[string]$Prefix,[int]$Seed,[int]$Steps=12) {
   Ensure-Comfy
   $env:COMFY_URL=$config.ComfyUrl
-  try {
-    $clientOutput=& python $imageClient $Prompt --negativ 'contact sheet, storyboard grid, collage, split screen, multiple panels, model sheet, turnaround sheet, white background, text, caption, watermark, logo, malformed anatomy, duplicate people, extra limbs, flat lighting, open door on a moving vehicle, laptop outside a vehicle, physically impossible vehicle, floating objects' --breite 768 --hoehe 448 --schritte $Steps --seed $Seed --name $Prefix 2>&1
-    $clientExit=$LASTEXITCODE
-    $clientOutput|ForEach-Object { Write-Host $_ }
-  } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
-  if($clientExit -ne 0){throw "ComfyUI wurde mit Code $clientExit beendet."}
+  $imageTimeout=if($config.ImageTimeoutSeconds){[Math]::Max(120,[int]$config.ImageTimeoutSeconds)}else{900}
+  try { Invoke-BoundedPython @($imageClient,$Prompt,'--negativ','contact sheet, storyboard grid, collage, split screen, multiple panels, model sheet, turnaround sheet, white background, text, caption, watermark, logo, malformed anatomy, duplicate people, extra limbs, flat lighting, open door on a moving vehicle, laptop outside a vehicle, physically impossible vehicle, floating objects','--breite','768','--hoehe','448','--schritte',[string]$Steps,'--seed',[string]$Seed,'--name',$Prefix) $imageTimeout 'ComfyUI Z-Image' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
   $folder=Split-Path $Prefix -Parent
   $leaf=Split-Path $Prefix -Leaf
   $result=Get-ChildItem -LiteralPath (Join-Path $comfyOutputRoot $folder) -Filter "$leaf*.png"|Sort-Object LastWriteTime -Descending|Select-Object -First 1
@@ -230,9 +226,8 @@ function Process-ImageJob($payload) {
     'person, people, human, character, face, portrait, body, hands, crowd, text, caption, watermark, white background, flat lighting'
   }
   $env:COMFY_URL=$config.ComfyUrl
-  & python $imageClient $payload.prompt --negativ $negativePrompt --breite 768 --hoehe 432 --schritte $photoSteps --seed (100000+[int]$job.id) --name $prefix
-  Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue
-  if($LASTEXITCODE -ne 0){throw "ComfyUI wurde mit Code $LASTEXITCODE beendet."}
+  $imageTimeout=if($config.ImageTimeoutSeconds){[Math]::Max(120,[int]$config.ImageTimeoutSeconds)}else{900}
+  try { Invoke-BoundedPython @($imageClient,$payload.prompt,'--negativ',$negativePrompt,'--breite','768','--hoehe','432','--schritte',[string]$photoSteps,'--seed',[string](100000+[int]$job.id),'--name',$prefix) $imageTimeout 'ComfyUI Referenzbild' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
   $result=Get-ChildItem -LiteralPath (Join-Path $comfyOutputRoot 'framecut') -Filter ("job-{0}*.png" -f $job.id)|Sort-Object LastWriteTime -Descending|Select-Object -First 1
   if(-not $result){throw 'ComfyUI meldete Erfolg, aber das Vorschaubild wurde nicht gefunden.'}
   $encoded=[Convert]::ToBase64String([IO.File]::ReadAllBytes($result.FullName))
