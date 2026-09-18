@@ -406,25 +406,31 @@ function Process-CaptionJob($payload) {
   Write-Host ("Beschreibung gespeichert: {0}" -f $asset.name) -ForegroundColor Green
 }
 function Invoke-QwenSpeech([array]$SpeechJobs,[string]$JobRoot) {
-  if(-not (Test-Path -LiteralPath $qwenClient)){throw 'FrameCut Qwen-TTS-Adapter fehlt.'}
-  if(-not (Test-Path -LiteralPath $qwenAppPath)){throw "Qwen3-TTS ist nicht installiert: $qwenAppPath"}
-  if(-not (Test-Path -LiteralPath $qwenPythonExe)){throw "Qwen3-TTS Python-Umgebung fehlt: $qwenPythonExe"}
-  $specPath=Join-Path $JobRoot 'speech-jobs.json'
-  # ConvertTo-Json writes a single PowerShell object as `{...}`, but the Python
-  # adapter intentionally accepts a list, even for one cue.  InputObject preserves
-  # the array shape and avoids a silent scalar job specification.
-  ConvertTo-Json -InputObject @($SpeechJobs) -Depth 8 | Set-Content -LiteralPath $specPath -Encoding utf8
-  $stdoutPath=Join-Path $JobRoot 'qwen-stdout.log';$stderrPath=Join-Path $JobRoot 'qwen-stderr.log'
-  $argLine="`"$qwenClient`" --qwen-app `"$qwenAppPath`" --jobs `"$specPath`" --model-size $qwenModelSize"
-  Write-Host ("Qwen3-TTS erzeugt {0} Stimme(n) ..." -f $SpeechJobs.Count) -ForegroundColor Cyan
-  $proc=Start-Process -FilePath $qwenPythonExe -ArgumentList $argLine -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
-  $timeout=if($config.AudioTimeoutSeconds){[Math]::Max(600,[int]$config.AudioTimeoutSeconds)}else{7200}
-  if(-not $proc.WaitForExit($timeout*1000)){Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue;throw "Qwen3-TTS hat das Zeitlimit von $timeout Sekunden überschritten."}
-  $stdout=if(Test-Path $stdoutPath){(Get-Content $stdoutPath -Raw).Trim()}else{''};$stderr=if(Test-Path $stderrPath){(Get-Content $stderrPath -Raw).Trim()}else{''}
-  if($proc.ExitCode -ne 0){throw "Qwen3-TTS fehlgeschlagen (Code $($proc.ExitCode)). $stderr"}
-  $jsonLine=($stdout -split "`r?`n"|Where-Object {$_ -match '^\{.*\}$'}|Select-Object -Last 1)
-  if(-not $jsonLine){throw "Qwen3-TTS lieferte kein Ergebnis. $stdout $stderr"}
-  return $jsonLine|ConvertFrom-Json
+  try {
+    if(-not (Test-Path -LiteralPath $qwenClient)){throw 'FrameCut Qwen-TTS-Adapter fehlt.'}
+    if(-not (Test-Path -LiteralPath $qwenAppPath)){throw "Qwen3-TTS ist nicht installiert: $qwenAppPath"}
+    if(-not (Test-Path -LiteralPath $qwenPythonExe)){throw "Qwen3-TTS Python-Umgebung fehlt: $qwenPythonExe"}
+    $specPath=Join-Path $JobRoot 'speech-jobs.json'
+    # ConvertTo-Json writes a single PowerShell object as `{...}`, but the Python
+    # adapter intentionally accepts a list, even for one cue.  InputObject preserves
+    # the array shape and avoids a silent scalar job specification.
+    ConvertTo-Json -InputObject @($SpeechJobs) -Depth 8 | Set-Content -LiteralPath $specPath -Encoding utf8
+    $stdoutPath=Join-Path $JobRoot 'qwen-stdout.log';$stderrPath=Join-Path $JobRoot 'qwen-stderr.log'
+    $argLine="`"$qwenClient`" --qwen-app `"$qwenAppPath`" --jobs `"$specPath`" --model-size $qwenModelSize"
+    Write-Host ("Qwen3-TTS erzeugt {0} Stimme(n) ..." -f $SpeechJobs.Count) -ForegroundColor Cyan
+    $proc=Start-Process -FilePath $qwenPythonExe -ArgumentList $argLine -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
+    if($null -eq $proc){throw 'Qwen3-TTS-Prozess konnte nicht gestartet werden.'}
+    $timeout=if($config.AudioTimeoutSeconds){[Math]::Max(600,[int]$config.AudioTimeoutSeconds)}else{7200}
+    if(-not $proc.WaitForExit($timeout*1000)){Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue;throw "Qwen3-TTS hat das Zeitlimit von $timeout Sekunden überschritten."}
+    $stdout=if(Test-Path $stdoutPath){(Get-Content $stdoutPath -Raw).Trim()}else{''};$stderr=if(Test-Path $stderrPath){(Get-Content $stderrPath -Raw).Trim()}else{''}
+    if($proc.ExitCode -ne 0){throw "Qwen3-TTS fehlgeschlagen (Code $($proc.ExitCode)). $stderr"}
+    $jsonLine=($stdout -split "`r?`n"|Where-Object {$_ -match '^\{.*\}$'}|Select-Object -Last 1)
+    if(-not $jsonLine){throw "Qwen3-TTS lieferte kein Ergebnis. $stdout $stderr"}
+    return $jsonLine|ConvertFrom-Json
+  } catch {
+    $detail = if ($_ -and $_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { [string]$_ }
+    throw "Qwen3-TTS Worker-Wrapper: $detail"
+  }
 }
 function Invoke-StableAudioCue($Cue,[string]$JobRoot) {
   if (-not (Test-Path -LiteralPath $stableAudioClient)) { throw 'FrameCut Stable-Audio-Adapter fehlt.' }
