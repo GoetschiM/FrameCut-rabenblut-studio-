@@ -22,6 +22,28 @@ test('builds deterministic dialogue cues on the episode timeline', () => {
   assert.deepEqual(validateAudioManifest(manifest), []);
 });
 
+test('creates editable narration drafts for visual-only plans when requested', () => {
+  const manifest = createEpisodeAudioManifest({ ownerId: 1, projectId: 2, episodeId: 3, shots: [
+    { id: 10, sequence: 1, duration_seconds: 4, title: 'Ankunft am Bahnhof' },
+    { id: 11, sequence: 2, duration_seconds: 6, title: 'Der Zug fährt ab' },
+  ], dialogue: [], includeNarrationFallback: true });
+  assert.equal(manifest.auto_narration_fallback, true);
+  assert.deepEqual(manifest.cues.map(cue => cue.kind), ['narration', 'narration']);
+  assert.deepEqual(manifest.cues.map(cue => cue.text), ['Ankunft am Bahnhof', 'Der Zug fährt ab']);
+  assert.deepEqual(validateAudioManifest(manifest), []);
+  const retitled = createEpisodeAudioManifest({ ownerId: 1, projectId: 2, episodeId: 3, shots: [
+    { id: 10, sequence: 1, duration_seconds: 4, title: 'Abfahrt am Bahnhof' },
+    { id: 11, sequence: 2, duration_seconds: 6, title: 'Der Zug fährt ab' },
+  ], dialogue: [], includeNarrationFallback: true });
+  assert.notEqual(retitled.source_revision, manifest.source_revision);
+});
+
+test('does not fabricate narration when the direction explicitly excludes it', () => {
+  const manifest = createEpisodeAudioManifest({ ownerId: 1, projectId: 2, episodeId: 3, shots, dialogue: [], includeNarrationFallback: false });
+  assert.equal(manifest.cues.length, 0);
+  assert.equal(manifest.auto_narration_fallback, false);
+});
+
 test('reports a draft as blocked instead of silently accepting it as a master', () => {
   const manifest = createEpisodeAudioManifest({ ownerId: 1, projectId: 2, episodeId: 3, shots, dialogue });
   const report = audioPreflight(manifest, { expectedSourceRevision: manifest.source_revision, mixingWorkerAvailable: false });

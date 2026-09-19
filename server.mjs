@@ -141,17 +141,32 @@ function inferredVoiceProfile(line) {
 function audioContextForEpisode(episodeId, ownerId) {
   const episode = row('SELECT e.*,p.id project_id FROM episodes e JOIN projects p ON p.id=e.project_id WHERE e.id=?', episodeId);
   if (!episode) return null;
-  const shots = rows('SELECT id,sequence,duration_seconds FROM shots WHERE episode_id=? ORDER BY sequence,id', episodeId);
+  const shots = rows('SELECT id,sequence,title,duration_seconds FROM shots WHERE episode_id=? ORDER BY sequence,id', episodeId);
   const dialogue = shots.length ? rows(`SELECT d.id,d.shot_id,d.asset_id,d.sequence,d.text,a.voice,a.name asset_name,a.summary asset_summary,a.visual_notes asset_notes
     FROM shot_dialogue d LEFT JOIN assets a ON a.id=d.asset_id
     WHERE d.shot_id IN (${shots.map(() => '?').join(',')}) ORDER BY d.shot_id,d.sequence,d.id`, ...shots.map(shot => shot.id)).map(line => ({ ...line, voice: inferredVoiceProfile(line) })) : [];
   const settings = row('SELECT mode,narrator_voice,language,updated_at FROM episode_audio_settings WHERE episode_id=? AND owner_id=?', episodeId, ownerId)
     || { mode: 'narrator_and_characters', narrator_voice: '', language: 'German', updated_at: null };
-  const generated = applyAudioDirection(createEpisodeAudioManifest({ ownerId, projectId: episode.project_id, episodeId, shots, dialogue }), settings);
+  const generated = applyAudioDirection(createEpisodeAudioManifest({
+    ownerId, projectId: episode.project_id, episodeId, shots, dialogue,
+    includeNarrationFallback: settings.mode !== 'characters_only',
+  }), settings);
   const saved = row('SELECT manifest_json,updated_at FROM episode_audio_manifests WHERE episode_id=? AND owner_id=?', episodeId, ownerId);
   let manifest = generated, source = 'automatisch aus Shot-Timeline und Dialogen erstellt', updatedAt = null;
   if (saved) {
-    try { manifest = JSON.parse(saved.manifest_json); source = 'gespeicherter Audio-Plan'; updatedAt = saved.updated_at; }
+    try {
+      const parsed = JSON.parse(saved.manifest_json);
+      // Older empty manifests were saved when the planner returned no dialogue.
+      // They must not hide the now available, deterministic narration draft.
+      if (Array.isArray(parsed?.cues) && parsed.cues.length === 0 && generated.cues.length > 0) {
+        manifest = generated;
+        source = 'automatisch aus Shot-Titeln ergänzter Erzähler-Entwurf';
+      } else {
+        manifest = parsed;
+        source = 'gespeicherter Audio-Plan';
+        updatedAt = saved.updated_at;
+      }
+    }
     catch { source = 'beschädigter gespeicherter Audio-Plan'; }
   }
   const mixPath = manifest?.mix?.artifact?.path;
