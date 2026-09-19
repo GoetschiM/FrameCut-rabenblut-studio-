@@ -1537,6 +1537,21 @@ const server = http.createServer(async (req, res) => {
       const refreshed = audioContextForEpisode(episodeId, account.id);
       return json(res, 200, { ok: true, source: refreshed.source, updatedAt: refreshed.updatedAt, manifest: refreshed.manifest, cues: refreshed.cues, blockers: refreshed.blockers, readyForMaster: refreshed.readyForMaster });
     }
+    if (/^\/api\/episodes\/\d+\/audio-auto-soundtrack$/.test(path) && req.method === 'POST') {
+      const account = guard(req, res); if (!account) return;
+      const episodeId = Number(path.split('/')[3]);
+      const audio = audioContextForEpisode(episodeId, account.id);
+      if (!audio) return json(res, 404, { error: 'Episode nicht gefunden.' });
+      const manifest = structuredClone(audio.manifest);
+      const style = String(row('SELECT style_profile FROM projects WHERE id=?', audio.episode.project_id)?.style_profile || 'cinematic family adventure').trim();
+      const duration = Math.max(1000, Math.min(120000, Number(manifest.timeline?.duration_ms || 60000)));
+      const add = cue => { if (!manifest.cues.some(item => item.id === cue.id) && !manifest.cues.some(item => item.kind === cue.kind && item.auto_soundtrack)) manifest.cues.push(cue); };
+      add({ id: 'auto-music-bed', kind: 'music', state: 'pending', start_ms: 0, target_duration_ms: duration, gain_db: -20, auto_soundtrack: true, language: 'German', prompt: `Instrumental cinematic background score for this episode. Style: ${style}. Support the story unobtrusively, no voices, no lyrics, seamless loop, clean professional mix.` });
+      add({ id: 'auto-ambience-bed', kind: 'ambience', state: 'pending', start_ms: 0, target_duration_ms: duration, gain_db: -28, auto_soundtrack: true, language: 'German', prompt: `Subtle cinematic environmental ambience matching this episode. Style and locations: ${style}. No voices, no melody, no prominent effects, seamless loop.` });
+      delete manifest.mix; saveAudioManifest(episodeId, account.id, manifest);
+      event('Automatischen Soundtrack vorgeschlagen', `Episode ${episodeId}`);
+      return json(res, 200, { ok: true, manifest, added: ['music', 'ambience'] });
+    }
     if (/^\/api\/episodes\/\d+\/audio-cues\/render$/.test(path) && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
       const episodeId = Number(path.split('/')[3]);

@@ -621,7 +621,7 @@ async function refreshAudioPreflight() {
       <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:15px;">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
           <div><h4 style="margin:0 0 4px;">Spuren auf der Timeline</h4><p style="margin:0;color:var(--text-muted);font-size:12px;line-height:1.45;">Dialoge und Off-Texte kommen aus den Shots. Musik, Atmosphäre und Effekte kannst du gezielt ergänzen. Jede Spur wird separat erzeugt und bleibt vor dem Mix nachvollziehbar.</p></div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;"><button type="button" class="ghost" id="audio-add-sfx">SFX / Atmosphäre hinzufügen</button><button type="button" class="ghost" id="audio-add-music">Musik hinzufügen</button></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;"><button type="button" class="ghost" id="audio-auto-soundtrack">✦ Musik + Ambiente vorschlagen</button><button type="button" class="ghost" id="audio-add-sfx">SFX / Atmosphäre hinzufügen</button><button type="button" class="ghost" id="audio-add-music">Musik hinzufügen</button></div>
         </div>
         <div style="display:grid;gap:8px;margin-top:12px;">
           ${(audio.manifest?.cues || []).map(c => {
@@ -667,6 +667,7 @@ async function refreshAudioPreflight() {
       });
     const addSfx = $('#audio-add-sfx'); if (addSfx) addSfx.onclick = () => addCue('sfx');
     const addMusic = $('#audio-add-music'); if (addMusic) addMusic.onclick = () => addCue('music');
+    const autoSoundtrack = $('#audio-auto-soundtrack'); if (autoSoundtrack) autoSoundtrack.onclick = async () => { try { await api(`/api/episodes/${currentEpisode}/audio-auto-soundtrack`, { method:'POST', body:'{}' }); notice('Musik und Atmosphäre sind vorgeschlagen. Prüfe die Spuren und starte dann „Alle offenen Spuren rendern“.'); await load(); } catch (err) { notice(`Soundtrack-Vorschlag fehlgeschlagen: ${err.message}`); } };
     document.querySelectorAll('[data-delete-audio-cue]').forEach(btn => btn.onclick = async () => {
       if (!confirm('Diese zusätzliche Audio-Spur wirklich aus dem Plan entfernen?')) return;
       try { const manifest = structuredClone(audio.manifest); manifest.cues = manifest.cues.filter(c => c.id !== btn.dataset.deleteAudioCue); delete manifest.mix; await api(`/api/episodes/${currentEpisode}/audio-manifest`, { method:'POST', body:JSON.stringify({ manifest }) }); await load(); notice('Audio-Spur entfernt.'); } catch (err) { notice(`Audio-Spur konnte nicht entfernt werden: ${err.message}`); }
