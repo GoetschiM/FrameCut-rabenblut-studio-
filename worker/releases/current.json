@@ -1,5 +1,6 @@
 {
-  "version": "bootstrap-1",
-  "file": "framecut-worker-bootstrap-1.zip",
+  "version": "bootstrap-2",
+  "file": "framecut-worker-bootstrap-2.zip",
+  "sha256": "c0e8319a648cb0e1fdadb9892169472a90a70e1a521139f203bcfe438a40d62a",
   "entrypoint": "Start-FrameCutRemoteWorker.bat"
 }

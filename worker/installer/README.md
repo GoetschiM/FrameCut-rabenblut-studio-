@@ -6,9 +6,11 @@ Windows-Bootstrap für zusätzliche GPU-Worker. Der Installer wird auf dem Rende
 Install-FrameCutWorker.bat
 ```
 
-Der Benutzer gibt einen einmaligen, kurzlebigen Registrierungscode ein. Danach lädt der Installer das versionierte Worker-Archiv vom Server, prüft die SHA-256-Prüfsumme, verschlüsselt das Worker-Token mit Windows DPAPI und richtet den Autostart ein.
+Der Installer schlägt im lokalen Netz bereits `http://10.0.60.131:4317` und den Rechnernamen vor; ein leeres Enter übernimmt diese Defaults. Tailscale ist nur ein optionaler Fallback und wird im gleichen LAN nicht benötigt.
 
-Der veröffentlichte Paketstand `bootstrap-1` registriert und überwacht den Rechner bereits, beansprucht aber bewusst noch keine Renderaufträge. Erst ein nachfolgendes Runtime-Setup prüft Pinokio, ComfyUI und MiniMax H3 und schaltet den Worker auf `ready`. So kann ein frisch installierter PC keine Aufträge ohne lokale Modelle übernehmen.
+Der Registrierungscode ist keine frei erfundene PIN. Er wird in FrameCut unter **Worker -> Neuen Join-Code erzeugen** erstellt, beginnt mit `FC-` und ist einmalig. Eingaben wie `1234` werden verständlich abgewiesen. Danach lädt der Installer das versionierte Worker-Archiv vom Server, prüft die SHA-256-Prüfsumme, verschlüsselt das Worker-Token mit Windows DPAPI und richtet den Autostart ein.
+
+Der veröffentlichte Paketstand `bootstrap-2` registriert und überwacht den Rechner bereits, beansprucht aber bewusst noch keine Renderaufträge. Das mitgelieferte Runtime-Setup prüft Pinokio und richtet die MiniMax-H3-Pinokio-App über `pterm` ein. Der erste Modelldownload ist groß und kann längere Zeit dauern. So kann ein frisch installierter PC keine Aufträge ohne lokale Modelle übernehmen.
 
 Der Server muss dafür liefern:
 

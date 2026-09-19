@@ -35,14 +35,47 @@ function Gpu-Info {
     [ordered]@{ nvidiaSmi = [bool]$smi; description = $line }
 }
 
+function Read-WithDefault([string]$Prompt, [string]$Default) {
+    $answer = Read-Host "$Prompt [Enter = $Default]"
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
+    return $answer.Trim()
+}
+
+function Test-JoinCode([string]$Code) {
+    return $Code.Trim().ToUpperInvariant() -match '^FC-[A-Z0-9]{6,40}$'
+}
+
+function Invoke-Register([string]$Uri, [string]$Body) {
+    try {
+        return Invoke-RestMethod -Uri $Uri -Method Post -ContentType 'application/json' -Body $Body -TimeoutSec 30
+    } catch {
+        $detail = $_.Exception.Message
+        try {
+            if ($_.Exception.Response) {
+                $reader = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $text = $reader.ReadToEnd()
+                if ($text) { $detail = "$detail — $text" }
+            }
+        } catch {}
+        throw $detail
+    }
+}
+
 Require-Admin
-if (-not $ServerUrl) { $ServerUrl = Read-Host 'FrameCut-Adresse (z. B. http://10.0.60.131:4317)' }
-if (-not $WorkerName) { $WorkerName = Read-Host 'Worker-Name (z. B. Gaming-PC)' }
+$defaultServer = 'http://10.0.60.131:4317'
+if (-not $ServerUrl) { $ServerUrl = Read-WithDefault 'FrameCut-Adresse' $defaultServer }
+$defaultName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'Gaming-PC' }
+if (-not $WorkerName) { $WorkerName = Read-WithDefault 'Worker-Name' $defaultName }
 $ServerUrl = $ServerUrl.Trim().TrimEnd('/')
 if ($ServerUrl -notmatch '^https?://') { throw 'ServerUrl muss mit http:// oder https:// beginnen.' }
 
+Step 'Verbindung zum FrameCut-Server testen'
+try {
+    $manifestResponse = Invoke-WebRequest -Uri "$ServerUrl/api/worker/installer/manifest" -UseBasicParsing -TimeoutSec 20
+} catch {
+    throw "FrameCut-Server nicht erreichbar oder Installer-Endpunkt noch nicht deployed: $ServerUrl`nDetails: $($_.Exception.Message)"
+}
 Step 'Installer-Manifest vom FrameCut-Server laden'
-$manifestResponse = Invoke-WebRequest -Uri "$ServerUrl/api/worker/installer/manifest" -UseBasicParsing -TimeoutSec 20
 $manifest = $manifestResponse.Content | ConvertFrom-Json
 foreach ($required in @('version','downloadUrl','sha256','entrypoint')) {
     if (-not $manifest.$required) { throw "Manifest-Feld fehlt: $required" }
@@ -55,19 +88,35 @@ $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)
 $freeGb = [math]::Round($disk.FreeSpace / 1GB, 1)
 if ($freeGb -lt 75) { Write-Warning "Nur $freeGb GB frei; MiniMax H3 benötigt ungefähr 75 GB." }
 
-Step 'Tailscale prüfen'
+Step 'Netzwerk prüfen (Tailscale ist optional)'
+$localNetworkOk = $false
+try {
+    $probe = Test-NetConnection -ComputerName ([uri]$ServerUrl).Host -Port ([uri]$ServerUrl).Port -WarningAction SilentlyContinue -InformationLevel Quiet
+    $localNetworkOk = [bool]$probe
+} catch { $localNetworkOk = $false }
 $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-if ($tailscale) {
-    try { $ts = (& $tailscale.Source status --json 2>$null | ConvertFrom-Json); if ($ts.BackendState -ne 'Running') { Write-Warning 'Tailscale ist nicht verbunden.' } } catch { Write-Warning 'Tailscale-Status nicht lesbar.' }
-} else { Write-Warning 'Tailscale nicht installiert; der Server muss lokal erreichbar sein.' }
+if ($localNetworkOk) {
+    Write-Host 'Lokales Netzwerk zum FrameCut-Server ist erreichbar. Tailscale wird nicht benötigt.' -ForegroundColor Green
+} elseif ($tailscale) {
+    Write-Warning 'Lokales Netzwerk nicht erreichbar. Tailscale kann als optionaler Fallback helfen.'
+} else {
+    Write-Warning 'Server nicht lokal erreichbar und Tailscale ist nicht installiert.'
+}
 
-if (-not $JoinCode) { $JoinCode = Read-Host 'Einmaligen FrameCut-Registrierungscode eingeben' }
-if ([string]::IsNullOrWhiteSpace($JoinCode)) { throw 'Registrierungscode fehlt.' }
+if (-not $JoinCode) {
+    Write-Host "`nDer Registrierungscode ist KEINE beliebige PIN." -ForegroundColor Yellow
+    Write-Host 'Erzeuge ihn in FrameCut unter Worker -> Neuen Join-Code erzeugen.'
+    Write-Host 'Er beginnt mit FC- und ist nur einmalig verwendbar.'
+    $JoinCode = Read-Host 'Einmaligen FrameCut-Registrierungscode eingeben'
+}
+if ([string]::IsNullOrWhiteSpace($JoinCode)) { throw 'Registrierungscode fehlt. Bitte einen FC-... Join-Code aus FrameCut verwenden.' }
+$JoinCode = $JoinCode.Trim().ToUpperInvariant()
+if (-not (Test-JoinCode $JoinCode)) { throw "Ungültiger Registrierungscode '$JoinCode'. Erwartet wird ein einmaliger Code im Format FC-... (nicht 1234)." }
 $gpuJson = $gpu | ConvertTo-Json -Depth 3
 $body = [ordered]@{ joinCode=$JoinCode; name=$WorkerName; machine=$env:COMPUTERNAME; os='windows'; architecture=$env:PROCESSOR_ARCHITECTURE; gpu=$gpu; capabilities=@('bootstrap'); installerVersion='phase1' } | ConvertTo-Json -Depth 6
 
 Step 'Worker registrieren'
-$registration = Invoke-RestMethod -Uri "$ServerUrl/api/worker/register" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 30
+$registration = Invoke-Register "$ServerUrl/api/worker/register" $body
 if (-not $registration.workerId -or -not $registration.workerToken) { throw 'Registrierung lieferte keine Worker-Zugangsdaten.' }
 
 $root = Join-Path $env:ProgramData 'FrameCut\Worker'
@@ -83,6 +132,21 @@ Expand-Archive -LiteralPath $zip -DestinationPath $versionRoot -Force
 
 $config = [ordered]@{ serverUrl=$ServerUrl; workerId=$registration.workerId; workerName=$WorkerName; workerTokenProtected=(Protect-Token $registration.workerToken); version=$manifest.version; installedAt=(Get-Date).ToUniversalTime().ToString('o'); runtimeState='awaiting_runtime' }
 $config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $root 'worker.json') -Encoding UTF8
+
+$runtimeSetup = Join-Path $versionRoot 'FrameCut-RuntimeSetup.ps1'
+if (Test-Path -LiteralPath $runtimeSetup) {
+    Step 'Pinokio und benötigte Runtime automatisch einrichten'
+    try {
+        & PowerShell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $runtimeSetup -ServerUrl $ServerUrl -WorkerRoot $root -WorkerId $registration.workerId
+        if ($LASTEXITCODE -eq 0) {
+            $config.runtimeState = 'runtime_ready'
+            $config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $root 'worker.json') -Encoding UTF8
+        }
+    } catch {
+        Write-Warning "Runtime-Setup noch nicht abgeschlossen: $($_.Exception.Message)"
+        Write-Host 'Der Worker bleibt registriert und versucht weiterhin den Bootstrap-Heartbeat.' -ForegroundColor Yellow
+    }
+}
 $entrypoint = Join-Path $versionRoot $manifest.entrypoint
 if (Test-Path -LiteralPath $entrypoint) {
     Step 'Worker-Autostart einrichten'
