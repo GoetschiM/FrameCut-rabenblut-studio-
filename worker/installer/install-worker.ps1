@@ -134,6 +134,12 @@ $config = [ordered]@{ serverUrl=$ServerUrl; workerId=$registration.workerId; wor
 $config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $root 'worker.json') -Encoding UTF8
 
 $runtimeSetup = Join-Path $versionRoot 'FrameCut-RuntimeSetup.ps1'
+if (-not (Test-Path -LiteralPath $runtimeSetup)) {
+    # Keep the guided setup usable while an older server release is still live.
+    # The desktop bundle carries the same runtime helper under payload\.
+    $localRuntimeSetup = Join-Path $PSScriptRoot 'payload\FrameCut-RuntimeSetup.ps1'
+    if (Test-Path -LiteralPath $localRuntimeSetup) { $runtimeSetup = $localRuntimeSetup }
+}
 if (Test-Path -LiteralPath $runtimeSetup) {
     Step 'Pinokio und benötigte Runtime automatisch einrichten'
     try {
