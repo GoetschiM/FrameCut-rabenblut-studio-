@@ -424,9 +424,14 @@ function Invoke-QwenSpeech([array]$SpeechJobs,[string]$JobRoot) {
     $timeout=if($config.AudioTimeoutSeconds){[Math]::Max(600,[int]$config.AudioTimeoutSeconds)}else{7200}
     if(-not $proc.WaitForExit($timeout*1000)){Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue;throw "Qwen3-TTS hat das Zeitlimit von $timeout Sekunden überschritten."}
     $stdout=if(Test-Path $stdoutPath){(Get-Content $stdoutPath -Raw).Trim()}else{''};$stderr=if(Test-Path $stderrPath){(Get-Content $stderrPath -Raw).Trim()}else{''}
-    if($proc.ExitCode -ne 0){throw "Qwen3-TTS fehlgeschlagen (Code $($proc.ExitCode)). $stderr"}
     $jsonLine=($stdout -split "`r?`n"|Where-Object {$_ -match '^\{.*\}$'}|Select-Object -Last 1)
     if(-not $jsonLine){throw "Qwen3-TTS lieferte kein Ergebnis. $stdout $stderr"}
+    # Windows can clear Process.ExitCode for a just-finished redirected child even
+    # though its JSON result and WAV are already present.  A valid structured result
+    # is the authoritative success signal; only a concrete non-zero code without it
+    # should fail the cue.
+    $exitCode=$null; try { $exitCode=$proc.ExitCode } catch {}
+    if($null -ne $exitCode -and [int]$exitCode -ne 0){throw "Qwen3-TTS fehlgeschlagen (Code $exitCode). $stderr"}
     return $jsonLine|ConvertFrom-Json
   } catch {
     $detail = if ($_ -and $_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { [string]$_ }
