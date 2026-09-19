@@ -189,7 +189,9 @@ function Get-H3Status { return Get-PinokioStatus $config.H3Ref }
 function Invoke-PtermBounded([string]$Action,[int]$TimeoutSeconds=90,[string]$Ref=$config.H3Ref,[string[]]$ExtraArgs=@()) {
   # Serialize trailing pterm arguments. Start-Job otherwise flattens an array on
   # some Windows PowerShell versions and loses --default/start.js.
-  $extraJson = @($ExtraArgs) | ConvertTo-Json -Compress
+  # ConvertTo-Json emits no value for an empty PowerShell array.  Always pass a
+  # JSON array so stop calls do not fail before pterm is invoked.
+  $extraJson = if (@($ExtraArgs).Count) { @($ExtraArgs) | ConvertTo-Json -Compress } else { '[]' }
   $command=Start-Job -ScriptBlock { param($ptermPath,$verb,$ref,$extraJson) $extra=@(ConvertFrom-Json -InputObject $extraJson); & $ptermPath $verb $ref @extra 2>&1 } -ArgumentList $pterm,$Action,$Ref,$extraJson
   $finished=Wait-Job -Job $command -Timeout $TimeoutSeconds
   if(-not $finished){
@@ -453,8 +455,14 @@ function Invoke-StableAudioCue($Cue,[string]$JobRoot) {
   Write-Host ("Stable Audio 3 erzeugt {0} ({1}s) ..." -f $Cue.kind,([Math]::Ceiling(([double]$Cue.target_duration_ms)/1000))) -ForegroundColor Cyan
   $proc=Start-Process -FilePath $stableAudioPython -ArgumentList $argLine -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru
   if(-not $proc.WaitForExit($stableAudioTimeout*1000)){Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue;throw "Stable Audio 3 hat das Zeitlimit von $stableAudioTimeout Sekunden überschritten."}
-  $stderrText=if(Test-Path $stderr){(Get-Content $stderr -Raw).Trim()}else{''}
-  if($proc.ExitCode -ne 0 -or -not(Test-Path -LiteralPath $output)){throw "Stable Audio 3 fehlgeschlagen (Code $($proc.ExitCode)). $stderrText"}
+  # An empty redirected stderr file is represented as $null by Windows PowerShell;
+  # normalize it before calling .Trim().  Likewise, a fully completed process can
+  # expose no ExitCode through Start-Process even though the WAV and JSON success
+  # response exist.  The output file is the decisive success signal here.
+  $stderrRaw = if(Test-Path $stderr){ Get-Content -LiteralPath $stderr -Raw } else { '' }
+  $stderrText = if ($null -eq $stderrRaw) { '' } else { ([string]$stderrRaw).Trim() }
+  $exitCode=$null;try{$exitCode=$proc.ExitCode}catch{}
+  if(($null -ne $exitCode -and [int]$exitCode -ne 0) -or -not(Test-Path -LiteralPath $output)){throw "Stable Audio 3 fehlgeschlagen (Code $exitCode). $stderrText"}
   return $output
 }
 function Process-AudioCueJob($payload) {
@@ -492,7 +500,10 @@ function Process-AudioMixJob($payload) {
   $concat=Join-Path $root 'clips.txt';$clipLines=@();$total=0.0
   foreach($clip in $clips){$local=Join-Path $root ("clip-{0:d3}.mp4" -f [int]$clip.sequence);Invoke-WebRequest -Uri ($config.ServerUrl+$clip.downloadUrl) -Headers (Headers) -OutFile $local;$clipLines += "file '$($local.Replace("'","'\''"))'";$total += [double]$clip.duration_seconds}
   if($total -le 0){throw 'Die Video-Timeline hat keine gültige Dauer.'}
-  Set-Content -LiteralPath $concat -Value ($clipLines -join "`n") -Encoding utf8
+  # FFmpeg's concat demuxer treats a UTF-8 BOM as part of its first keyword
+  # ("\ufefffile"), so emit plain UTF-8 explicitly rather than PowerShell 5.1's
+  # BOM-prefixed Set-Content encoding.
+  [IO.File]::WriteAllText($concat,($clipLines -join "`n"),(New-Object Text.UTF8Encoding($false)))
   $video=Join-Path $root 'picture-cut.mp4';& $ffmpegExe -y -loglevel error -f concat -safe 0 -i $concat -map 0:v:0 -c:v copy -an $video 2>&1|Out-Null
   if($LASTEXITCODE -ne 0 -or -not(Test-Path $video)){throw 'Der Bildschnitt für den Audio-Mix konnte nicht erstellt werden.'}
   $tracks=@($payload.audio.manifest.cues|Where-Object {$_.state -eq 'ready' -and $_.artifact.downloadUrl})
@@ -504,13 +515,24 @@ function Process-AudioMixJob($payload) {
   for($i=0;$i -lt $tracks.Count;$i++){
     $n=$i+1;$cue=$tracks[$i];$delay=[int]$cue.start_ms;$duration=[Math]::Max(1,([double]$cue.target_duration_ms/1000));$gain=if($null -ne $cue.gain_db){[double]$cue.gain_db}else{0}
     $loop=if($cue.kind -eq 'music' -or $cue.kind -eq 'ambience'){'aloop=loop=-1:size=2147483647,'}else{''}
-    $filters += "[$n:a]aresample=48000,$loop`atrim=duration=$($duration.ToString([Globalization.CultureInfo]::InvariantCulture)),volume=$($gain.ToString([Globalization.CultureInfo]::InvariantCulture)),adelay=$delay|$delay[a$n]"
+    # In a double-quoted PowerShell string `$n:a` means a scoped variable and
+    # `` `a`` is an ANSI escape character.  Build the FFmpeg input label and
+    # `atrim` filter explicitly so the graph gets `[1:a]...atrim`, not `[]...`.
+    $filters += ("[{0}:a]aresample=48000,{1}atrim=duration={2},volume={3},adelay={4}|{4}[a{0}]" -f $n,$loop,$duration.ToString([Globalization.CultureInfo]::InvariantCulture),$gain.ToString([Globalization.CultureInfo]::InvariantCulture),$delay)
     if($cue.kind -eq 'music' -or $cue.kind -eq 'ambience'){$musicLabels += "[a$n]"}else{$foregroundLabels += "[a$n]"}
   }
   if($musicLabels.Count -gt 0){$filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[bed]" -f ($musicLabels -join ''),$musicLabels.Count)}
-  $filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[foreground]" -f ($foregroundLabels -join ''),$foregroundLabels.Count)
-  if($musicLabels.Count -gt 0){$filters += '[bed][foreground]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=450[ducked]';$filters += '[ducked][foreground]amix=inputs=2:duration=longest:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[mix]'}else{$filters += '[foreground]loudnorm=I=-16:TP=-1.5:LRA=11[mix]'}
-  $master=Join-Path $root 'audio-master.mp4';$args += @('-filter_complex',($filters -join ';'),'-map','0:v:0','-map','[mix]','-c:v','copy','-c:a','aac','-b:a','192k','-t',([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture)),'-movflags','+faststart',$master)
+  # Use short, unambiguous labels.  Some FFmpeg builds misinterpret the word
+  # "foreground" as a stream specifier when it is reused as a sidechain input.
+  $filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[fg]" -f ($foregroundLabels -join ''),$foregroundLabels.Count)
+  if($musicLabels.Count -gt 0){
+    # A filter output can only be consumed once.  Split foreground audio: one
+    # branch controls ducking, the other remains audible in the final mix.
+    $filters += '[fg]asplit=2[fg_side][fg_mix]'
+    $filters += '[bed][fg_side]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=450[duck]'
+    $filters += '[duck][fg_mix]amix=inputs=2:duration=longest:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[mix]'
+  }else{$filters += '[fg]loudnorm=I=-16:TP=-1.5:LRA=11[mix]'}
+  $master=Join-Path $root 'audio-master.mp4';$args += @('-filter_complex',($filters -join ';'),'-map','0:v:0','-map','[mix]','-c:v','copy','-c:a','aac','-ar','48000','-b:a','192k','-t',([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture)),'-movflags','+faststart',$master)
   & $ffmpegExe @args 2>&1|Out-Null
   if($LASTEXITCODE -ne 0 -or -not(Test-Path $master)){throw 'ffmpeg konnte den Stimmen-Mix nicht erstellen.'}
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-master" -Headers (Headers) -ContentType 'video/mp4' -InFile $master | Out-Null
@@ -680,6 +702,8 @@ try {
         $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)
         if($payload){try{if($payload.job.kind -eq 'comfyui_reference_preview'){Process-ImageJob $payload}elseif($payload.job.kind -eq 'caption_asset'){Process-CaptionJob $payload}elseif($payload.job.kind -eq 'audio_preview'){Process-AudioPreviewJob $payload}elseif($payload.job.kind -eq 'audio_cue'){Process-AudioCueJob $payload}elseif($payload.job.kind -eq 'audio_mix'){Process-AudioMixJob $payload}else{Process-Job $payload};Remove-ConfirmedJobWorkspace $payload.job}catch{
           $failure = if ($_ -and $_.Exception -and $_.Exception.Message) { [string]$_.Exception.Message } elseif ($_){ [string]$_ } else { 'Unbekannter Worker-Fehler.' }
+          $stack = if ($_ -and $_.ScriptStackTrace) { [string]$_.ScriptStackTrace } else { '' }
+          if ($stack) { $failure = "$failure`n$stack" }
           Write-Host $failure -ForegroundColor Red
           try { Report-Job $payload.job.id 'fail' $failure } catch { Write-Host ("Fehlerstatus konnte nicht an FrameCut gemeldet werden: {0}" -f ([string]$_)) -ForegroundColor Red }
         }}

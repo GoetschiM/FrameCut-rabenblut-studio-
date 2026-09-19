@@ -32,7 +32,10 @@ def main() -> int:
     parser.add_argument("--spec", required=True)
     args = parser.parse_args()
 
-    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    # Windows PowerShell writes UTF-8 with a BOM by default.  Accept both that
+    # form and plain UTF-8 so a perfectly valid cue never fails before Stable
+    # Audio even receives the prompt.
+    spec = json.loads(Path(args.spec).read_text(encoding="utf-8-sig"))
     prompt = str(spec.get("prompt") or "").strip()
     duration = max(1, min(120, int(spec.get("duration_seconds") or 1)))
     output = Path(str(spec.get("output") or "")).resolve()
