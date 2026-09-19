@@ -1290,6 +1290,10 @@ function newAsset() {
       <label>Visuelle Details / Leitplanken
         <textarea name="visualNotes" placeholder="Aussehen, Kleidung, Beleuchtung, Farben..."></textarea>
       </label>
+      <div class="shot-modal-grid" id="new-character-dimensions">
+        <label>Alter (optional)<input name="ageYears" type="number" min="0" max="130" placeholder="z. B. 7"></label>
+        <label>Größe in cm (optional)<input name="heightCm" type="number" min="30" max="260" placeholder="z. B. 122"></label>
+      </div>
       <label>Foto hochladen (Direkt vom Handy oder PC)
         <input name="file" type="file" accept="image/png,image/jpeg,image/webp">
       </label>
@@ -1344,6 +1348,11 @@ async function editAsset(a) {
         <textarea name="visualNotes">${esc(a.visual_notes || '')}</textarea>
       </label>
       ${a.kind === 'character' ? `
+      <div class="shot-modal-grid">
+        <label>Alter (optional)<input name="ageYears" type="number" min="0" max="130" value="${a.age_years ?? ''}"></label>
+        <label>Größe in cm (optional)<input name="heightCm" type="number" min="30" max="260" value="${a.height_cm ?? ''}"></label>
+      </div>
+      <p style="font-size:11px;color:var(--text-dim);margin:-4px 0 8px;">Diese Angaben sind optionale Konsistenz-Leitplanken für generierte Referenzbilder und Größenverhältnisse. Das stabile Identitäts-Seed bleibt absichtlich unverändert.</p>
       <label>Stimmprofil
         <textarea name="voice" placeholder="z. B. junge, helle Schweizerdeutsche Kinderstimme; neugierig, warm, klar und natürlich">${esc(a.voice || '')}</textarea>
         <span style="display:block;margin-top:4px;color:var(--text-dim);font-size:11px;">Diese Beschreibung wird nur an den lokalen Qwen-TTS-Adapter übergeben. Kein Klonen einer echten Stimme ohne Referenzton.</span>

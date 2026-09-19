@@ -384,13 +384,14 @@ function Process-ImageJob($payload) {
   $prefix=("framecut/job-{0}" -f $job.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
   $negativePrompt=if($asset.kind -eq 'character'){
-    'text, caption, watermark, malformed anatomy, duplicate person, white background, flat lighting'
+    'text, caption, watermark, malformed anatomy, duplicate person, twin, clone, multiple people, contact sheet, character turnaround, white background, flat lighting'
   }else{
     'person, people, human, character, face, portrait, body, hands, crowd, text, caption, watermark, white background, flat lighting'
   }
   $env:COMFY_URL=$config.ComfyUrl
   $imageTimeout=if($config.ImageTimeoutSeconds){[Math]::Max(120,[int]$config.ImageTimeoutSeconds)}else{900}
-  try { Invoke-BoundedPython @($imageClient,$payload.prompt,'--negativ',$negativePrompt,'--breite','768','--hoehe','432','--schritte',[string]$photoSteps,'--seed',[string](100000+[int]$job.id),'--name',$prefix) $imageTimeout 'ComfyUI Referenzbild' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
+  $identitySeed=if($asset.identity_seed){[int]$asset.identity_seed}else{100000+[int]$asset.id}
+  try { Invoke-BoundedPython @($imageClient,$payload.prompt,'--negativ',$negativePrompt,'--breite','768','--hoehe','432','--schritte',[string]$photoSteps,'--seed',[string]$identitySeed,'--name',$prefix) $imageTimeout 'ComfyUI Referenzbild' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
   $result=Get-ChildItem -LiteralPath (Join-Path $comfyOutputRoot 'framecut') -Filter ("job-{0}*.png" -f $job.id)|Sort-Object LastWriteTime -Descending|Select-Object -First 1
   if(-not $result){throw 'ComfyUI meldete Erfolg, aber das Vorschaubild wurde nicht gefunden.'}
   $encoded=[Convert]::ToBase64String([IO.File]::ReadAllBytes($result.FullName))
@@ -588,7 +589,13 @@ function Process-Job($payload) {
   $visualRefs=@($allRefs|Where-Object { $_.kind -ne 'source' -and $_.name -and $shotText -match [regex]::Escape([string]$_.name) })
   if($visualRefs.Count -eq 0 -and $allRefs.Count -eq 1){$visualRefs=@($allRefs|Where-Object {$_.kind -ne 'source'}|Select-Object -First 1)}
   $inactiveNames=@($allRefs|Where-Object { $_.kind -ne 'source' -and $visualRefs.id -notcontains $_.id }|ForEach-Object {$_.name}|Where-Object {$_})
-  $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {"$($_.name): $($_.summary) $($_.visual_notes). Exactly one instance; preserve age, face, hairstyle, clothing and scale."}) -join ' | ' } else { 'No asset is active in this shot.' }
+  $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {
+    $measurements=@()
+    if($null -ne $_.age_years -and [string]$_.age_years -ne ''){$measurements += "age $($_.age_years) years"}
+    if($null -ne $_.height_cm -and [string]$_.height_cm -ne ''){$measurements += "height $($_.height_cm) cm"}
+    $scale=if($measurements.Count){" Locked physical scale: $($measurements -join ', ')."}else{''}
+    "$($_.name): $($_.summary) $($_.visual_notes). Exactly one instance; preserve face, hairstyle, clothing, body proportions and relative scale.$scale"
+  }) -join ' | ' } else { 'No asset is active in this shot.' }
   $inactiveRule=if($inactiveNames.Count -gt 0){"Do not show these inactive continuity assets in this shot: $($inactiveNames -join ', ')."}else{''}
   $teslaRequested=($shot.prompt -match '(?i)\btesla\b') -or (($visualRefs|Where-Object {$_.name -match '(?i)\btesla\b'}).Count -gt 0)
   # A named prop such as Polo (the excavator) may be a vehicle in the broad sense.
