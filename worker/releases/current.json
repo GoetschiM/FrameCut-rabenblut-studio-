@@ -1,0 +1,5 @@
+{
+  "version": "bootstrap-1",
+  "file": "framecut-worker-bootstrap-1.zip",
+  "entrypoint": "Start-FrameCutRemoteWorker.bat"
+}
