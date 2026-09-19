@@ -1685,4 +1685,17 @@ $('#episode-switch').onchange = e => { currentEpisode = Number(e.target.value); 
 $('#refresh').onclick = () => load().then(() => notice('Aktualisiert.')).catch(e => notice(e.message));
 $('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
 
+// User dropdown
+(function () {
+  const pill = $('#user-pill');
+  const dropdown = $('#user-dropdown');
+  if (!pill || !dropdown) return;
+  pill.onclick = e => { e.stopPropagation(); dropdown.classList.toggle('open'); };
+  document.addEventListener('click', () => dropdown.classList.remove('open'));
+  const menuSettings = $('#user-menu-settings');
+  const menuLogout = $('#user-menu-logout');
+  if (menuSettings) menuSettings.onclick = e => { e.stopPropagation(); dropdown.classList.remove('open'); openView('settings'); };
+  if (menuLogout) menuLogout.onclick = async e => { e.stopPropagation(); await api('/api/logout', { method: 'POST' }); location.reload(); };
+})();
+
 openStudio().catch(init);

@@ -1172,3 +1172,91 @@ body {
 .hero-btn-stop:hover {
   background: rgba(255, 82, 82, 0.25) !important;
 }
+
+/* ─── SETTINGS FORMS (outside modals) ─────────────────────────────────────── */
+.shot-modal-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+#episode-settings-form,
+.render-settings-form,
+#render-settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+#episode-settings-form label,
+.render-settings-form label,
+#render-settings-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+#episode-settings-form input,
+#episode-settings-form textarea,
+#episode-settings-form select,
+.render-settings-form input,
+.render-settings-form textarea,
+.render-settings-form select,
+#render-settings-form input,
+#render-settings-form textarea,
+#render-settings-form select {
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  color: var(--text-main);
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: var(--font-ui);
+  outline: none;
+}
+#episode-settings-form input:focus,
+#episode-settings-form textarea:focus,
+#render-settings-form input:focus,
+#render-settings-form textarea:focus {
+  border-color: var(--emerald);
+}
+#episode-settings-form textarea,
+#render-settings-form textarea { min-height: 80px; resize: vertical; }
+
+/* ─── USER DROPDOWN ────────────────────────────────────────────────────────── */
+.user-pill {
+  position: relative;
+  cursor: pointer;
+  user-select: none;
+}
+.user-pill:hover { border-color: var(--line-strong); }
+.user-dropdown {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: #14151a;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  box-shadow: 0 12px 36px rgba(0,0,0,0.7);
+  min-width: 160px;
+  z-index: 200;
+  overflow: hidden;
+}
+.user-dropdown.open { display: block; }
+.user-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-main);
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.user-dropdown-item:hover { background: var(--bg-card); color: var(--emerald); }
+.user-dropdown-sep { height: 1px; background: var(--line); margin: 4px 0; }
