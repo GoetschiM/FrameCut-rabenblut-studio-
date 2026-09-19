@@ -133,6 +133,45 @@ function renderProjectSwitcher() {
   });
 }
 
+function updateNavPill() {
+  const label = document.getElementById('nav-pill-label');
+  const dropdown = document.getElementById('nav-dropdown');
+  if (!label || !dropdown) return;
+  const project = data && data.selected && data.selected.project;
+  const episode = data && data.selected && data.selected.episode;
+  const episodes = (data && data.selected && data.selected.episodes) || [];
+  const projects = (data && data.projects) || [];
+  if (project) {
+    label.textContent = project.title + ' / EP ' + String(episode ? episode.number : 1).padStart(2, '0');
+  } else {
+    label.textContent = 'Projekt';
+  }
+  const epItems = episodes.map(e =>
+    '<button class="nav-dd-item' + (e.id === currentEpisode ? ' active' : '') + '" data-nav-ep="' + e.id + '">EP ' + String(e.number).padStart(2,'0') + ' · ' + esc(e.title) + '</button>'
+  ).join('');
+  const prItems = projects.map(p =>
+    '<button class="nav-dd-item' + (p.id === currentProject ? ' active' : '') + '" data-nav-proj="' + p.id + '">' + esc(p.title) + '</button>'
+  ).join('');
+  dropdown.innerHTML =
+    '<div class="nav-dd-header">Episoden</div>' + epItems +
+    '<button class="nav-dd-item" id="nav-dd-new-ep">+ Neue Episode</button>' +
+    '<div class="nav-dd-sep"></div><div class="nav-dd-header">Projekte</div>' + prItems +
+    '<button class="nav-dd-item" id="nav-dd-new-proj">+ Neues Projekt</button>' +
+    '<div class="nav-dd-sep"></div>' +
+    '<button class="nav-dd-item nav-dd-emerald" id="nav-dd-render"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style="margin-right:4px"><polygon points="5 3 19 12 5 21 5 3"/></svg>Alles rendern</button>' +
+    (episode ? '<button class="nav-dd-item nav-dd-danger" id="nav-dd-archive-ep">Episode archivieren</button>' : '');
+  dropdown.querySelectorAll('[data-nav-ep]').forEach(btn => btn.onclick = e => { e.stopPropagation(); currentEpisode = Number(btn.dataset.navEp); dropdown.classList.remove('open'); document.getElementById('nav-pill').classList.remove('open'); load(); });
+  dropdown.querySelectorAll('[data-nav-proj]').forEach(btn => btn.onclick = e => { e.stopPropagation(); if (Number(btn.dataset.navProj) !== currentProject) { currentProject = Number(btn.dataset.navProj); currentEpisode = null; } dropdown.classList.remove('open'); document.getElementById('nav-pill').classList.remove('open'); load(); });
+  const newEpBtn = document.getElementById('nav-dd-new-ep');
+  if (newEpBtn) newEpBtn.onclick = e => { e.stopPropagation(); dropdown.classList.remove('open'); document.getElementById('nav-pill').classList.remove('open'); newEpisode(); };
+  const newProjBtn = document.getElementById('nav-dd-new-proj');
+  if (newProjBtn) newProjBtn.onclick = e => { e.stopPropagation(); dropdown.classList.remove('open'); document.getElementById('nav-pill').classList.remove('open'); newProject(); };
+  const renderBtn = document.getElementById('nav-dd-render');
+  if (renderBtn) renderBtn.onclick = e => { e.stopPropagation(); dropdown.classList.remove('open'); document.getElementById('nav-pill').classList.remove('open'); document.getElementById('batch-render-btn').click(); };
+  const archBtn = document.getElementById('nav-dd-archive-ep');
+  if (archBtn) archBtn.onclick = async e => { e.stopPropagation(); if (!confirm('Diese Episode archivieren?')) return; dropdown.classList.remove('open'); document.getElementById('nav-pill').classList.remove('open'); try { await api('/api/episodes/' + currentEpisode + '/archive', {method:'POST'}); currentEpisode = null; await load(); notice('Episode archiviert.'); } catch(err) { notice(err.message); } };
+}
+
 function projectOptions() {
   const s = $('#project-switch');
   s.innerHTML = data.projects.map(p => `<option value="${p.id}" ${p.id === currentProject ? 'selected' : ''}>${esc(p.title)}</option>`).join('');
@@ -306,9 +345,13 @@ function render() {
       </div>
     </div>
     <textarea id="story-editor" style="width:100%;min-height:360px;background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);padding:18px;color:var(--text-main);font-family:var(--font-mono);font-size:13px;line-height:1.6;resize:vertical;" placeholder="# Episode 01\n\nSchreibe hier die Handlung...">${esc(story)}</textarea>
-    <details style="margin-top:16px;">
-      <summary style="cursor:pointer;color:var(--text-dim);font-size:12px;font-family:var(--font-mono);">⚙️ Nur für diese Episode: Stil & Qualität überschreiben (sonst gilt der Projekt-Standard)</summary>
-      <form id="episode-settings-form" style="margin-top:12px;padding:14px;background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);">
+    <div class="ep-section" style="margin-top:16px;">
+      <button type="button" class="ep-section-toggle" data-target="episode-style-body">
+        <span>Episode-Stil &amp; Qualität überschreiben</span>
+        <svg class="ep-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div id="episode-style-body" class="ep-section-body hidden">
+      <form id="episode-settings-form">
         <label>Style-Prompt für diese Episode<textarea name="styleProfile" placeholder="Leer lassen = Projekt-Stil übernehmen">${esc(episode.style_profile || '')}</textarea></label>
         <label>Negativ-Prompt für diese Episode<textarea name="negativePrompt" maxlength="2400" placeholder="Leer lassen = Projekt-Negativ-Prompt übernehmen">${esc(episode.negative_prompt || '')}</textarea><small>Zusätzliche Ausschlüsse für Keyframes und Videos, z. B. keine Schrift oder keine Fahrzeuge.</small></label>
         <div class="shot-modal-grid">
@@ -330,15 +373,21 @@ function render() {
           <button class="ghost" type="button" id="episode-settings-reset">Alle auf Projekt-Standard zurücksetzen</button>
         </div>
       </form>
-    </details>
-    <details style="margin-top:10px;">
-      <summary style="cursor:pointer;color:var(--text-dim);font-size:12px;font-family:var(--font-mono);">🗄️ Folgen-Verwaltung</summary>
+      </div>
+    </div>
+    <div class="ep-section" style="margin-top:8px;">
+      <button type="button" class="ep-section-toggle" data-target="episode-manage-body">
+        <span>Folgen-Verwaltung</span>
+        <svg class="ep-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div id="episode-manage-body" class="ep-section-body hidden">
       <div style="margin-top:12px;padding:14px;background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);">
         <p class="upload-note" style="margin-bottom:10px;">Archivierte Folgen verschwinden aus der Auswahl, bleiben aber vollständig erhalten und wiederherstellbar.</p>
         <button class="ghost" type="button" id="archive-episode">Diese Episode archivieren</button>
         <div id="archived-episodes-panel" style="margin-top:12px;"></div>
       </div>
-    </details>
+      </div>
+    </div>
   `;
 
   // 3. STORYBOARD (MATCHING MOCKUP 1 & 2)
@@ -565,6 +614,7 @@ function render() {
   `;
 
   renderProjectSwitcher();
+  updateNavPill();
   bindDynamic();
 }
 
@@ -1676,6 +1726,35 @@ function newEpisode() {
     notice('Episode angelegt.');
   });
 }
+
+// Nav-pill toggle handler
+document.getElementById('nav-pill') && document.getElementById('nav-pill').addEventListener('click', e => {
+  e.stopPropagation();
+  const pill = document.getElementById('nav-pill');
+  const dd = document.getElementById('nav-dropdown');
+  const isOpen = dd.classList.contains('open');
+  dd.classList.toggle('open', !isOpen);
+  pill.classList.toggle('open', !isOpen);
+});
+document.addEventListener('click', e => {
+  if (!e.target.closest('.nav-pill-wrap')) {
+    const pill = document.getElementById('nav-pill');
+    const dd = document.getElementById('nav-dropdown');
+    if (pill) pill.classList.remove('open');
+    if (dd) dd.classList.remove('open');
+  }
+});
+
+// Episode section toggle handler
+document.addEventListener('click', e => {
+  const toggle = e.target.closest('.ep-section-toggle');
+  if (!toggle) return;
+  const body = document.getElementById(toggle.dataset.target);
+  if (!body) return;
+  const isOpen = !body.classList.contains('hidden');
+  body.classList.toggle('hidden', isOpen);
+  toggle.classList.toggle('open', !isOpen);
+});
 
 // Nav bindings
 document.querySelectorAll('.nav').forEach(b => b.onclick = () => openView(b.dataset.view));
