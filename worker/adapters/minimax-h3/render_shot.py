@@ -14,6 +14,7 @@ def main():
     p.add_argument('--low-vram',action='store_true')
     p.add_argument('--crop',nargs=4,type=int,metavar=('X','Y','WIDTH','HEIGHT'))
     p.add_argument('--reference-image',action='append',default=[])
+    p.add_argument('--reference-image-size',choices=('match','max'),default='match')
     a=p.parse_args()
     assert a.width%32==0 and a.height%32==0 and (a.frames-5)%17==0
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
@@ -48,21 +49,31 @@ def main():
       'video':{'class_type':'CreateVideo','inputs':{'images':['decode',0],'audio':['decode_audio',0],'fps':24.0}},
       'save':{'class_type':'SaveVideo','inputs':{'video':['video',0],'filename_prefix':'rabenblut/film_v2/'+a.name,'format':'mp4','codec':'h264'}}
     }
+    scene_image=['image',0]
     if a.crop:
         x,y,w,h=a.crop
         g['crop']={'class_type':'ImageCrop','inputs':{'image':['image',0],'x':x,'y':y,'width':w,'height':h}}
         g['cond']['inputs']['first_frame']=['crop',0]
+        scene_image=['crop',0]
     if a.reference_image:
         g['unet']['inputs']['unet_name']='minimax_h3_ref2va_pruned_int8_convrot.safetensors'
-        g['cond']={'class_type':'MiniMaxH3ReferenceToVideo','inputs':{'clip':['clip',0],'vae':['vae',0],'audio_vae':['avae',0],'prompt':prompt,'width':a.width,'height':a.height,'length':a.frames,'ref_image_size':'match','ref_images.ref_image_0':['image',0]}}
-        for index,refpath in enumerate(a.reference_image,1):
+        # Ref2VA has two distinct concepts which must not be conflated:
+        #   * semantic reference pictures (<Picture N>) define identity/style;
+        #   * a frame-0 guide defines the actual opening composition.
+        # Previously the scene keyframe was passed as Picture 1. H3 could then
+        # reinterpret a character sheet as the opening frame, causing white
+        # backgrounds, contact sheets and duplicated characters in the clip.
+        g['cond']={'class_type':'MiniMaxH3ReferenceToVideo','inputs':{'clip':['clip',0],'vae':['vae',0],'audio_vae':['avae',0],'prompt':prompt,'width':a.width,'height':a.height,'length':a.frames,'ref_image_size':a.reference_image_size}}
+        for index,refpath in enumerate(a.reference_image):
             ref=Path(refpath);rb=uuid.uuid4().hex
             rbbody=(f'--{rb}\r\nContent-Disposition: form-data; name="image"; filename="rb_{rb}.png"\r\nContent-Type: image/png\r\n\r\n').encode()+ref.read_bytes()+f'\r\n--{rb}--\r\n'.encode()
             request=urllib.request.Request(base+'/upload/image',data=rbbody,headers={'Content-Type':'multipart/form-data; boundary='+rb})
             with urllib.request.urlopen(request,timeout=120) as r:refmeta=json.load(r)
-            key='reference_'+str(index)
+            key='reference_'+str(index+1)
             g[key]={'class_type':'LoadImage','inputs':{'image':refmeta['name']}}
             g['cond']['inputs']['ref_images.ref_image_'+str(index)]=[key,0]
+        g['scene_guide']={'class_type':'MiniMaxH3AddGuide','inputs':{'positive':['cond',0],'vae':['vae',0],'latent':['cond',1],'image':scene_image,'frame_idx':0}}
+        g['guide']['inputs']['conditioning']=['scene_guide',0]
     (out/(a.name+'.workflow.json')).write_text(json.dumps(g,indent=2),encoding='utf-8')
     result=api('/prompt',{'prompt':g,'client_id':'rabenblut-film-v2'})
     state={'prompt_id':result['prompt_id'],'input':str(image.resolve()),'prompt':prompt,'settings':vars(a),'status':'queued'}

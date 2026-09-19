@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS shot_assets (shot_id INTEGER NOT NULL, asset_id INTEG
 CREATE TABLE IF NOT EXISTS shots (id INTEGER PRIMARY KEY, episode_id INTEGER NOT NULL, sequence INTEGER NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL DEFAULT '', camera TEXT NOT NULL DEFAULT '', duration_seconds REAL NOT NULL DEFAULT 5, seed INTEGER, status TEXT NOT NULL DEFAULT 'Entwurf', source_image_path TEXT, output_video_path TEXT, created_at TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS user_provider_keys (user_id INTEGER NOT NULL, provider TEXT NOT NULL, encrypted_key TEXT NOT NULL, model TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,provider));
 CREATE TABLE IF NOT EXISTS auto_plan_drafts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, episode_id INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT, target_seconds REAL NOT NULL, recommended_seconds REAL NOT NULL, style_profile TEXT NOT NULL DEFAULT '', adaptation_mode TEXT NOT NULL DEFAULT 'cinematic', reference_asset_ids TEXT NOT NULL DEFAULT '[]', analysis_json TEXT NOT NULL, created_at TEXT NOT NULL, committed_at TEXT);`);
+db.exec(`CREATE TABLE IF NOT EXISTS user_style_presets (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, name TEXT NOT NULL,
+  description TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(user_id,name)
+);`);
 db.exec(`CREATE TABLE IF NOT EXISTS episode_exports (id INTEGER PRIMARY KEY,episode_id INTEGER NOT NULL,name TEXT NOT NULL,file_path TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'mp4',created_at TEXT NOT NULL);`);
 // Stores a reviewed cue plan only. Media artifacts and provider configuration remain
 // on the audio worker, never in the web server database.
@@ -76,7 +81,6 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_story_versions_ep ON story_versions(epis
 // Every query above ran as a full table scan until now.
 db.exec(`CREATE INDEX IF NOT EXISTS idx_shots_episode ON shots(episode_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, id);
-CREATE INDEX IF NOT EXISTS idx_jobs_shot ON jobs(shot_id, state);
 CREATE INDEX IF NOT EXISTS idx_jobs_episode ON jobs(episode_id);
 CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id);
 CREATE INDEX IF NOT EXISTS idx_episode_assets_ep ON episode_assets(episode_id);
@@ -86,6 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_exports_episode ON episode_exports(episode_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);`);
 try { db.exec("ALTER TABLE shots ADD COLUMN render_tier TEXT NOT NULL DEFAULT 'Vorschau'"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE shots ADD COLUMN kind TEXT NOT NULL DEFAULT 'scene'"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE shots ADD COLUMN reference_photo_path TEXT"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE episodes ADD COLUMN style_profile TEXT"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE episodes ADD COLUMN video_steps INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE episodes ADD COLUMN photo_steps INTEGER"); } catch { /* column already exists */ }
@@ -98,6 +103,7 @@ try { db.exec("ALTER TABLE jobs ADD COLUMN worker_id TEXT"); } catch { /* column
 try { db.exec("ALTER TABLE jobs ADD COLUMN shot_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE jobs ADD COLUMN asset_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"); } catch { /* column already exists */ }
+db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_shot ON jobs(shot_id, state)");
 try { db.exec("ALTER TABLE workers ADD COLUMN name TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE workers ADD COLUMN owner_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE workers ADD COLUMN machine TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
@@ -819,6 +825,28 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (path === '/api/me' && req.method === 'GET') return json(res,200,{user:user(req)});
+    if (path === '/api/style-presets' && req.method === 'GET') {
+      const account=guard(req,res); if(!account)return;
+      return json(res,200,{presets:rows('SELECT id,name,description,created_at,updated_at FROM user_style_presets WHERE user_id=? ORDER BY name COLLATE NOCASE',account.id)});
+    }
+    if (path === '/api/style-presets' && req.method === 'POST') {
+      const account=guard(req,res); if(!account)return; const d=await body(req);
+      const name=assertText(d.name,'Stilname',80),description=assertText(d.description,'Stilbeschreibung',5000);
+      if(row('SELECT id FROM user_style_presets WHERE user_id=? AND name=? COLLATE NOCASE',account.id,name))return json(res,409,{error:'Du hast bereits eine Stilvorlage mit diesem Namen.'});
+      const stamp=now(),created=run('INSERT INTO user_style_presets(user_id,name,description,created_at,updated_at) VALUES (?,?,?,?,?)',account.id,name,description,stamp,stamp);
+      event('Stilvorlage gespeichert',`${account.username} · ${name}`);
+      return json(res,201,{preset:row('SELECT id,name,description,created_at,updated_at FROM user_style_presets WHERE id=? AND user_id=?',Number(created.lastInsertRowid),account.id)});
+    }
+    if (/^\/api\/style-presets\/\d+$/.test(path) && req.method === 'PATCH') {
+      const account=guard(req,res); if(!account)return; const id=Number(path.split('/').pop()),existing=row('SELECT * FROM user_style_presets WHERE id=? AND user_id=?',id,account.id); if(!existing)return json(res,404,{error:'Stilvorlage nicht gefunden.'}); const d=await body(req);
+      const name=assertText(d.name??existing.name,'Stilname',80),description=assertText(d.description??existing.description,'Stilbeschreibung',5000);
+      const duplicate=row('SELECT id FROM user_style_presets WHERE user_id=? AND name=? COLLATE NOCASE AND id<>?',account.id,name,id); if(duplicate)return json(res,409,{error:'Du hast bereits eine andere Stilvorlage mit diesem Namen.'});
+      run('UPDATE user_style_presets SET name=?,description=?,updated_at=? WHERE id=? AND user_id=?',name,description,now(),id,account.id); event('Stilvorlage aktualisiert',`${account.username} · ${name}`);
+      return json(res,200,{preset:row('SELECT id,name,description,created_at,updated_at FROM user_style_presets WHERE id=? AND user_id=?',id,account.id)});
+    }
+    if (/^\/api\/style-presets\/\d+$/.test(path) && req.method === 'DELETE') {
+      const account=guard(req,res); if(!account)return; const id=Number(path.split('/').pop()),existing=row('SELECT * FROM user_style_presets WHERE id=? AND user_id=?',id,account.id); if(!existing)return json(res,404,{error:'Stilvorlage nicht gefunden.'}); run('DELETE FROM user_style_presets WHERE id=? AND user_id=?',id,account.id); event('Stilvorlage gelöscht',`${account.username} · ${existing.name}`); return json(res,200,{ok:true});
+    }
     // A worker package is deliberately public: it contains no credentials and its
     // checksum is delivered alongside it. Downloading the archive itself still
     // requires the freshly issued worker token below.
@@ -1573,6 +1601,8 @@ const server = http.createServer(async (req, res) => {
     if (/^\/api\/shots\/\d+\/dialogue$/.test(path) && req.method === 'POST') { if (!guard(req,res)) return; const shotId=Number(path.split('/')[3]),d=await body(req),shot=row('SELECT s.*,e.project_id FROM shots s JOIN episodes e ON e.id=s.episode_id WHERE s.id=?',shotId); if(!shot)return json(res,404,{error:'Shot nicht gefunden.'}); const text=String(d.text||'').trim(); if(!text)return json(res,400,{error:'Text darf nicht leer sein.'}); const assetId=Number(d.assetId)||null; if(assetId && !row('SELECT id FROM assets WHERE id=? AND project_id=?',assetId,shot.project_id))return json(res,400,{error:'Diese Figur gehört nicht zu diesem Projekt.'}); const seq=(row('SELECT MAX(sequence) max FROM shot_dialogue WHERE shot_id=?',shotId)?.max||0)+1; const ins=run('INSERT INTO shot_dialogue(shot_id,asset_id,sequence,text,created_at) VALUES (?,?,?,?,?)',shotId,assetId,seq,text.slice(0,1000),now()); event('Dialogzeile hinzugefügt',shot.title); return json(res,201,{line:row('SELECT id,asset_id,sequence,text FROM shot_dialogue WHERE id=?',Number(ins.lastInsertRowid))}); }
     if (/^\/api\/shots\/\d+\/dialogue\/\d+$/.test(path) && req.method === 'PATCH') { if (!guard(req,res)) return; const parts=path.split('/'),shotId=Number(parts[3]),lineId=Number(parts[5]),d=await body(req),line=row('SELECT * FROM shot_dialogue WHERE id=? AND shot_id=?',lineId,shotId); if(!line)return json(res,404,{error:'Dialogzeile nicht gefunden.'}); const assetId=d.assetId!==undefined?(Number(d.assetId)||null):line.asset_id; run('UPDATE shot_dialogue SET text=?, asset_id=? WHERE id=?',String(d.text??line.text).trim().slice(0,1000),assetId,lineId); return json(res,200,{ok:true}); }
     if (/^\/api\/shots\/\d+\/dialogue\/\d+$/.test(path) && req.method === 'DELETE') { if (!guard(req,res)) return; const parts=path.split('/'),shotId=Number(parts[3]),lineId=Number(parts[5]); const removed=run('DELETE FROM shot_dialogue WHERE id=? AND shot_id=?',lineId,shotId); if(!removed.changes)return json(res,404,{error:'Dialogzeile nicht gefunden.'}); return json(res,200,{ok:true}); }
+    if (/^\/api\/shots\/\d+\/reference-photo$/.test(path) && req.method === 'PUT') { if (!guard(req,res)) return; const id=Number(path.split('/')[3]),d=await body(req,10_000_000),shot=row('SELECT * FROM shots WHERE id=?',id); if(!shot)return json(res,404,{error:'Shot nicht gefunden.'}); const match=String(d.data||'').match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/); if(!match)return json(res,400,{error:'Erlaubt sind PNG, JPG und WebP.'}); const bytes=Buffer.from(match[2],'base64'); if(bytes.length>10*1024*1024)return json(res,400,{error:'Datei ist größer als 10 MB.'}); await mkdir(UPLOADS,{recursive:true}); const ext=match[1]==='image/png'?'png':match[1]==='image/webp'?'webp':'jpg',file='shot-ref-'+id+'-'+randomBytes(5).toString('hex')+'.'+ext; await writeFile(join(UPLOADS,file),bytes); const portable='data/uploads/'+file; if(shot.reference_photo_path){try{await rm(resolve(DATA,shot.reference_photo_path),{force:true})}catch{}} run('UPDATE shots SET reference_photo_path=? WHERE id=?',portable,id); event('Shot-Referenzfoto gesetzt',shot.title); return json(res,201,{ok:true,path:portable}); }
+    if (/^\/api\/shots\/\d+\/reference-photo$/.test(path) && req.method === 'DELETE') { if (!guard(req,res)) return; const id=Number(path.split('/')[3]),shot=row('SELECT * FROM shots WHERE id=?',id); if(!shot)return json(res,404,{error:'Shot nicht gefunden.'}); if(shot.reference_photo_path){try{await rm(resolve(DATA,shot.reference_photo_path),{force:true})}catch{}} run('UPDATE shots SET reference_photo_path=NULL WHERE id=?',id); event('Shot-Referenzfoto gelöscht',shot.title); return json(res,200,{ok:true}); }
     if (path === '/api/jobs/batch' && req.method === 'POST') {
       const account = guard(req, res); if (!account) return;
       const d = await body(req);
@@ -1872,10 +1902,10 @@ const server = http.createServer(async (req, res) => {
       if(!shot){run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?",'Der zugehörige Shot fehlt.',now(),job.id);return json(res,204,{});}
       const references=rows("SELECT a.id,a.name,a.kind,a.summary,a.visual_notes,a.age_years,a.height_cm,a.identity_seed,a.file_path,sa.role FROM shot_assets sa JOIN assets a ON a.id=sa.asset_id WHERE sa.shot_id=? ORDER BY CASE sa.role WHEN 'reference' THEN 1 ELSE 2 END,a.id",shot.id)
         .filter(a=>a.file_path).map(a=>({...a,file_path:undefined,downloadUrl:`/api/worker/assets/${a.id}/file`}));
-      const source=shot.source_image_path?{name:'Shot-Startbild',kind:'source',role:'source',downloadUrl:`/api/worker/shots/${shot.id}/source`}:null;
+      const source=(shot.reference_photo_path||shot.source_image_path)?{name:shot.reference_photo_path?'Shot-Referenzfoto':'Shot-Startbild',kind:'source',role:'source',downloadUrl:`/api/worker/shots/${shot.id}/source`}:null;
       return json(res,200,{job,shot:{...shot,source_image_path:undefined,output_video_path:undefined,references:source?[source,...references]:references}});
     }
-    if (/^\/api\/worker\/jobs\/\d+\/image$/.test(path) && req.method === 'POST') { if(!workerGuard(req,res))return; const id=Number(path.split('/')[4]),job=row('SELECT * FROM jobs WHERE id=?',id),d=await body(req,9_000_000); if(!job?.asset_id)return json(res,404,{error:'Bildauftrag nicht gefunden.'}); const match=String(d.data||'').match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/); if(!match)return json(res,400,{error:'Bilddaten sind ungültig.'}); const bytes=Buffer.from(match[2],'base64');if(bytes.length>6*1024*1024)return json(res,400,{error:'Vorschaubild ist größer als 6 MB.'});await mkdir(UPLOADS,{recursive:true});const ext=match[1]==='image/png'?'png':match[1]==='image/webp'?'webp':'jpg',file=`worker-${id}-${randomBytes(5).toString('hex')}.${ext}`;await writeFile(join(UPLOADS,file),bytes);const portable=`data/uploads/${file}`;run('UPDATE assets SET file_path=? WHERE id=?',portable,job.asset_id);run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?",'Referenzbild lokal erzeugt und hochgeladen.',now(),id);event('Referenzbild fertig',`Job ${id} · Benutzer ${job.owner_id||'unbekannt'}`);return json(res,201,{ok:true,path:portable}); }
+    if (/^\/api\/worker\/jobs\/\d+\/image$/.test(path) && req.method === 'POST') { if(!workerGuard(req,res))return; const id=Number(path.split('/')[4]),job=row('SELECT * FROM jobs WHERE id=?',id),d=await body(req,9_000_000); if(!job?.asset_id)return json(res,404,{error:'Bildauftrag nicht gefunden.'}); const match=String(d.data||'').match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/); if(!match)return json(res,400,{error:'Bilddaten sind ungültig.'}); const bytes=Buffer.from(match[2],'base64');if(bytes.length>6*1024*1024)return json(res,400,{error:'Vorschaubild ist größer als 6 MB.'});await mkdir(UPLOADS,{recursive:true});const ext=match[1]==='image/png'?'png':match[1]==='image/webp'?'webp':'jpg',file=`worker-${id}-${randomBytes(5).toString('hex')}.${ext}`;await writeFile(join(UPLOADS,file),bytes);const portable=`data/uploads/${file}`;run('UPDATE assets SET file_path=? WHERE id=?',portable,job.asset_id);run('UPDATE asset_photos SET is_primary=0 WHERE asset_id=?',job.asset_id);run('INSERT INTO asset_photos(asset_id,file_path,is_primary,created_at) VALUES (?,?,1,?)',job.asset_id,portable,now());run("UPDATE jobs SET state='fertig',detail=?,completed_at=? WHERE id=?",'Referenzbild lokal erzeugt und hochgeladen.',now(),id);event('Referenzbild fertig',`Job ${id} · Benutzer ${job.owner_id||'unbekannt'}`);return json(res,201,{ok:true,path:portable}); }
     if (/^\/api\/worker\/jobs\/\d+\/caption$/.test(path) && req.method === 'POST') {
       if (!workerGuard(req, res)) return;
       const id = Number(path.split('/')[4]);
@@ -1958,7 +1988,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (/^\/api\/worker\/shots\/\d+\/video$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const shot=row('SELECT output_video_path FROM shots WHERE id=?',Number(path.split('/')[4])); if(!shot?.output_video_path)return json(res,404,{error:'Clip fehlt.'}); const target=mediaPath(shot.output_video_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Clip fehlt.'}); return serveFile(res,target); }
     if (/^\/api\/worker\/episodes\/\d+\/status$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return;const episodeId=Number(path.split('/')[4]);const counts=rows('SELECT kind,state,count(*) count FROM jobs WHERE episode_id=? GROUP BY kind,state',episodeId);const shots=row('SELECT count(*) total,sum(CASE WHEN output_video_path IS NOT NULL THEN 1 ELSE 0 END) finished FROM shots WHERE episode_id=?',episodeId);return json(res,200,{episodeId,counts,shots}); }
-    if (/^\/api\/worker\/shots\/\d+\/source$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const shot=row('SELECT * FROM shots WHERE id=?',Number(path.split('/')[4])); if(!shot?.source_image_path)return json(res,404,{error:'Startbild fehlt.'}); const target=mediaPath(shot.source_image_path); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Startbild fehlt.'}); return serveFile(res,target); }
+    if (/^\/api\/worker\/shots\/\d+\/source$/.test(path) && req.method === 'GET') { if(!workerGuard(req,res))return; const shot=row('SELECT * FROM shots WHERE id=?',Number(path.split('/')[4])); const sourcePath=shot?.reference_photo_path||shot?.source_image_path; if(!sourcePath)return json(res,404,{error:'Startbild fehlt.'}); const target=mediaPath(sourcePath); if(!permittedMediaPath(target)||!existsSync(target))return json(res,404,{error:'Startbild fehlt.'}); return serveFile(res,target); }
     if (/^\/api\/worker\/jobs\/\d+\/(complete|fail)$/.test(path) && req.method === 'POST') { if (!workerGuard(req,res)) return; const id=Number(path.split('/')[4]),action=path.split('/')[5],d=await body(req),job=row('SELECT * FROM jobs WHERE id=?',id); if(!job)return json(res,404,{error:'Job nicht gefunden.'}); if(job.state==='abgebrochen')return json(res,409,{error:'Dieser Auftrag wurde bereits abgebrochen.'}); const state=action==='complete'?'fertig':'fehlgeschlagen'; run('UPDATE jobs SET state=?,detail=?,completed_at=? WHERE id=?',state,String(d.detail||'').slice(0,4000),now(),id); if(action==='complete'&&job.shot_id){run('UPDATE shots SET status=?,output_video_path=COALESCE(?,output_video_path) WHERE id=?','Gerendert',String(d.outputPath||'').trim()||null,job.shot_id);} if(action==='fail'&&job.shot_id){const shot=row('SELECT output_video_path FROM shots WHERE id=?',job.shot_id);run('UPDATE shots SET status=? WHERE id=?',shot?.output_video_path?'Gerendert':'Entwurf',job.shot_id);} event(action==='complete'?'Video-Job fertig':'Video-Job fehlgeschlagen',`Job ${id} · Benutzer ${job.owner_id||'unbekannt'}`); return json(res,200,{ok:true}); }
     if (path === '/api/import-rabenblut' && req.method === 'POST') { if (!guard(req,res)) return; return json(res,200,{project:importRabenblut()}); }
     if (path === '/api/runtime' && req.method === 'GET') { if (!guard(req,res)) return; return json(res,200,{status:'bereit',message:'Render-Aufträge werden seriell an die vorhandenen lokalen Worker übergeben.',services:[['ComfyUI','Bildreferenzen','bereit'],['MiniMax H3','Video','bereit'],['Qwen TTS','Sprache','bei Bedarf'],['Audio Studio','Musik & SFX','bei Bedarf']]}); }

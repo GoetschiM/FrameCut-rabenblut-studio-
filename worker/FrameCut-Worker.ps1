@@ -44,7 +44,12 @@ $script:storageWarned = $false
 # Clips are delivered without sound by default; set StripAudio to false in worker.config.json
 # to keep whatever the video model generated.
 $stripAudio = -not ($config.PSObject.Properties.Name -contains 'StripAudio' -and $config.StripAudio -eq $false)
-$useH3ReferenceConditioning = $config.PSObject.Properties.Name -contains 'UseH3ReferenceConditioning' -and $config.UseH3ReferenceConditioning -eq $true
+$h3AppPath = if ($config.H3AppPath) { $config.H3AppPath } else { Join-Path $pinokioHome 'api\minimax-h3-pinokio.git\app' }
+$h3ReferenceModel = Join-Path $h3AppPath 'models\diffusion_models\minimax_h3_ref2va_pruned_int8_convrot.safetensors'
+# Auto-enable exact H3 identity conditioning when the local Ref2VA model exists.
+# An explicit false remains an emergency fallback to the ordinary image-to-video path.
+$useH3ReferenceConditioning = if ($config.PSObject.Properties.Name -contains 'UseH3ReferenceConditioning') { $config.UseH3ReferenceConditioning -eq $true } else { Test-Path -LiteralPath $h3ReferenceModel }
+$h3ReferenceImageSize = if ($config.H3ReferenceImageSize -in @('match','max')) { [string]$config.H3ReferenceImageSize } else { 'match' }
 $ffmpegExe = if ($config.FfmpegPath) { $config.FfmpegPath } else { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }
 $ffprobeExe = if ($config.FfprobePath) { $config.FfprobePath } elseif ($ffmpegExe) { Join-Path (Split-Path -Parent $ffmpegExe) 'ffprobe.exe' } else { (Get-Command ffprobe -ErrorAction SilentlyContinue).Source }
 if ($stripAudio -and -not $ffmpegExe) {
@@ -577,6 +582,7 @@ function Process-Job($payload) {
   Free-Models $config.ComfyUrl
   $jobRoot=Join-Path $runtimeRoot ("jobs\{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $jobRoot|Out-Null
   $allRefs=@($shot.references|Where-Object {$_.role -ne 'style'})
+  $sourceRef=@($allRefs|Where-Object {$_.kind -eq 'source'}|Select-Object -First 1)
   # Assets linked to this shot in the database are a deliberate choice. Prefer the ones the
   # prompt also names, but never drop a linked reference just because the prompt phrased it
   # differently ("the narrator" instead of "Michel") - that silently broke character
@@ -613,7 +619,12 @@ function Process-Job($payload) {
   $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage, not a reference card. Opening instant of this exact shot: {0}. Camera: {1}. Active identity constraints: {2}. Show only the subjects and objects required by the stated action, each exactly once; no doubles, twins, clones or duplicate vehicles/props. {3} {4} {5} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {6}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout, no white studio background." -f $shot.prompt,$shot.camera,$assetText,$inactiveRule,$teslaRule,$negativeRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
   $approvedKeyframe=Join-Path $runtimeRoot ("approved-keyframes\shot-{0}.png" -f [int]$shot.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
-  if(Test-Path -LiteralPath $approvedKeyframe){
+  if($sourceRef.Count -gt 0){
+    $uploadedScene=Join-Path $jobRoot 'uploaded-scene-reference'
+    Invoke-WebRequest -Uri ($config.ServerUrl+$sourceRef[0].downloadUrl) -Headers (Headers) -OutFile $uploadedScene
+    Write-Host 'Vom Benutzer festgelegtes Shot-Referenzfoto wird als Szenenführung verwendet.' -ForegroundColor Cyan
+    $sceneKeyframe=$uploadedScene
+  } elseif(Test-Path -LiteralPath $approvedKeyframe){
     Write-Host ("Geprueften Keyframe wiederverwenden: {0}" -f $approvedKeyframe) -ForegroundColor Cyan
     $sceneKeyframe=$approvedKeyframe
   } else {
@@ -627,23 +638,31 @@ function Process-Job($payload) {
     if(-not $sceneKeyframe){throw 'Kein verwendbarer Keyframe: alle Versuche enthielten einen weißen Referenz-/Studiohintergrund.'}
   }
   Copy-Item -LiteralPath $sceneKeyframe -Destination (Join-Path $jobRoot 'scene-keyframe.png') -Force
-  # H3's reference-to-video graph does not have a real first-frame input. It can reinterpret a
-  # character sheet as the opening composition, which caused contact sheets and duplicate people
-  # to leak into delivered clips. Keep it disabled unless deliberately enabled in worker config.
+  # Real identity pictures are semantic Ref2VA inputs. The generated scene keyframe remains a
+  # separate frame-0 guide in render_shot.py, so portraits/contact sheets cannot become the clip's
+  # visible first frame.
   $cleanRefs=@()
+  $referenceDirectives=@()
   if($useH3ReferenceConditioning){
-    foreach($item in $visualRefs){
+    $pictureNumber=0
+    foreach($item in @($visualRefs|Select-Object -First 9)){
+      $pictureNumber++
       $localRef=Join-Path $jobRoot ("identity-{0}" -f [int]$item.id)
       Invoke-WebRequest -Uri ($config.ServerUrl+$item.downloadUrl) -Headers (Headers) -OutFile $localRef
       $cleanRefs+=$localRef
+      $measurements=@()
+      if($null -ne $item.age_years -and [string]$item.age_years -ne ''){$measurements += "age $($item.age_years) years"}
+      if($null -ne $item.height_cm -and [string]$item.height_cm -ne ''){$measurements += "height $($item.height_cm) cm"}
+      $physical=if($measurements.Count){" Physical scale: $($measurements -join ', ')."}else{''}
+      $referenceDirectives += ("<Picture {0}> is the sole identity reference for {1}. Show {1} exactly once. Preserve the same face, age, hairstyle, clothing, colors, body proportions and distinguishing features; do not copy the reference background or pose.{2}" -f $pictureNumber,$item.name,$physical)
     }
   }
   Free-Models $config.ComfyUrl
   Stop-OwnedComfy
   Ensure-H3
   $promptFile=Join-Path $jobRoot 'prompt.txt'
-  $conditioning='The supplied first frame is the exact full-screen composition and opening moment.'
-  $identityNote=if($cleanRefs.Count -gt 0){' The additional reference images define the exact appearance of the named people, objects and environments - preserve those faces, clothing, vehicles, architecture and atmosphere.'}else{' The supplied opening frame is the sole visual identity source; preserve every depicted face, hairstyle, outfit, prop and environment exactly.'}
+  $conditioning='The supplied frame-0 guide defines only the exact full-screen composition and opening moment.'
+  $identityNote=if($cleanRefs.Count -gt 0){' '+($referenceDirectives -join ' ')+' Never display a reference sheet, portrait background, white studio backdrop, split screen or contact sheet.'}else{' The supplied opening frame is the sole visual identity source; preserve every depicted face, hairstyle, outfit, prop and environment exactly.'}
   $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change. Show exactly one instance of each named character unless the stated action explicitly requires more; never add, clone, replace or merge people. {4} {5} Project style: {6}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$negativeRule,$job.style_profile)
   Set-Content -LiteralPath $promptFile -Value $fullPrompt -Encoding utf8
   $outputDir=Join-Path $runtimeRoot ("outputs-v2\project-{0}\episode-{1}" -f $job.project_id,$job.episode_number);New-Item -ItemType Directory -Force -Path $outputDir|Out-Null
@@ -660,6 +679,7 @@ function Process-Job($payload) {
   $renderArgs=@($renderClient,'--base-url',$config.H3Url,'--image',(Join-Path $jobRoot 'scene-keyframe.png'),'--prompt-file',$promptFile,'--output-dir',$outputDir,'--name',$name,'--width',[string]$renderWidth,'--height',[string]$renderHeight,'--frames',[string]$frames,'--steps',[string]$videoSteps,'--seed',[string]([int]$shot.seed),'--low-vram')
   if($useH3ReferenceConditioning){
     foreach($refPath in $cleanRefs){ $renderArgs += @('--reference-image',$refPath) }
+    $renderArgs += @('--reference-image-size',$h3ReferenceImageSize)
     if($cleanRefs.Count -gt 0){ Write-Host ("H3-Referenzmodus aktiv: {0} Bild(er)" -f $cleanRefs.Count) -ForegroundColor DarkCyan }
   } elseif($visualRefs.Count -gt 0) {
     Write-Host 'H3 bleibt im stabilen Bildstart-Modus; Besetzungsbilder steuern den Keyframe, nicht den ersten Videoframe.' -ForegroundColor DarkCyan

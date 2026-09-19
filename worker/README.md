@@ -24,6 +24,9 @@ Standardpfaden (passend zu diesem Laptop) abzuweichen:
   "H3Ref": "pinokio://...",
   "ComfyRef": "pinokio://...",
   "H3Url": "http://127.0.0.1:8188",
+  "H3AppPath": "C:\\Pfad\\zu\\Pinokio\\api\\minimax-h3-pinokio.git\\app",
+  "UseH3ReferenceConditioning": true,
+  "H3ReferenceImageSize": "match",
   "ComfyUrl": "http://127.0.0.1:8190",
   "RenderClientPath": "C:\\Pfad\\zu\\render_shot.py",
   "ImageClientPath": "C:\\Pfad\\zu\\zimage.py",
@@ -38,6 +41,13 @@ Standardpfaden (passend zu diesem Laptop) abzuweichen:
 Clip hochgeladen wird — Dialog, Soundeffekte und Musik sollen als eigene Ebenen entstehen,
 nicht vom Bildmodell mitgeraten werden. Auf `false` setzen, um den Originalton zu behalten.
 `FfmpegPath` ist optional; ohne Angabe wird `ffmpeg` im PATH gesucht.
+
+`UseH3ReferenceConditioning` aktiviert MiniMax-H3-Ref2VA für verknüpfte Figuren,
+Gegenstände und Orte. Die echten Referenzbilder werden dabei ausschließlich als
+benannte `<Picture N>`-Identitätsquellen verwendet; der Szenen-Keyframe wird separat
+als Bildführung bei Frame 0 verankert. Dadurch erscheint ein freigestelltes Porträt
+nicht als sichtbares Startbild. `H3ReferenceImageSize` bleibt auf 8-GB-GPUs sinnvollerweise
+`match`; `max` kann die Identität verstärken, benötigt aber wesentlich mehr Speicher und Zeit.
 
 Es kann immer nur **ein** Worker gleichzeitig laufen — ein zweiter Start beendet sich
 selbst mit Hinweis, damit sich nicht zwei Instanzen um dieselben Aufträge und dieselbe
