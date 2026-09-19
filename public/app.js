@@ -207,6 +207,7 @@ function shotCard(s) {
     <div class="shot-card-media">
       ${badge}
       ${media}
+      ${s.reference_photo_path ? `<img class="shot-ref-photo" src="/${s.reference_photo_path}" loading="lazy" alt="Referenz">` : ''}
     </div>
     <div class="shot-card-content">
       <div class="shot-meta-top">
@@ -1599,6 +1600,13 @@ async function editShot(s) {
         <textarea name="prompt" style="min-height:90px;">${esc(s.prompt || '')}</textarea>
       </label>
       ${dialogueHtml}
+      <div class="ref-photo-section">
+        <div class="ref-photo-label">Referenzfoto <span style="font-weight:400;color:var(--text-dim);">— echtes Foto dieser Szene als visueller Anker</span></div>
+        ${s.reference_photo_path
+          ? `<div class="ref-photo-preview"><img src="/${s.reference_photo_path}" class="ref-photo-img" alt="Referenz"><button type="button" id="delete-ref-photo" class="ghost" style="margin-top:6px;font-size:12px;">Foto entfernen</button></div>`
+          : `<label class="ref-photo-upload-label" for="ref-photo-input"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><span>Foto hochladen (JPG / PNG / WebP, max. 10 MB)</span></label><input type="file" id="ref-photo-input" accept="image/jpeg,image/png,image/webp" style="display:none;">`
+        }
+      </div>
       <p id="modal-error" class="error"></p>
       <div style="display:flex;gap:10px;">
         <button type="submit" class="form-button" style="flex:1;">Änderungen speichern</button>
@@ -1647,6 +1655,33 @@ async function editShot(s) {
       } catch (err) {
         $('#modal-error').textContent = err.message;
       }
+    };
+  }
+
+  // Reference photo upload / delete
+  const refInput = document.getElementById('ref-photo-input');
+  if (refInput) {
+    refInput.onchange = async () => {
+      const file = refInput.files[0];
+      if (!file) return;
+      if (file.size > 10 * 1024 * 1024) { document.getElementById('modal-error').textContent = 'Datei ist größer als 10 MB.'; return; }
+      const reader = new FileReader();
+      reader.onload = async e => {
+        try {
+          const result = await api(`/api/shots/${s.id}/reference-photo`, { method: 'PUT', body: JSON.stringify({ data: e.target.result, name: file.name }) });
+          await editShot({...s, reference_photo_path: result.path});
+        } catch (err) { document.getElementById('modal-error').textContent = err.message; }
+      };
+      reader.readAsDataURL(file);
+    };
+  }
+  const delRefBtn = document.getElementById('delete-ref-photo');
+  if (delRefBtn) {
+    delRefBtn.onclick = async () => {
+      try {
+        await api(`/api/shots/${s.id}/reference-photo`, { method: 'DELETE' });
+        await editShot({...s, reference_photo_path: null});
+      } catch (err) { document.getElementById('modal-error').textContent = err.message; }
     };
   }
 }
