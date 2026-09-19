@@ -317,6 +317,34 @@ function Invoke-ZImage([string]$Prompt,[string]$Prefix,[int]$Seed,[int]$Steps=12
   if(-not $result){throw "ComfyUI meldete Erfolg, aber $leaf wurde nicht gefunden."}
   return $result.FullName
 }
+function Test-KeyframeHasWhiteStudioBackground([string]$Path) {
+  # A reference-card/studio frame is especially destructive in image-to-video:
+  # H3 faithfully animates its white paper background for the opening seconds.
+  # Reject only near-solid white borders; bright skies and normal daylight scenes
+  # still contain enough colour/contrast to pass.
+  try {
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+    $bitmap = [Drawing.Bitmap]::new($Path)
+    try {
+      $samples = 0; $nearWhite = 0
+      $stride = [Math]::Max(1,[int]($bitmap.Width / 80))
+      for ($x=0; $x -lt $bitmap.Width; $x += $stride) {
+        foreach ($y in @(0, [Math]::Max(0,$bitmap.Height-1))) {
+          $pixel=$bitmap.GetPixel($x,$y); $samples++
+          if($pixel.R -ge 242 -and $pixel.G -ge 242 -and $pixel.B -ge 242){$nearWhite++}
+        }
+      }
+      $strideY = [Math]::Max(1,[int]($bitmap.Height / 60))
+      for ($y=0; $y -lt $bitmap.Height; $y += $strideY) {
+        foreach ($x in @(0, [Math]::Max(0,$bitmap.Width-1))) {
+          $pixel=$bitmap.GetPixel($x,$y); $samples++
+          if($pixel.R -ge 242 -and $pixel.G -ge 242 -and $pixel.B -ge 242){$nearWhite++}
+        }
+      }
+      return $samples -gt 0 -and (($nearWhite / $samples) -ge 0.76)
+    } finally { $bitmap.Dispose() }
+  } catch { return $false }
+}
 function Invoke-BoundedPython([string[]]$Arguments,[int]$TimeoutSeconds,[string]$Operation) {
   $pythonExe=(Get-Command python -ErrorAction Stop).Source
   $task=Start-Job -ScriptBlock {
@@ -552,12 +580,16 @@ function Process-Job($payload) {
   # prompt also names, but never drop a linked reference just because the prompt phrased it
   # differently ("the narrator" instead of "Michel") - that silently broke character
   # consistency whenever the wording did not match the asset name exactly.
-  $keyframeRefs=@($allRefs|Sort-Object @{Expression={if($shot.prompt -match [regex]::Escape($_.name)){0}else{1}}},@{Expression={[int]$_.id}}|Select-Object -First 3)
-  # Every explicitly linked production asset participates in continuity. Characters and
-  # props stabilize identity; location anchors keep a recurring world from drifting.
-  # The generated shot-start frame already carries composition, so do not re-download it.
-  $visualRefs=@($keyframeRefs|Where-Object {$_.kind -ne 'source'}|Select-Object -First 3)
-  $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {"$($_.name): $($_.visual_notes)"}) -join ' | ' } else { 'None' }
+  # Episode assets often remain linked as continuity candidates even though they
+  # are absent from a particular shot.  Passing all of them to the keyframe prompt
+  # is what caused buses, excavators and extra Leos to be invented in unrelated
+  # scenes.  Only an asset explicitly named by title/prompt is an active subject.
+  $shotText = ("{0} {1}" -f $shot.title,$shot.prompt)
+  $visualRefs=@($allRefs|Where-Object { $_.kind -ne 'source' -and $_.name -and $shotText -match [regex]::Escape([string]$_.name) })
+  if($visualRefs.Count -eq 0 -and $allRefs.Count -eq 1){$visualRefs=@($allRefs|Where-Object {$_.kind -ne 'source'}|Select-Object -First 1)}
+  $inactiveNames=@($allRefs|Where-Object { $_.kind -ne 'source' -and $visualRefs.id -notcontains $_.id }|ForEach-Object {$_.name}|Where-Object {$_})
+  $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {"$($_.name): $($_.summary) $($_.visual_notes). Exactly one instance; preserve age, face, hairstyle, clothing and scale."}) -join ' | ' } else { 'No asset is active in this shot.' }
+  $inactiveRule=if($inactiveNames.Count -gt 0){"Do not show these inactive continuity assets in this shot: $($inactiveNames -join ', ')."}else{''}
   $teslaRequested=($shot.prompt -match '(?i)\btesla\b') -or (($visualRefs|Where-Object {$_.name -match '(?i)\btesla\b'}).Count -gt 0)
   $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'ABSOLUTE EXCLUSION: this is a car-free, vehicle-free frame. Show zero cars or other vehicles anywhere: no Tesla, no automobile, no sedan, no SUV, no parked traffic and no road traffic.'}
   $vehicleNegative=if($teslaRequested){''}else{'Tesla, car, automobile, sedan, SUV, vehicle, electric car, parked car, traffic, road traffic'}
@@ -568,14 +600,21 @@ function Process-Job($payload) {
   $effectiveNegative=@($vehicleNegative,$configuredNegative)|Where-Object {$_}|ForEach-Object {$_.Trim()}|Select-Object -Unique
   $negativePrompt=$effectiveNegative -join ', '
   $negativeRule=if($configuredNegative){"ABSOLUTE USER EXCLUSIONS: Do not show or introduce any of these: $configuredNegative."}else{''}
-  $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage. Opening instant of this exact shot: {0}. Camera: {1}. Continuity metadata only (do not visualize biography, occupations or props unless the shot action explicitly asks for them): {2}. Show only the subjects and objects required by the stated action. {3} {4} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {5}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout." -f $shot.prompt,$shot.camera,$assetText,$teslaRule,$negativeRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
+  $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage, not a reference card. Opening instant of this exact shot: {0}. Camera: {1}. Active identity constraints: {2}. Show only the subjects and objects required by the stated action, each exactly once; no doubles, twins, clones or duplicate vehicles/props. {3} {4} {5} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {6}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout, no white studio background." -f $shot.prompt,$shot.camera,$assetText,$inactiveRule,$teslaRule,$negativeRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
   $approvedKeyframe=Join-Path $runtimeRoot ("approved-keyframes\shot-{0}.png" -f [int]$shot.id)
   $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
   if(Test-Path -LiteralPath $approvedKeyframe){
     Write-Host ("Geprueften Keyframe wiederverwenden: {0}" -f $approvedKeyframe) -ForegroundColor Cyan
     $sceneKeyframe=$approvedKeyframe
   } else {
-    $sceneKeyframe=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}" -f [int]$job.id) ([int]$shot.seed) $photoSteps $negativePrompt
+    $sceneKeyframe=$null
+    for($attempt=0;$attempt -lt 3 -and -not $sceneKeyframe;$attempt++){
+      $attemptSeed=[int]$shot.seed + $attempt*104729
+      $candidate=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}-try-{1}" -f [int]$job.id,$attempt) $attemptSeed $photoSteps ($negativePrompt + ', duplicate character, cloned person, twin, duplicate vehicle, duplicate bus, duplicate excavator, duplicate robot, white studio background, product card')
+      if(Test-KeyframeHasWhiteStudioBackground $candidate){Write-Host ("Keyframe-Versuch {0} verworfen: weißer Studio-/Referenzhintergrund." -f ($attempt+1)) -ForegroundColor Yellow;continue}
+      $sceneKeyframe=$candidate
+    }
+    if(-not $sceneKeyframe){throw 'Kein verwendbarer Keyframe: alle Versuche enthielten einen weißen Referenz-/Studiohintergrund.'}
   }
   Copy-Item -LiteralPath $sceneKeyframe -Destination (Join-Path $jobRoot 'scene-keyframe.png') -Force
   # H3's reference-to-video graph does not have a real first-frame input. It can reinterpret a
