@@ -579,6 +579,17 @@ async function refreshAudioPreflight() {
     const stateColor = audio.readyForMaster ? 'var(--emerald)' : '#ffb703';
     const settings = audio.settings || {};
     const mode = settings.mode || 'narrator_and_characters';
+    const cueList = Array.isArray(audio.manifest?.cues) ? audio.manifest.cues : [];
+    const renderableCount = cueList.filter(item => item.state === 'pending' && (
+      ((item.kind === 'dialogue' || item.kind === 'narration') && String(item.text || '').trim()) ||
+      (!['dialogue', 'narration'].includes(item.kind) && String(item.prompt || '').trim())
+    )).length;
+    const fallbackNotice = audio.manifest?.auto_narration_fallback
+      ? '<p style="margin:10px 0 0;color:var(--text-muted);font-size:12px;line-height:1.45;">Für diese visuelle Story gab es keine Dialogzeilen. FrameCut hat deshalb einen editierbaren Erzähler-Entwurf aus den Shot-Titeln erstellt. Prüfe die Texte vor dem Rendern im Storyboard.</p>'
+      : '';
+    const emptyCueNotice = !cueList.length
+      ? `<div style="margin-top:12px;padding:11px;border:1px dashed var(--line);border-radius:8px;color:var(--text-muted);font-size:12px;line-height:1.5;">${mode === 'characters_only' ? 'Der Modus „Nur Figuren“ erzeugt bewusst keine Erzählerstimme. Ergänze Dialogzeilen in den betreffenden Shots oder wechsle zu einem Erzähler-Modus.' : 'Noch keine sprachfähigen Shot-Titel oder Dialogzeilen vorhanden. Ergänze zuerst Text im Storyboard.'}<br><button type="button" class="ghost" id="audio-open-shots" style="margin-top:8px;">Storyboard öffnen</button></div>`
+      : '';
     target.innerHTML = `
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
         <div>
@@ -631,9 +642,11 @@ async function refreshAudioPreflight() {
             return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg-elevated);"><div style="min-width:0;"><b style="font-size:12px;">${esc(kind)} · ${esc(state)}</b><span style="display:block;margin-top:3px;color:var(--text-muted);font-size:12px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(detail || 'Kein Inhalt')}</span><small style="color:var(--text-dim);font-family:var(--font-mono);">${(Number(c.start_ms || 0) / 1000).toFixed(1)}s · ${(Number(c.target_duration_ms || 0) / 1000).toFixed(1)}s · ${Number(c.gain_db || 0).toFixed(1)} dB</small></div><div style="display:flex;gap:6px;align-items:center;">${c.artifact?.path ? `<audio controls preload="none" src="/media/${encodeURIComponent(c.artifact.path)}" style="width:150px;height:30px;"></audio>` : ''}${['music','ambience','sfx'].includes(c.kind) ? `<button type="button" class="ghost" data-delete-audio-cue="${esc(c.id)}">Entfernen</button>` : ''}</div></div>`;
           }).join('') || '<p style="margin:0;color:var(--text-dim);font-size:12px;">Noch keine Audio-Spuren geplant.</p>'}
         </div>
+        ${fallbackNotice}
+        ${emptyCueNotice}
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">
-        <button type="button" class="form-button" id="audio-render-tracks" ${(audio.manifest?.cues || []).some(c => c.state === 'pending') ? '' : 'disabled'}>Alle offenen Spuren rendern</button>
+        <button type="button" class="form-button" id="audio-render-tracks" ${renderableCount ? '' : 'disabled'} title="${renderableCount ? `${renderableCount} offene Spur(en) einreihen` : 'Es gibt keine offenen Spuren mit Text oder Audio-Prompt'}">Alle offenen Spuren rendern${renderableCount ? ` (${renderableCount})` : ''}</button>
         <button type="button" class="ghost" id="audio-render" ${(!audio.cuesReady || audio.readyForMaster) ? 'disabled' : ''}>Audio-Master mischen</button>
         <span style="font-size:11px;color:var(--text-dim);align-self:center;">1. Spuren lokal erzeugen · 2. automatisch oder manuell mischen · 3. MP4-Master mit verständlicher Sprache herunterladen.</span>
       </div>
@@ -653,6 +666,7 @@ async function refreshAudioPreflight() {
         await refreshAudioPreflight();
       } catch (err) { notice(`Sprachregie konnte nicht gespeichert werden: ${err.message}`); }
     };
+    const openShots = $('#audio-open-shots'); if (openShots) openShots.onclick = () => openView('shots');
     const addCue = kind => showModal(`
       <h3>${kind === 'music' ? 'Musikspur ergänzen' : 'SFX oder Atmosphäre ergänzen'}</h3>
       <form>${kind === 'music' ? '' : '<label>Spurtyp<select name="cueKind"><option value="sfx">Soundeffekt</option><option value="ambience">Atmosphäre / Raumklang</option></select></label>'}<label>Audio-Prompt<textarea name="prompt" required placeholder="${kind === 'music' ? 'z. B. instrumentaler, warmer Neo-Noir-Score, keine Stimmen, subtil, für eine durchgehende Filmszene' : 'z. B. leises nächtliches Stadtambiente, vereinzelter Wind, entfernte Schritte, keine Musik, keine Sprache'}"></textarea></label>
