@@ -591,8 +591,11 @@ function Process-Job($payload) {
   $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {"$($_.name): $($_.summary) $($_.visual_notes). Exactly one instance; preserve age, face, hairstyle, clothing and scale."}) -join ' | ' } else { 'No asset is active in this shot.' }
   $inactiveRule=if($inactiveNames.Count -gt 0){"Do not show these inactive continuity assets in this shot: $($inactiveNames -join ', ')."}else{''}
   $teslaRequested=($shot.prompt -match '(?i)\btesla\b') -or (($visualRefs|Where-Object {$_.name -match '(?i)\btesla\b'}).Count -gt 0)
-  $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'ABSOLUTE EXCLUSION: this is a car-free, vehicle-free frame. Show zero cars or other vehicles anywhere: no Tesla, no automobile, no sedan, no SUV, no parked traffic and no road traffic.'}
-  $vehicleNegative=if($teslaRequested){''}else{'Tesla, car, automobile, sedan, SUV, vehicle, electric car, parked car, traffic, road traffic'}
+  # A named prop such as Polo (the excavator) may be a vehicle in the broad sense.
+  # Never let the Tesla safeguard contradict an explicitly active prop; it only bans
+  # unrequested passenger cars and road traffic.
+  $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'ABSOLUTE EXCLUSION: do not introduce a Tesla or any unrequested passenger car. No automobile, sedan, SUV, parked traffic or road traffic. Explicitly named active props remain allowed exactly once.'}
+  $vehicleNegative=if($teslaRequested){''}else{'Tesla, passenger car, automobile, sedan, SUV, electric car, parked car, traffic, road traffic'}
   # The server resolves project defaults and episode overrides before handing us a job.
   # Send it to Z-Image as an actual negative conditioning prompt, and phrase it as an
   # explicit exclusion for H3 (which only exposes a positive text field).
