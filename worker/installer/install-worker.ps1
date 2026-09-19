@@ -22,7 +22,10 @@ function Require-Admin {
 function Protect-Token([string]$Token) {
     Add-Type -AssemblyName System.Security
     $raw = [Text.Encoding]::UTF8.GetBytes($Token)
-    $cipher = [Security.Cryptography.ProtectedData]::Protect($raw,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
+    # The worker is deliberately scheduled as LocalSystem so it survives logoff.
+    # CurrentUser DPAPI would encrypt for the elevated installer account and fail at
+    # the first unattended start. LocalMachine keeps the secret bound to this PC.
+    $cipher = [Security.Cryptography.ProtectedData]::Protect($raw,$null,[Security.Cryptography.DataProtectionScope]::LocalMachine)
     [Convert]::ToBase64String($cipher)
 }
 function Gpu-Info {
@@ -61,7 +64,7 @@ if ($tailscale) {
 if (-not $JoinCode) { $JoinCode = Read-Host 'Einmaligen FrameCut-Registrierungscode eingeben' }
 if ([string]::IsNullOrWhiteSpace($JoinCode)) { throw 'Registrierungscode fehlt.' }
 $gpuJson = $gpu | ConvertTo-Json -Depth 3
-$body = [ordered]@{ joinCode=$JoinCode; name=$WorkerName; machine=$env:COMPUTERNAME; os='windows'; architecture=$env:PROCESSOR_ARCHITECTURE; gpu=$gpu; capabilities=@('comfyui','minimax-h3'); installerVersion='phase1' } | ConvertTo-Json -Depth 6
+$body = [ordered]@{ joinCode=$JoinCode; name=$WorkerName; machine=$env:COMPUTERNAME; os='windows'; architecture=$env:PROCESSOR_ARCHITECTURE; gpu=$gpu; capabilities=@('bootstrap'); installerVersion='phase1' } | ConvertTo-Json -Depth 6
 
 Step 'Worker registrieren'
 $registration = Invoke-RestMethod -Uri "$ServerUrl/api/worker/register" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 30
@@ -72,19 +75,24 @@ $versionRoot = Join-Path $root "versions\$($manifest.version)"
 New-Item -ItemType Directory -Path $versionRoot -Force | Out-Null
 $zip = Join-Path $env:TEMP "framecut-worker-$($manifest.version).zip"
 Step "Worker $($manifest.version) herunterladen und prüfen"
-Invoke-WebRequest -Uri $manifest.downloadUrl -OutFile $zip -UseBasicParsing -TimeoutSec 300
+$downloadHeaders = @{ 'x-framecut-worker'=$registration.workerToken; 'x-framecut-worker-id'=$registration.workerId }
+Invoke-WebRequest -Uri $manifest.downloadUrl -Headers $downloadHeaders -OutFile $zip -UseBasicParsing -TimeoutSec 300
 $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actual -ne $manifest.sha256.ToString().ToLowerInvariant()) { throw "SHA-256-Prüfung fehlgeschlagen: $actual" }
 Expand-Archive -LiteralPath $zip -DestinationPath $versionRoot -Force
 
-$config = [ordered]@{ serverUrl=$ServerUrl; workerId=$registration.workerId; workerName=$WorkerName; workerTokenProtected=(Protect-Token $registration.workerToken); version=$manifest.version; installedAt=(Get-Date).ToUniversalTime().ToString('o') }
+$config = [ordered]@{ serverUrl=$ServerUrl; workerId=$registration.workerId; workerName=$WorkerName; workerTokenProtected=(Protect-Token $registration.workerToken); version=$manifest.version; installedAt=(Get-Date).ToUniversalTime().ToString('o'); runtimeState='awaiting_runtime' }
 $config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $root 'worker.json') -Encoding UTF8
 $entrypoint = Join-Path $versionRoot $manifest.entrypoint
 if (Test-Path -LiteralPath $entrypoint) {
     Step 'Worker-Autostart einrichten'
-    $action = New-ScheduledTaskAction -Execute $entrypoint -WorkingDirectory (Split-Path $entrypoint)
+    # The published entrypoint is a .bat launcher, which avoids fragile quoting for
+    # PowerShell scripts and lets the task run independently of an interactive login.
+    $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$entrypoint`"" -WorkingDirectory (Split-Path $entrypoint)
     $trigger = New-ScheduledTaskTrigger -AtLogOn
-    Register-ScheduledTask -TaskName 'FrameCut Worker' -Action $action -Trigger $trigger -Description 'FrameCut GPU Worker' -Force | Out-Null
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName 'FrameCut Worker' -Action $action -Trigger $trigger -Principal $principal -Description 'FrameCut GPU Worker' -Force | Out-Null
+    Start-ScheduledTask -TaskName 'FrameCut Worker'
 }
 Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
 Write-Host "`nFrameCut Worker ($($registration.workerId)) wurde eingerichtet." -ForegroundColor Green

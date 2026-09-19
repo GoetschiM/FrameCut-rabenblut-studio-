@@ -18,6 +18,7 @@ const db = new DatabaseSync(join(DATA, 'studio.db'));
 const PORT = Number(process.env.RABENBLUT_STUDIO_PORT || 4317);
 const HOST = process.env.RABENBLUT_STUDIO_HOST || '127.0.0.1';
 const WORKER_TOKEN = process.env.FRAMECUT_WORKER_TOKEN || '';
+const WORKER_RELEASES = join(APP, 'worker', 'releases');
 const KEY_ENCRYPTION = process.env.FRAMECUT_KEY_ENCRYPTION_KEY || '';
 const OIDC_ISSUER = process.env.FRAMECUT_OIDC_ISSUER || 'https://auth.rebelone.ch/application/o/framecut/';
 const OIDC_CLIENT_ID = process.env.FRAMECUT_OIDC_CLIENT_ID || '';
@@ -62,6 +63,10 @@ db.exec(`CREATE TABLE IF NOT EXISTS episode_audio_settings (
 );`);
 db.exec(`CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, last_seen TEXT NOT NULL, first_seen TEXT NOT NULL);`);
+db.exec(`CREATE TABLE IF NOT EXISTS worker_join_codes (
+  code_hash TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL, used_at TEXT, used_by_worker_id TEXT
+);`);
 db.exec(`CREATE TABLE IF NOT EXISTS story_versions (id INTEGER PRIMARY KEY, episode_id INTEGER NOT NULL, markdown TEXT NOT NULL, saved_at TEXT NOT NULL);`);
 db.exec(`CREATE TABLE IF NOT EXISTS trash (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, label TEXT NOT NULL, payload TEXT NOT NULL, deleted_at TEXT NOT NULL, deleted_by INTEGER);`);
 db.exec(`CREATE TABLE IF NOT EXISTS prompt_overrides (purpose TEXT PRIMARY KEY, text TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by INTEGER);`);
@@ -93,6 +98,17 @@ try { db.exec("ALTER TABLE jobs ADD COLUMN worker_id TEXT"); } catch { /* column
 try { db.exec("ALTER TABLE jobs ADD COLUMN shot_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE jobs ADD COLUMN asset_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN name TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN owner_id INTEGER"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN machine TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN os TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN architecture TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN gpu_json TEXT NOT NULL DEFAULT '{}'"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '[]'"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN token_hash TEXT"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN registered_at TEXT"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE workers ADD COLUMN installer_version TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE projects ADD COLUMN style_profile TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
 // A project can define a default exclusion list; an episode may override it.  Keep the
 // episode column nullable so an empty episode setting means "inherit", rather than an
@@ -544,7 +560,30 @@ function user(req) {
 function json(res, status, data, headers = {}) { res.writeHead(status, { 'content-type':'application/json; charset=utf-8', ...headers }); res.end(JSON.stringify(data)); }
 async function body(req, limit=2_000_000) { let text = ''; for await (const chunk of req) { text += chunk; if(text.length>limit) throw new Error('Die Eingabe ist zu groß.'); } try { return JSON.parse(text || '{}'); } catch { throw new Error('Ungültige Daten.'); } }
 function guard(req, res) { const account = user(req); if (!account) { json(res, 401, { error:'Bitte zuerst anmelden.' }); return null; } return account; }
-function workerGuard(req, res) { if (!WORKER_TOKEN || req.headers['x-framecut-worker'] !== WORKER_TOKEN) { json(res, 401, { error:'Worker nicht autorisiert.' }); return false; } return true; }
+function workerTokenHash(token) { return createHash('sha256').update(String(token || ''), 'utf8').digest('hex'); }
+function safeWorkerTokenEqual(left, right) {
+  const a = Buffer.from(String(left || ''), 'utf8'), b = Buffer.from(String(right || ''), 'utf8');
+  return a.length === b.length && a.length > 0 && timingSafeEqual(a, b);
+}
+function workerGuard(req, res) {
+  const token = String(req.headers['x-framecut-worker'] || '');
+  const requestedId = String(req.headers['x-framecut-worker-id'] || 'laptop').slice(0, 80);
+  // The original laptop worker uses the global token. Keep it fully compatible while
+  // new installations receive individual, revocable worker tokens.
+  if (WORKER_TOKEN && safeWorkerTokenEqual(token, WORKER_TOKEN)) return { id: requestedId, legacy: true };
+  const worker = row('SELECT * FROM workers WHERE id=? AND token_hash=?', requestedId, workerTokenHash(token));
+  if (!worker) { json(res, 401, { error:'Worker nicht autorisiert.' }); return null; }
+  return { id: requestedId, worker, legacy: false };
+}
+function workerOrigin(req) {
+  const forwarded = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const protocol = forwarded === 'https' ? 'https' : 'http';
+  return `${protocol}://${req.headers.host}`;
+}
+function workerJoinCode() {
+  // Human-readable, one-time code. The database stores only its SHA-256 digest.
+  return `FC-${randomBytes(9).toString('base64url').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12)}`;
+}
 function hydrateRabenblut(project) {
   const episode=row('SELECT * FROM episodes WHERE project_id=? ORDER BY number LIMIT 1',project.id); const manifest=join(WORKSPACE,'assets','ravenblood-comic','episode-v4','production-manifest.json');
   if(!episode || !existsSync(manifest) || row('SELECT COUNT(*) count FROM assets WHERE project_id=?',project.id).count) return project;
@@ -757,6 +796,79 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (path === '/api/me' && req.method === 'GET') return json(res,200,{user:user(req)});
+    // A worker package is deliberately public: it contains no credentials and its
+    // checksum is delivered alongside it. Downloading the archive itself still
+    // requires the freshly issued worker token below.
+    if (path === '/api/worker/installer/manifest' && req.method === 'GET') {
+      const currentPath = join(WORKER_RELEASES, 'current.json');
+      if (!existsSync(currentPath)) return json(res, 503, { error:'Für den Installer ist noch kein Worker-Paket veröffentlicht.' });
+      let current;
+      try { current = JSON.parse(await readFile(currentPath, 'utf8')); } catch { return json(res, 503, { error:'Das Worker-Paketmanifest ist ungültig.' }); }
+      const file = basename(String(current.file || ''));
+      const packagePath = join(WORKER_RELEASES, file);
+      if (!current.version || !file || !current.entrypoint || !existsSync(packagePath)) {
+        return json(res, 503, { error:'Das veröffentlichte Worker-Paket ist unvollständig.' });
+      }
+      const sha256 = createHash('sha256').update(await readFile(packagePath)).digest('hex');
+      return json(res, 200, { version:String(current.version), downloadUrl:`${workerOrigin(req)}/api/worker/installer/download/${encodeURIComponent(file)}`, sha256, entrypoint:String(current.entrypoint) });
+    }
+    if (/^\/api\/worker\/installer\/download\/[A-Za-z0-9._-]+\.zip$/.test(path) && req.method === 'GET') {
+      if (!workerGuard(req, res)) return;
+      const file = basename(decodeURIComponent(path.split('/').pop()));
+      return serveFile(res, join(WORKER_RELEASES, file), true);
+    }
+    if (path === '/api/workers/join-codes' && req.method === 'POST') {
+      const account = guard(req, res); if (!account) return;
+      const d = await body(req);
+      const requested = Number(d.expiresMinutes || 30);
+      const expiresMinutes = Number.isFinite(requested) ? Math.max(5, Math.min(24 * 60, Math.round(requested))) : 30;
+      const code = workerJoinCode(), createdAt = now(), expiresAt = new Date(Date.now() + expiresMinutes * 60_000).toISOString();
+      run('INSERT INTO worker_join_codes(code_hash,owner_id,created_at,expires_at) VALUES (?,?,?,?)', workerTokenHash(code), account.id, createdAt, expiresAt);
+      event('Worker-Join-Code erstellt', `${account.username} · gültig für ${expiresMinutes} Minuten`);
+      // The plaintext is returned only here. It is never persisted or written to activity.
+      return json(res, 201, { code, expiresAt, expiresMinutes });
+    }
+    if (path === '/api/workers' && req.method === 'GET') {
+      const account = guard(req, res); if (!account) return;
+      const workers = rows(`SELECT id,name,machine,os,architecture,gpu_json,capabilities_json,status,first_seen,last_seen,registered_at,installer_version
+        FROM workers WHERE owner_id=? OR owner_id IS NULL ORDER BY last_seen DESC`, account.id)
+        .map(item => ({ ...item, gpu: (() => { try { return JSON.parse(item.gpu_json || '{}'); } catch { return {}; } })(), capabilities: (() => { try { return JSON.parse(item.capabilities_json || '[]'); } catch { return []; } })(), gpu_json:undefined, capabilities_json:undefined }));
+      return json(res, 200, { workers });
+    }
+    if (path === '/api/worker/register' && req.method === 'POST') {
+      const d = await body(req);
+      const joinCode = String(d.joinCode || '').trim().toUpperCase();
+      const name = String(d.name || '').trim().slice(0, 80);
+      if (!/^FC-[A-Z0-9]{8,20}$/.test(joinCode) || !name) return json(res, 400, { error:'Registrierungscode oder Worker-Name ist ungültig.' });
+      const codeHash = workerTokenHash(joinCode);
+      const workerId = `worker-${randomBytes(9).toString('hex')}`;
+      const workerToken = randomBytes(32).toString('base64url');
+      const gpu = d.gpu && typeof d.gpu === 'object' ? d.gpu : {};
+      const capabilities = Array.isArray(d.capabilities) ? d.capabilities.map(value => String(value).slice(0, 50)).filter(value => /^[a-z0-9_-]+$/i.test(value)).slice(0, 20) : ['bootstrap'];
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const invite = row('SELECT * FROM worker_join_codes WHERE code_hash=?', codeHash);
+        if (!invite || invite.used_at || new Date(invite.expires_at).getTime() <= Date.now()) throw new Error('REGISTRATION_CODE_INVALID');
+        const registeredAt = now();
+        run(`INSERT INTO workers(id,name,owner_id,machine,os,architecture,gpu_json,capabilities_json,token_hash,status,first_seen,last_seen,registered_at,installer_version)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, workerId, name, invite.owner_id, String(d.machine || '').slice(0, 120), String(d.os || '').slice(0, 40), String(d.architecture || '').slice(0, 40), JSON.stringify(gpu).slice(0, 4000), JSON.stringify(capabilities), workerTokenHash(workerToken), 'awaiting_runtime', registeredAt, registeredAt, registeredAt, String(d.installerVersion || '').slice(0, 60));
+        run('UPDATE worker_join_codes SET used_at=?,used_by_worker_id=? WHERE code_hash=?', registeredAt, workerId, codeHash);
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        if (error.message === 'REGISTRATION_CODE_INVALID') return json(res, 403, { error:'Der Registrierungscode ist ungültig, abgelaufen oder bereits verwendet.' });
+        throw error;
+      }
+      event('Worker registriert', `${name} · ${workerId}`);
+      return json(res, 201, { workerId, workerToken, status:'awaiting_runtime', message:'Worker registriert. Der Bootstrap meldet sich jetzt am Server; GPU-Rendering wird erst nach der lokalen Laufzeit-Prüfung aktiviert.' });
+    }
+    if (path === '/api/worker/heartbeat' && req.method === 'POST') {
+      const workerAuth = workerGuard(req, res); if (!workerAuth) return;
+      const d = await body(req);
+      const status = ['awaiting_runtime','ready','offline'].includes(String(d.status)) ? String(d.status) : 'awaiting_runtime';
+      run('UPDATE workers SET last_seen=?,status=? WHERE id=?', now(), status, workerAuth.id);
+      return json(res, 200, { ok:true, workerId:workerAuth.id, status });
+    }
     if (path === '/api/settings/providers' && req.method === 'GET') { const account=guard(req,res); if(!account)return; const userRows=rows('SELECT provider,model,updated_at FROM user_provider_keys WHERE user_id=?',account.id); const configured=new Map(userRows.map(r=>[r.provider,r])); return json(res,200,{providers:['gemini','openai','deepseek'].map(provider=>({provider,configured:configured.has(provider),model:configured.get(provider)?.model||'',updatedAt:configured.get(provider)?.updated_at||null}))}); }
     if (path === '/api/settings/prompts' && req.method === 'GET') { const account=guard(req,res); if(!account)return; const defaults={analysis:DEFAULT_ANALYSIS_GUIDANCE,shot_batch:DEFAULT_SHOT_BATCH_GUIDANCE,planner:DEFAULT_PLANNER_GUIDANCE,intro:DEFAULT_INTRO_GUIDANCE,outro:DEFAULT_OUTRO_GUIDANCE}; return json(res,200,{prompts:Object.entries(PROMPT_PURPOSES).map(([purpose,label])=>{const saved=row('SELECT text,updated_at FROM prompt_overrides WHERE purpose=?',purpose); return {purpose,label,default:defaults[purpose],current:saved?.text||defaults[purpose],isOverridden:Boolean(saved),updatedAt:saved?.updated_at||null};})}); }
     if (/^\/api\/settings\/prompts\/(analysis|shot_batch|planner|intro|outro)$/.test(path) && req.method === 'PUT') { const account=guard(req,res); if(!account)return; const purpose=path.split('/').pop(),d=await body(req),text=String(d.text||'').trim(); if(!text)return json(res,400,{error:'Der Prompt-Text darf nicht leer sein. Zum Zurücksetzen die Löschen-Funktion nutzen.'}); if(text.length>6000)return json(res,400,{error:'Prompt ist länger als 6000 Zeichen.'}); run('INSERT INTO prompt_overrides(purpose,text,updated_at,updated_by) VALUES (?,?,?,?) ON CONFLICT(purpose) DO UPDATE SET text=excluded.text,updated_at=excluded.updated_at,updated_by=excluded.updated_by',purpose,text,now(),account.id); event('KI-Prompt angepasst',`${account.username} · ${PROMPT_PURPOSES[purpose]}`); return json(res,200,{ok:true}); }
@@ -1661,9 +1773,17 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (path === '/api/worker/next' && req.method === 'GET') {
-      if (!workerGuard(req,res)) return;
-      const workerId=String(req.headers['x-framecut-worker-id']||'laptop').slice(0,80);
-      run('INSERT INTO workers(id,last_seen,first_seen) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen', workerId, now(), now());
+      const workerAuth = workerGuard(req,res); if (!workerAuth) return;
+      const workerId = workerAuth.id;
+      if (workerAuth.legacy) {
+        run(`INSERT INTO workers(id,name,status,last_seen,first_seen) VALUES (?,?,?,?,?)
+          ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,status='ready'`, workerId, 'Lokaler Laptop-Worker', 'ready', now(), now());
+      } else {
+        run('UPDATE workers SET last_seen=? WHERE id=?', now(), workerId);
+        // A fresh installation is intentionally visible but cannot claim production
+        // jobs until its local Pinokio/renderer setup has marked it ready.
+        if (workerAuth.worker.status !== 'ready') return json(res,204,{});
+      }
       db.exec('BEGIN IMMEDIATE');
       let job;
       try {
