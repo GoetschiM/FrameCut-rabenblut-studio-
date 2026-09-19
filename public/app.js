@@ -633,7 +633,7 @@ async function refreshAudioPreflight() {
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">
-        <button type="button" class="form-button" id="audio-render-tracks" ${cue.pending ? 'disabled' : ''}>Alle offenen Spuren rendern</button>
+        <button type="button" class="form-button" id="audio-render-tracks" ${(audio.manifest?.cues || []).some(c => c.state === 'pending') ? '' : 'disabled'}>Alle offenen Spuren rendern</button>
         <button type="button" class="ghost" id="audio-render" ${(!audio.cuesReady || audio.readyForMaster) ? 'disabled' : ''}>Audio-Master mischen</button>
         <span style="font-size:11px;color:var(--text-dim);align-self:center;">1. Spuren lokal erzeugen · 2. automatisch oder manuell mischen · 3. MP4-Master mit verständlicher Sprache herunterladen.</span>
       </div>
