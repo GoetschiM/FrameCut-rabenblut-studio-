@@ -21,9 +21,131 @@
   function renderSettings() {
     const view = $('#view-settings'); if (!view) return;
     const project = data?.selected?.project;
-    const renderPanel = project ? `<div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">${esc(project.title)}</p><h3>Render-Einstellungen</h3><small>Steps und Auflösung gelten für dieses Projekt. Höhere Werte dauern länger, mehr Steps können die Bildqualität verbessern — am besten erst an einer einzelnen Szene ausprobieren.</small></div></div><div class="panel"><form id="render-settings-form"><label>Negativ-Prompt für dieses Projekt<textarea name="negativePrompt" maxlength="2400" placeholder="z. B. keine Schrift, keine Logos, keine Fahrzeuge, keine zusätzlichen Personen">${esc(project.negative_prompt || '')}</textarea><small>Was in keinem Render erscheinen soll. Gilt für Keyframes und MiniMax-Videos; kann pro Episode überschrieben werden.</small></label><div class="shot-modal-grid"><label>Foto-Steps (Referenzen & Keyframes)<input name="photoSteps" type="number" min="1" max="40" value="${project.photo_steps ?? 8}"></label><label>Video-Steps (MiniMax H3)<input name="videoSteps" type="number" min="1" max="40" value="${project.video_steps ?? 4}"></label></div><div class="shot-modal-grid"><label>Vorschau-Breite<input name="previewWidth" type="number" min="160" max="2048" step="32" value="${project.preview_width ?? 384}"></label><label>Vorschau-Höhe<input name="previewHeight" type="number" min="160" max="2048" step="32" value="${project.preview_height ?? 224}"></label></div><div class="shot-modal-grid"><label>Fertig-Breite<input name="finalWidth" type="number" min="160" max="2048" step="32" value="${project.final_width ?? 768}"></label><label>Fertig-Höhe<input name="finalHeight" type="number" min="160" max="2048" step="32" value="${project.final_height ?? 448}"></label></div><p class="upload-note">Breite/Höhe werden automatisch auf Vielfache von 32 gerundet (Anforderung des Video-Modells).</p><p id="render-settings-notice" class="upload-note"></p><button class="form-button" type="submit">Render-Einstellungen speichern</button></form></div>` : '';
-    const projectPanel = project ? `<div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">${esc(project.title)}</p><h3>Projekt-Verwaltung</h3><small>Archivierte Projekte verschwinden aus der Seitenleiste, bleiben aber vollständig erhalten und lassen sich jederzeit wiederherstellen.</small></div><div style="display:flex;gap:10px;flex-wrap:wrap;"><button class="form-button" id="archive-project" style="background:rgba(255,255,255,0.08);">Dieses Projekt archivieren</button><button class="form-button" id="delete-project" style="background:rgba(255,82,82,0.12);color:#ff5252;">Dieses Projekt löschen</button></div></div><div class="panel" id="archived-projects-panel"><p class="upload-note">Lade …</p></div>` : '';
-    view.innerHTML = `<div id="settings-cost-row" class="settings-cost-row"><span style="color:var(--text-dim);font-size:11px;font-family:var(--font-mono)">Lade Kosten…</span></div><div class="section-lead"><div><p class="eyebrow">DEIN ARBEITSPLATZ</p><h3>KI & API-Schlüssel</h3><small>Jeder Benutzer verwaltet seine eigenen Schlüssel. Sie werden verschlüsselt gespeichert und niemals wieder im Klartext angezeigt.</small></div><button class="form-button" id="manage-ai">KI-Anbieter einrichten</button></div><div class="panel"><div class="service"><span><b>Auto-Modus</b><br><small>Aus deiner Story entsteht ein editierbarer Plan mit Figuren, Orten und Video-Shots. Für den ersten Test reicht Gemini Flash oder DeepSeek.</small></span><span class="pill">PLANEN, NICHT RENDERN</span></div><div class="service"><span><b>Datenschutz</b><br><small>Nur deine Story und die gewählte Stilvorgabe gehen an den von dir eingerichteten KI-Anbieter.</small></span><span class="pill">PRO BENUTZER</span></div></div><div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">DEIN VERBRAUCH</p><h3>KI-Token & geschätzte Kosten</h3><small>Nur für deinen Account, basierend auf den tatsächlich von den Anbietern gemeldeten Token-Zahlen. Die Kosten sind grob geschätzt, keine offizielle Abrechnung.</small></div></div><div class="panel" id="usage-panel"><p class="upload-note">Lade …</p></div><div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">FORTGESCHRITTEN</p><h3>KI-Prompts</h3><small>Die Anweisungen, die bei jeder Story-Analyse und Shot-Generierung an die KI gehen. Änderungen wirken für alle deine Projekte, sofort beim nächsten Auto-Modus-Lauf.</small></div></div><div class="panel" id="prompts-panel"><p class="upload-note">Lade …</p></div>${renderPanel}${projectPanel}<div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">GELÖSCHTE ELEMENTE</p><h3>Papierkorb</h3><small>Gelöschte Shots, Figuren/Orte und Folgen bleiben 14 Tage wiederherstellbar.</small></div></div><div class="panel" id="trash-panel"><p class="upload-note">Lade …</p></div>`;
+    const renderSection = project ? `
+      <div class="settings-section" id="settings-sec-render">
+        <div class="settings-card">
+          <div class="settings-card-hd">
+            <p class="eyebrow">${esc(project.title)}</p>
+            <h3>Render-Einstellungen</h3>
+            <p class="settings-card-desc">Steps und Auflösung gelten für dieses Projekt. Höhere Werte dauern länger.</p>
+          </div>
+          <form id="render-settings-form">
+            <label>Negativ-Prompt für dieses Projekt
+              <textarea name="negativePrompt" maxlength="2400" placeholder="z. B. keine Schrift, keine Logos">${esc(project.negative_prompt || '')}</textarea>
+              <small>Was in keinem Render erscheinen soll.</small>
+            </label>
+            <div class="shot-modal-grid">
+              <label>Foto-Steps<input name="photoSteps" type="number" min="1" max="40" value="${project.photo_steps ?? 8}"></label>
+              <label>Video-Steps<input name="videoSteps" type="number" min="1" max="40" value="${project.video_steps ?? 4}"></label>
+            </div>
+            <div class="shot-modal-grid">
+              <label>Vorschau-Breite<input name="previewWidth" type="number" min="160" max="2048" step="32" value="${project.preview_width ?? 384}"></label>
+              <label>Vorschau-Höhe<input name="previewHeight" type="number" min="160" max="2048" step="32" value="${project.preview_height ?? 224}"></label>
+            </div>
+            <div class="shot-modal-grid">
+              <label>Fertig-Breite<input name="finalWidth" type="number" min="160" max="2048" step="32" value="${project.final_width ?? 768}"></label>
+              <label>Fertig-Höhe<input name="finalHeight" type="number" min="160" max="2048" step="32" value="${project.final_height ?? 448}"></label>
+            </div>
+            <p class="upload-note">Breite/Höhe werden auf Vielfache von 32 gerundet.</p>
+            <p id="render-settings-notice" class="upload-note"></p>
+            <button class="form-button" type="submit">Render-Einstellungen speichern</button>
+          </form>
+        </div>
+      </div>` : '';
+    const projectSection = project ? `
+      <div class="settings-section" id="settings-sec-project">
+        <div class="settings-card">
+          <div class="settings-card-hd">
+            <p class="eyebrow">${esc(project.title)}</p>
+            <h3>Projekt-Verwaltung</h3>
+            <p class="settings-card-desc">Archivierte Projekte verschwinden aus der Seitenleiste, bleiben aber vollständig erhalten.</p>
+          </div>
+          <div class="settings-btn-row">
+            <button class="form-button" id="archive-project" style="background:rgba(255,255,255,0.08);">Projekt archivieren</button>
+            <button class="form-button" id="delete-project" style="background:rgba(255,82,82,0.12);color:#ff5252;">Projekt löschen</button>
+          </div>
+        </div>
+        <div class="settings-card" id="archived-projects-panel"><p class="upload-note">Lade …</p></div>
+      </div>` : '';
+    const extraNavBtns = project ? `
+      <button class="settings-navbtn" data-sec="render">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>Render
+      </button>
+      <button class="settings-navbtn" data-sec="project">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h18M3 12h18M3 17h18"/></svg>Projekt
+      </button>` : '';
+    view.innerHTML = `
+      <div class="settings-layout">
+        <nav class="settings-sidenav">
+          <button class="settings-navbtn active" data-sec="usage">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Verbrauch
+          </button>
+          <button class="settings-navbtn" data-sec="ai">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>KI & API
+          </button>
+          <button class="settings-navbtn" data-sec="prompts">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>Prompts
+          </button>
+          ${extraNavBtns}
+          <button class="settings-navbtn" data-sec="trash">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6M10 11v6M14 11v6M9 6V4h6v2"/></svg>Papierkorb
+          </button>
+        </nav>
+        <div class="settings-main">
+          <div class="settings-section active" id="settings-sec-usage">
+            <div id="settings-cost-row" class="settings-stat-grid">
+              <span style="color:var(--text-dim);font-size:12px;">Lade Verbrauch…</span>
+            </div>
+            <div class="settings-card" id="usage-panel"><p class="upload-note">Lade …</p></div>
+          </div>
+          <div class="settings-section" id="settings-sec-ai">
+            <div class="settings-card">
+              <div class="settings-card-hd">
+                <p class="eyebrow">DEIN ARBEITSPLATZ</p>
+                <h3>KI & API-Schlüssel</h3>
+                <p class="settings-card-desc">Jeder Benutzer verwaltet seine eigenen Schlüssel. Sie werden verschlüsselt gespeichert.</p>
+              </div>
+              <button class="form-button" id="manage-ai" style="margin-bottom:16px;">KI-Anbieter einrichten</button>
+              <div class="settings-info-rows">
+                <div class="settings-info-row"><span class="settings-info-lbl">Auto-Modus</span><span class="settings-info-val">Aus deiner Story entsteht ein editierbarer Plan mit Figuren, Orten und Shots.</span><span class="pill">PLANEN</span></div>
+                <div class="settings-info-row"><span class="settings-info-lbl">Datenschutz</span><span class="settings-info-val">Nur Story und Stilvorgabe gehen an den eingerichteten KI-Anbieter.</span><span class="pill">PRO BENUTZER</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="settings-section" id="settings-sec-prompts">
+            <div class="settings-card" style="margin-bottom:12px;">
+              <div class="settings-card-hd">
+                <p class="eyebrow">FORTGESCHRITTEN</p>
+                <h3>KI-Prompts</h3>
+                <p class="settings-card-desc">Die Anweisungen bei jeder Story-Analyse und Shot-Generierung. Änderungen wirken sofort.</p>
+              </div>
+            </div>
+            <div class="settings-card" id="prompts-panel"><p class="upload-note">Lade …</p></div>
+          </div>
+          ${renderSection}
+          ${projectSection}
+          <div class="settings-section" id="settings-sec-trash">
+            <div class="settings-card" style="margin-bottom:12px;">
+              <div class="settings-card-hd">
+                <p class="eyebrow">GELÖSCHTE ELEMENTE</p>
+                <h3>Papierkorb</h3>
+                <p class="settings-card-desc">Gelöschte Shots, Figuren/Orte und Folgen bleiben 14 Tage wiederherstellbar.</p>
+              </div>
+            </div>
+            <div class="settings-card" id="trash-panel"><p class="upload-note">Lade …</p></div>
+          </div>
+        </div>
+      </div>
+    `;
+    view.querySelectorAll('.settings-navbtn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        view.querySelectorAll('.settings-navbtn').forEach(b => b.classList.remove('active'));
+        view.querySelectorAll('.settings-section').forEach(s => s.classList.remove('active'));
+        btn.classList.add('active');
+        const sec = view.querySelector('#settings-sec-' + btn.dataset.sec);
+        if (sec) sec.classList.add('active');
+      });
+    });
     $('#manage-ai').onclick = aiSettings;
     renderUsage();
     renderPrompts();
@@ -43,7 +165,7 @@
     });
     const archiveBtn = $('#archive-project');
     if (archiveBtn) archiveBtn.onclick = async () => {
-      if (!confirm(`"${project.title}" archivieren? Es verschwindet aus der Seitenleiste, bleibt aber erhalten und ist unter "Archivierte Projekte" wiederherstellbar.`)) return;
+      if (!confirm(`"${project.title}" archivieren? Es verschwindet aus der Seitenleiste, bleibt aber erhalten.`)) return;
       try {
         await api(`/api/projects/${project.id}/archive`, { method: 'POST' });
         currentProject = null; currentEpisode = null;
@@ -53,7 +175,7 @@
     };
     const deleteBtn = $('#delete-project');
     if (deleteBtn) deleteBtn.onclick = async () => {
-      const typed = prompt(`"${project.title}" wirklich löschen? Alle Episoden, Shots, Figuren/Orte und Renders werden mit verschoben. Kann 14 Tage lang im Papierkorb wiederhergestellt werden.\n\nGib zum Bestätigen den Projektnamen ein:`);
+      const typed = prompt(`"${project.title}" wirklich löschen? Kann 14 Tage lang im Papierkorb wiederhergestellt werden.\n\nGib zum Bestätigen den Projektnamen ein:`);
       if (typed !== project.title) { if (typed !== null) notice('Löschen abgebrochen: Name stimmte nicht überein.'); return; }
       try {
         await api(`/api/projects/${project.id}`, { method: 'DELETE' });
@@ -81,15 +203,15 @@
         const fmt = entries => entries.reduce((s, e) => s + e.estimatedCostUsd, 0).toFixed(3);
         const tok = entries => entries.reduce((s, e) => s + e.totalTokens, 0).toLocaleString('de-CH');
         const periods = [{label:'7 Tage',entries:usage.week},{label:'30 Tage',entries:usage.month},{label:'Gesamt',entries:usage.allTime}];
-        badge.innerHTML = periods.map((d, i) => {
-          const sep = i > 0 ? '<div class="settings-cost-divider"></div>' : '';
-          return sep + '<div class="settings-cost-item"><div class="cost-label">' + esc(d.label) + '</div><div class="cost-val">
+        badge.innerHTML = periods.map(d => {
+          return '<div class="settings-stat"><div class="settings-stat-label">' + esc(d.label) + '</div><div class="settings-stat-val">$' + fmt(d.entries) + '</div><div class="settings-stat-sub">' + tok(d.entries) + ' Token</div></div>';
         }).join('');
       }
     } catch (err) {
       panel.innerHTML = `<p class="upload-note">Verbrauch konnte nicht geladen werden: ${esc(err.message)}</p>`;
     }
   }
+
 
   async function renderPrompts() {
     const panel = $('#prompts-panel'); if (!panel) return;

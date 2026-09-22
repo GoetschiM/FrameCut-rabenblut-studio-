@@ -1474,3 +1474,220 @@ body {
     padding-bottom: calc(72px + env(safe-area-inset-bottom));
   }
 }
+
+/* ======================== SETTINGS PAGE LAYOUT ======================== */
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  min-height: 100%;
+  align-items: start;
+  gap: 0;
+}
+
+.settings-sidenav {
+  position: sticky;
+  top: 0;
+  padding: 8px 0;
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-self: start;
+}
+
+.settings-navbtn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 16px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-family: var(--font);
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 0;
+  transition: color 0.15s, background 0.15s;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.settings-navbtn:hover {
+  color: var(--text);
+  background: rgba(255,255,255,0.04);
+}
+
+.settings-navbtn.active {
+  color: var(--emerald);
+  background: var(--emerald-dim);
+  border-right: 2px solid var(--emerald);
+}
+
+.settings-navbtn svg {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.settings-navbtn.active svg { opacity: 1; }
+
+.settings-main {
+  padding: 24px 28px;
+  min-width: 0;
+}
+
+.settings-section {
+  display: none;
+}
+.settings-section.active {
+  display: block;
+}
+
+/* Settings card — replaces .section-lead + .panel */
+.settings-card {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 22px 24px;
+  margin-bottom: 14px;
+}
+
+.settings-card-hd {
+  margin-bottom: 18px;
+}
+.settings-card-hd h3 {
+  margin: 4px 0 8px;
+  font-size: 17px;
+  font-weight: 600;
+}
+.settings-card-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0;
+  line-height: 1.55;
+}
+
+/* Usage stat grid */
+.settings-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.settings-stat {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.settings-stat-label {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.settings-stat-val {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--emerald);
+  font-family: var(--font-mono);
+  line-height: 1;
+}
+
+.settings-stat-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* Info rows in AI section */
+.settings-info-rows {
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+
+.settings-info-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.settings-info-lbl {
+  font-weight: 600;
+  font-size: 13px;
+  min-width: 90px;
+  flex-shrink: 0;
+}
+
+.settings-info-val {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+/* Danger buttons row */
+.settings-btn-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Mobile: stack nav on top */
+@media (max-width: 860px) {
+  .settings-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-sidenav {
+    position: sticky;
+    top: 0;
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 6px 12px;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-main);
+    z-index: 10;
+    gap: 4px;
+    scrollbar-width: none;
+  }
+
+  .settings-sidenav::-webkit-scrollbar { display: none; }
+
+  .settings-navbtn {
+    padding: 7px 13px;
+    font-size: 12px;
+    flex-shrink: 0;
+    border-radius: 6px;
+    width: auto;
+  }
+
+  .settings-navbtn.active {
+    border-right: none;
+  }
+
+  .settings-main {
+    padding: 16px;
+  }
+
+  .settings-stat-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+
+  .settings-stat-val {
+    font-size: 20px;
+  }
+}
