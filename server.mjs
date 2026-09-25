@@ -848,14 +848,14 @@ Rules: comma-separated keywords, maximum 40 words, only visible appearance (age,
     let translated = 0;
     for (const shot of shots) {
       if (translated >= limit) break;
-      const source = createHash('sha256').update(JSON.stringify(['action-v1', shot.title, shot.prompt, shot.camera || '', Number(shot.dialogue_count) > 0])).digest('hex');
+      const source = createHash('sha256').update(JSON.stringify(['action-v2', shot.title, shot.prompt, shot.camera || '', Number(shot.dialogue_count) > 0])).digest('hex');
       if (shot.prompt_en_source === source) continue;
       const silent = Number(shot.dialogue_count) === 0;
       const instruction = `Rewrite this storyboard shot for a video generator as concise English (maximum 60 words).
 Title: ${shot.title}
 Action (may be German): ${String(shot.prompt).slice(0, 1500)}
 Camera (may be German): ${String(shot.camera || '').slice(0, 200)}
-Rules: describe only what is visible: who does what, where, movement, light, camera. Keep character names exactly. No inner thoughts, no story background, no quoted speech.${silent ? ' This shot has NO dialogue: never mention speaking, saying, explaining, calling, shouting or any sound from a mouth; express communication only through gestures, looks and posture, and state that everyone keeps their mouth closed.' : ' This shot has spoken dialogue that is supplied separately; do not quote or paraphrase what is said.'}
+Rules: describe only what is visible: who does what, where, movement, light, camera. Keep character names exactly. No inner thoughts, no story background, no quoted speech.${silent ? ' This shot has NO dialogue: never mention speaking, saying, explaining, calling, shouting, breathing, exhaling, sighing, gasping, laughing, yawning, smiling with teeth or any other mouth movement or sound; express communication only through gestures, looks and posture, and state that everyone keeps their mouth closed.' : ' This shot has spoken dialogue that is supplied separately; do not quote or paraphrase what is said.'}
 Return JSON: {"action":"...","camera":"..."}`;
       for (const { provider } of available) {
         try {
