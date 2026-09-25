@@ -117,6 +117,9 @@ try { db.exec("ALTER TABLE jobs ADD COLUMN asset_id INTEGER"); } catch { /* colu
 try { db.exec("ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE shots ADD COLUMN audio_direction_json TEXT NOT NULL DEFAULT '{}'"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE shots ADD COLUMN render_completed_at TEXT"); } catch { /* column already exists */ }
+// Concise English action text for the video model (German prose is read aloud by H3).
+try { db.exec("ALTER TABLE shots ADD COLUMN prompt_en TEXT"); } catch { /* column already exists */ }
+try { db.exec("ALTER TABLE shots ADD COLUMN prompt_en_source TEXT"); } catch { /* column already exists */ }
 db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_shot ON jobs(shot_id, state)");
 try { db.exec("ALTER TABLE workers ADD COLUMN name TEXT NOT NULL DEFAULT ''"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE workers ADD COLUMN owner_id INTEGER"); } catch { /* column already exists */ }
@@ -836,6 +839,37 @@ Rules: comma-separated keywords, maximum 40 words, only visible appearance (age,
         } catch (error) { console.error('visual tags', asset.id, provider, error.message); }
       }
     }
+    // Shots: concise English visual action; silent shots get body language instead of talking.
+    const shots = rows(`SELECT DISTINCT s.id, s.title, s.prompt, s.camera, s.prompt_en_source,
+        (SELECT count(*) FROM shot_dialogue d WHERE d.shot_id=s.id) dialogue_count
+      FROM jobs j JOIN shots s ON s.id=j.shot_id
+      WHERE j.kind='minimax_h3' AND j.state IN ('wartet','läuft') AND s.prompt<>''
+      ORDER BY CASE WHEN j.detail LIKE 'Vorrang:%' THEN 0 ELSE 1 END, j.id`);
+    let translated = 0;
+    for (const shot of shots) {
+      if (translated >= limit) break;
+      const source = createHash('sha256').update(JSON.stringify(['action-v1', shot.title, shot.prompt, shot.camera || '', Number(shot.dialogue_count) > 0])).digest('hex');
+      if (shot.prompt_en_source === source) continue;
+      const silent = Number(shot.dialogue_count) === 0;
+      const instruction = `Rewrite this storyboard shot for a video generator as concise English (maximum 60 words).
+Title: ${shot.title}
+Action (may be German): ${String(shot.prompt).slice(0, 1500)}
+Camera (may be German): ${String(shot.camera || '').slice(0, 200)}
+Rules: describe only what is visible: who does what, where, movement, light, camera. Keep character names exactly. No inner thoughts, no story background, no quoted speech.${silent ? ' This shot has NO dialogue: never mention speaking, saying, explaining, calling, shouting or any sound from a mouth; express communication only through gestures, looks and posture, and state that everyone keeps their mouth closed.' : ' This shot has spoken dialogue that is supplied separately; do not quote or paraphrase what is said.'}
+Return JSON: {"action":"...","camera":"..."}`;
+      for (const { provider } of available) {
+        try {
+          const stored = providerKey(account.user_id, provider); if (!stored) continue;
+          const result = await callProviderJson(provider, stored.key, stored.model || '', instruction, { userId: account.user_id, purpose: 'shot_action' });
+          const action = String(result?.action || '').replace(/\s+/g, ' ').trim().slice(0, 700);
+          if (action.length < 12) continue;
+          const camera = String(result?.camera || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+          run('UPDATE shots SET prompt_en=?, prompt_en_source=? WHERE id=?', camera ? `${action} Camera: ${camera}` : action, source, shot.id);
+          translated++; break;
+        } catch (error) { console.error('shot action', shot.id, provider, error.message); }
+      }
+    }
+    updated += translated;
   } finally { visualTagRefreshRunning = false; }
   return updated;
 }

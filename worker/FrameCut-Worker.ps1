@@ -506,8 +506,7 @@ function Get-SharedSceneGuidePrompt($Contract,$Shot) {
   $subjectText=if($subjects.Count){$subjects -join '; '}else{'only the setting and props named in the scene action'}
   $guide=@"
 A single cinematic film frame taken inside one real, lived-in location, with depth from foreground to far background.
-Scene action: $(Clean-GuideText ([string]$Shot.prompt))
-Camera: $([string]$Shot.camera)
+Scene action: $(if([string]$Shot.prompt_en){[string]$Shot.prompt_en}else{(Clean-GuideText ([string]$Shot.prompt))+' Camera: '+[string]$Shot.camera})
 Location: $locationText. The environment is fully rendered in every corner of the frame: floor, walls, ceiling or sky, furniture, props, atmosphere and lighting continue edge to edge behind and around everyone.
 Acting in this frame, each appearing exactly once and interacting inside the location: $subjectText
 Visual style: $style, applied equally to the characters and the richly detailed surrounding environment.
