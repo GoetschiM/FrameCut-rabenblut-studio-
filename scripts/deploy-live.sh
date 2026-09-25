@@ -60,7 +60,7 @@ restore() {
 /usr/local/bin/node --check server.mjs || restore
 systemctl restart framecut.service
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-  code="\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4317/api/queue || true)"
+  code="\$(/usr/local/bin/node -e "fetch('http://127.0.0.1:4317/api/queue').then(r=>process.stdout.write(String(r.status))).catch(()=>process.stdout.write('0'))" || true)"
   [ "\$code" = 401 ] && break
   sleep 2
 done
