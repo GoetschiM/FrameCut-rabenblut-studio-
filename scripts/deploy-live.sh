@@ -40,7 +40,7 @@ echo "== Commit $COMMIT ($STAMP)"
 if [ "$deploy_server" = 1 ]; then
   mapfile -t SERVER_FILES < <(git ls-files server.mjs lib public)
   BUNDLE="$(mktemp -d)/framecut-$COMMIT.tgz"
-  tar -czf "$BUNDLE" "${SERVER_FILES[@]}"
+  tar --owner=0 --group=0 -czf "$BUNDLE" "${SERVER_FILES[@]}"
   scp -q "$BUNDLE" "$PVE_HOST:/tmp/framecut-$COMMIT.tgz"
   ssh "$PVE_HOST" "pct push $CT_ID /tmp/framecut-$COMMIT.tgz /tmp/framecut-$COMMIT.tgz"
   ssh "$PVE_HOST" "pct exec $CT_ID -- bash -s" <<REMOTE
@@ -49,11 +49,11 @@ cd "$APP_DIR"
 mkdir -p backups
 BACKUP="backups/deploy-$STAMP.tgz"
 tar -czf "\$BACKUP" $(printf '%q ' "${SERVER_FILES[@]}") 2>/dev/null || tar -czf "\$BACKUP" server.mjs lib public
-tar -xzf "/tmp/framecut-$COMMIT.tgz" -C "$APP_DIR"
+tar --no-same-owner -xzf "/tmp/framecut-$COMMIT.tgz" -C "$APP_DIR"
 chown -R framecut:framecut public
 restore() {
   echo "Health-Check fehlgeschlagen - stelle \$BACKUP wieder her" >&2
-  tar -xzf "\$BACKUP" -C "$APP_DIR"
+  tar --no-same-owner -xzf "\$BACKUP" -C "$APP_DIR"
   systemctl restart framecut.service
   exit 1
 }
