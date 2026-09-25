@@ -785,7 +785,10 @@ function Process-AudioMixJob($payload) {
     # Every source becomes an independent, closed GOP H.264 clip with the exact
     # master geometry and authored duration. This prevents 192x160 preview/reference
     # SPS data from corrupting the following 768x448 clips during concat.
-    $videoFilter="scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:color=black,fps=${targetFps},tpad=stop_mode=clone:stop_duration=${durationText},trim=duration=${durationText},setpts=PTS-STARTPTS,format=yuv420p"
+    # Frame 0 of an H3 clip is the scene guide, which the model often leaves abruptly
+    # (a one-frame flash of a different pose or extra figure). Hold frame 3 over frames
+    # 0-2: the clip keeps its exact length, so dialogue stays in sync.
+    $videoFilter="trim=start_frame=3,setpts=PTS-STARTPTS,tpad=start=3:start_mode=clone,scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:color=black,fps=${targetFps},tpad=stop_mode=clone:stop_duration=${durationText},trim=duration=${durationText},setpts=PTS-STARTPTS,format=yuv420p"
     & $ffmpegExe -y -loglevel error -i $local -map 0:v:0 -vf $videoFilter -an -c:v libx264 -preset medium -crf 18 -g ($targetFps*2) -keyint_min ($targetFps*2) -sc_threshold 0 -movflags +faststart $normalized 2>&1|Out-Null
     if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $normalized)){throw ("Clip {0} konnte nicht auf das Masterprofil normalisiert werden." -f $sequence)}
     $clipLines += "file '$($normalized.Replace("'","'\''"))'"
