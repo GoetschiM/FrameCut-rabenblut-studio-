@@ -61,8 +61,15 @@ def main() -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         language = str(job.get("language") or "German").strip() or "German"
         voice = str(job.get("voice") or "A clear, natural German storyteller voice.").strip()
+        performance = str(job.get("performance") or "").strip()
         if model_type == "VoiceDesign":
-            wavs, sample_rate = model.generate_voice_design(text=text, language=language, instruct=voice)
+            # VoiceDesign samples a new timbre per call. Seeding from the character's
+            # voice description keeps one stable voice per character across all scenes.
+            seed = int.from_bytes(hashlib.sha256(voice.encode("utf-8")).digest()[:4], "big")
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            instruct = "; ".join(part for part in (voice, performance, "Speak only Standard German (Hochdeutsch), clearly articulated. No music or sound effects.") if part)
+            wavs, sample_rate = model.generate_voice_design(text=text, language=language, instruct=instruct)
         else:
             # Keying by the saved voice direction keeps every character on the same
             # voice across scenes while naturally assigning different casts another one.
@@ -70,7 +77,7 @@ def main() -> int:
             speaker = speakers[key % len(speakers)]
             wavs, sample_rate = model.generate_custom_voice(
                 text=text, language=language, speaker=speaker,
-                instruct=voice if args.model_size == "1.7B" else None,
+                instruct="; ".join(part for part in (voice, performance, "Speak only Standard German. No music or sound effects.") if part) if args.model_size == "1.7B" else None,
             )
         sf.write(str(output), wavs[0], sample_rate)
         results.append({"id": job.get("id"), "output": str(output), "speaker": speaker if model_type == "CustomVoice" else "voice-design", "sample_rate": int(sample_rate), "seconds": round(len(wavs[0]) / sample_rate, 3)})

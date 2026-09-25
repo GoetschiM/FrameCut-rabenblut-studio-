@@ -25,7 +25,7 @@ Standardpfaden (passend zu diesem Laptop) abzuweichen:
   "ComfyRef": "pinokio://...",
   "H3Url": "http://127.0.0.1:8188",
   "H3AppPath": "C:\\Pfad\\zu\\Pinokio\\api\\minimax-h3-pinokio.git\\app",
-  "UseH3ReferenceConditioning": true,
+  "UseH3ReferenceConditioning": false,
   "H3ReferenceImageSize": "match",
   "ComfyUrl": "http://127.0.0.1:8190",
   "RenderClientPath": "C:\\Pfad\\zu\\render_shot.py",
@@ -42,7 +42,11 @@ Clip hochgeladen wird — Dialog, Soundeffekte und Musik sollen als eigene Ebene
 nicht vom Bildmodell mitgeraten werden. Auf `false` setzen, um den Originalton zu behalten.
 `FfmpegPath` ist optional; ohne Angabe wird `ffmpeg` im PATH gesucht.
 
-`UseH3ReferenceConditioning` aktiviert MiniMax-H3-Ref2VA für verknüpfte Figuren,
+`UseH3ReferenceConditioning` bleibt standardmäßig deaktiviert: Roh-Referenzbilder
+können bei MiniMax H3 als erstes Frame oder zusätzliche Figur erscheinen. FrameCut
+animiert deshalb den separaten, vollflächigen Szenenguide und verwendet die
+Referenzdaten nur für die verbindliche Szenenbeschreibung. Erst eine künftige
+FaceID-/LoRA-Keyframe-Stufe darf diese Option wieder gezielt aktivieren.
 Gegenstände und Orte. Die echten Referenzbilder werden dabei ausschließlich als
 benannte `<Picture N>`-Identitätsquellen verwendet; der Szenen-Keyframe wird separat
 als Bildführung bei Frame 0 verankert. Dadurch erscheint ein freigestelltes Porträt

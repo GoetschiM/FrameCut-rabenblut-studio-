@@ -1,6 +1,7 @@
-{
-  "version": "bootstrap-2",
-  "file": "framecut-worker-bootstrap-2.zip",
-  "sha256": "c0e8319a648cb0e1fdadb9892169472a90a70e1a521139f203bcfe438a40d62a",
-  "entrypoint": "Start-FrameCutRemoteWorker.bat"
+﻿{
+    "version":  "2026.09.21.1",
+    "file":  "framecut-worker-2026.09.21.1.zip",
+    "installerFile":  "framecut-worker-installer-2026.09.20.zip",
+    "sha256":  "4700e3ed38fa6b4083daac7f2666146291ebaf1a90acf7baf1b42cecc7594723",
+    "entrypoint":  "FrameCut-Worker.bat"
 }

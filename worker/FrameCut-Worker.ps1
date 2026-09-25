@@ -7,11 +7,45 @@ $configPath = Join-Path $runtimeRoot 'worker.config.json'
 $tokenPath = Join-Path $runtimeRoot 'worker-token.dpapi'
 $pidPath = Join-Path $runtimeRoot 'worker.pid'
 $stopPath = Join-Path $runtimeRoot 'worker.stop'
-$pinokioHome = Join-Path $env:USERPROFILE 'Documents\Pinokio'
+# PowerShell 5.1 reuses pooled keep-alive sockets that the Node server closed during long ffmpeg/H3 work ("Verbindung ... geschlossen").
+$PSDefaultParameterValues['Invoke-RestMethod:DisableKeepAlive']=$true
+$PSDefaultParameterValues['Invoke-WebRequest:DisableKeepAlive']=$true
+function Resolve-PinokioHome {
+  $pinokioCfg = Join-Path $env:USERPROFILE '.pinokio\config.json'
+  if (Test-Path -LiteralPath $pinokioCfg) {
+    try {
+      $cfg = Get-Content -LiteralPath $pinokioCfg -Raw | ConvertFrom-Json
+      if ($cfg.home -and (Test-Path -LiteralPath $cfg.home)) { return $cfg.home }
+    } catch {}
+  }
+  $candidates = @(
+    (Join-Path $env:USERPROFILE 'Documents\Pinokio'),
+    (Join-Path $env:LOCALAPPDATA 'Pinokio'),
+    'C:\Pinokio', 'D:\Pinokio', 'E:\Pinokio'
+  )
+  foreach ($c in $candidates) {
+    if (Test-Path -LiteralPath (Join-Path $c 'bin\npm\pterm.cmd')) { return $c }
+  }
+  foreach ($c in $candidates) {
+    if (Test-Path -LiteralPath $c) { return $c }
+  }
+  return (Join-Path $env:USERPROFILE 'Documents\Pinokio')
+}
+
+$pinokioHome = Resolve-PinokioHome
 $pterm = Join-Path $pinokioHome 'bin\npm\pterm.cmd'
 
 if(-not (Test-Path -LiteralPath $configPath) -or -not (Test-Path -LiteralPath $tokenPath)){Write-Host 'Worker ist noch nicht eingerichtet. Bitte Setup erneut ausfuehren.' -ForegroundColor Yellow;exit 1}
 $config=Get-Content -LiteralPath $configPath -Raw|ConvertFrom-Json
+$versionPath=Join-Path $workerRoot 'worker.version.json'
+$updateScript=Join-Path $workerRoot 'FrameCut-Worker-Update.ps1'
+$workerVersion='legacy'
+if(Test-Path -LiteralPath $versionPath){
+  try {$versionInfo=Get-Content -LiteralPath $versionPath -Raw|ConvertFrom-Json;$workerVersion=[string]$versionInfo.version}catch{}
+}
+$autoUpdate = -not ($config.PSObject.Properties.Name -contains 'AutoUpdate' -and $config.AutoUpdate -eq $false)
+$updateCheckSeconds = if($config.UpdateCheckSeconds){[Math]::Max(60,[int]$config.UpdateCheckSeconds)}else{300}
+$script:lastUpdateCheck=[datetime]::MinValue
 
 # Every executable helper is bundled in this repository. Per-worker overrides are still
 # supported for a custom Pinokio or ComfyUI layout, but a fresh clone has portable defaults.
@@ -48,10 +82,22 @@ $h3AppPath = if ($config.H3AppPath) { $config.H3AppPath } else { Join-Path $pino
 $h3ReferenceModel = Join-Path $h3AppPath 'models\diffusion_models\minimax_h3_ref2va_pruned_int8_convrot.safetensors'
 # Auto-enable exact H3 identity conditioning when the local Ref2VA model exists.
 # An explicit false remains an emergency fallback to the ordinary image-to-video path.
-$useH3ReferenceConditioning = if ($config.PSObject.Properties.Name -contains 'UseH3ReferenceConditioning') { $config.UseH3ReferenceConditioning -eq $true } else { Test-Path -LiteralPath $h3ReferenceModel }
+$useH3ReferenceConditioning = $config.PSObject.Properties.Name -contains 'UseH3ReferenceConditioning' -and $config.UseH3ReferenceConditioning -eq $true
 $h3ReferenceImageSize = if ($config.H3ReferenceImageSize -in @('match','max')) { [string]$config.H3ReferenceImageSize } else { 'match' }
-$ffmpegExe = if ($config.FfmpegPath) { $config.FfmpegPath } else { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }
-$ffprobeExe = if ($config.FfprobePath) { $config.FfprobePath } elseif ($ffmpegExe) { Join-Path (Split-Path -Parent $ffmpegExe) 'ffprobe.exe' } else { (Get-Command ffprobe -ErrorAction SilentlyContinue).Source }
+$ffmpegExe = if ($config.FfmpegPath -and (Test-Path -LiteralPath $config.FfmpegPath)) { $config.FfmpegPath }
+  elseif ((Get-Command ffmpeg -ErrorAction SilentlyContinue)) { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }
+  elseif (Test-Path -LiteralPath (Join-Path $workerRoot 'tools\ffmpeg\bin\ffmpeg.exe')) { Join-Path $workerRoot 'tools\ffmpeg\bin\ffmpeg.exe' }
+  elseif (Test-Path -LiteralPath (Join-Path $workerRoot 'tools\ffmpeg.exe')) { Join-Path $workerRoot 'tools\ffmpeg.exe' }
+  else {
+    $pwFfmpeg = Get-ChildItem -Path (Join-Path $pinokioHome 'bin\playwright\browsers') -Filter 'ffmpeg-win64.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pwFfmpeg) { $pwFfmpeg.FullName } else { $null }
+  }
+$ffprobeExe = if ($config.FfprobePath -and (Test-Path -LiteralPath $config.FfprobePath)) { $config.FfprobePath }
+  elseif ((Get-Command ffprobe -ErrorAction SilentlyContinue)) { (Get-Command ffprobe -ErrorAction SilentlyContinue).Source }
+  elseif ($ffmpegExe) {
+    $siblingProbe = Join-Path (Split-Path -Parent $ffmpegExe) 'ffprobe.exe'
+    if (Test-Path -LiteralPath $siblingProbe) { $siblingProbe } else { $null }
+  } else { $null }
 if ($stripAudio -and -not $ffmpegExe) {
   Write-Host 'Hinweis: ffmpeg wurde nicht gefunden - Clips behalten ihre Original-Tonspur.' -ForegroundColor Yellow
   $stripAudio = $false
@@ -61,6 +107,18 @@ if(-not (Test-Path -LiteralPath $pterm)){Write-Host 'Pinokio/pterm wurde nicht g
 if(-not (Test-Path -LiteralPath $renderClient)){Write-Host 'MiniMax-H3-Client wurde nicht gefunden.' -ForegroundColor Yellow;exit 1}
 
 Add-Type -AssemblyName System.Security
+
+function Get-Sha256Hex([string]$Path) {
+  # Get-FileHash is not guaranteed to be exported in every PowerShell host that
+  # Pinokio starts. Use the framework implementation so reference integrity
+  # checks work identically on Windows PowerShell 5.1 and PowerShell 7.
+  $stream = [IO.File]::OpenRead($Path)
+  try {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+  } finally { $stream.Dispose() }
+}
 
 Add-Type @'
 using System;
@@ -182,6 +240,50 @@ function Read-WorkerToken {
   return [Text.Encoding]::Unicode.GetString($plain)
 }
 function Headers { return @{'x-framecut-worker'=(Read-WorkerToken);'x-framecut-worker-id'=$config.WorkerId} }
+function Get-RuntimeInventory {
+  $modelRoot=Join-Path $h3AppPath 'models'
+  return [ordered]@{
+    pinokio=Test-Path -LiteralPath $pterm
+    h3App=Test-Path -LiteralPath $h3AppPath
+    h3RefModel=Test-Path -LiteralPath (Join-Path $modelRoot 'diffusion_models\minimax_h3_ref2va_pruned_int8_convrot.safetensors')
+    h3FlModel=Test-Path -LiteralPath (Join-Path $modelRoot 'diffusion_models\minimax_h3_fl2va_pruned_int8_convrot.safetensors')
+    h3TextEncoder=Test-Path -LiteralPath (Join-Path $modelRoot 'text_encoders\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors')
+    h3VideoVae=Test-Path -LiteralPath (Join-Path $modelRoot 'vae\minimax_h3_video_vae_fp16.safetensors')
+    h3AudioVae=Test-Path -LiteralPath (Join-Path $modelRoot 'vae\minimax_h3_audio_vae_fp32.safetensors')
+    h3TurboLora=Test-Path -LiteralPath (Join-Path $modelRoot 'loras\minimax_h3_turbo_v4_step600_ema.safetensors')
+    qwenTts=Test-Path -LiteralPath $qwenPythonExe
+    stableAudio=[bool]($stableAudioRef -or $stableAudioMusicUrl -or $stableAudioSfxUrl)
+    ffmpeg=[bool]$ffmpegExe
+  }
+}
+function Report-WorkerVersion {
+  try {
+    $body=@{version=$workerVersion;autoUpdate=$autoUpdate;runtime=(Get-RuntimeInventory)}|ConvertTo-Json -Depth 5 -Compress
+    return Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/version" -Headers (Headers) -ContentType 'application/json' -Body $body
+  } catch { Write-Host ("Worker-Version konnte nicht gemeldet werden: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow }
+}
+function Get-PendingWorkerUpdate {
+  if(-not $autoUpdate -or -not (Test-Path -LiteralPath $updateScript)){return $null}
+  if(((Get-Date)-$script:lastUpdateCheck).TotalSeconds -lt $updateCheckSeconds){return $null}
+  $script:lastUpdateCheck=Get-Date
+  try {
+    # Dashboard requests are consumed only while idle. The server clears a request
+    # when the restarted worker reports the requested version back.
+    $versionReport=Report-WorkerVersion
+    $manifest=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/installer/manifest" -TimeoutSec 15
+    $requested=[string]$versionReport.updateRequestedVersion
+    if($manifest.version -and [string]$manifest.version -ne $workerVersion -and $manifest.downloadUrl -and $manifest.sha256){
+      if($requested -and $requested -ne [string]$manifest.version){Write-Host ("Vorgemerktes Update {0} ist nicht mehr aktuell; installiere {1}." -f $requested,$manifest.version) -ForegroundColor DarkYellow}
+      return $manifest
+    }
+  } catch { Write-Host ("Worker-Updateprüfung übersprungen: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow }
+  return $null
+}
+function Start-WorkerUpdate($Manifest) {
+  $args='-NoProfile -ExecutionPolicy Bypass -File "'+$updateScript+'" -ServerUrl "'+$config.ServerUrl+'" -WorkerRoot "'+$workerRoot+'" -ParentPid '+$PID
+  Start-Process -FilePath 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -ArgumentList $args -WorkingDirectory $workerRoot -WindowStyle Hidden
+  Write-Host ("Worker-Update {0} wird im Leerlauf installiert; Neustart folgt automatisch." -f [string]$Manifest.version) -ForegroundColor Cyan
+}
 function Report-Job([int]$Id,[string]$Action,[string]$Detail,[string]$OutputPath='') {
   $payload=@{detail=$Detail}; if($OutputPath){$payload.outputPath=$OutputPath}
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$Id/$Action" -Headers (Headers) -ContentType 'application/json' -Body ($payload|ConvertTo-Json) | Out-Null
@@ -248,7 +350,13 @@ function Ensure-H3 {
     Write-Host ("MiniMax H3 wird ueber Pinokio gestartet (Versuch {0}/2) ..." -f $attempt) -ForegroundColor Cyan
     $start=Invoke-PtermBounded 'run' 90
     if($start.TimedOut){
-      Write-Host 'pterm run hat das Timeout erreicht.' -ForegroundColor Yellow
+      Write-Host 'pterm run bleibt geöffnet; prüfe den tatsächlichen H3-Status weiter ...' -ForegroundColor Yellow
+      $afterStart=Get-H3Status
+      if($afterStart -and $afterStart.ready){return}
+      $afterState=if($afterStart){[string]$afterStart.state}else{''}
+      if($afterStart -and (($afterStart.running -eq $true) -or $afterState -eq 'starting')){
+        if(Wait-H3Ready 600){return}
+      }
       if($attempt -lt 2){Reset-H3;continue}
       break
     }
@@ -276,8 +384,14 @@ function Ensure-StableAudio {
     throw 'Stable Audio wurde nicht rechtzeitig bereit.'
   }
   Write-Host 'Stable Audio 3 wird über Pinokio gestartet ...' -ForegroundColor Cyan
-  $start=Invoke-PtermBounded 'run' 120 $stableAudioRef @('--default',$stableAudioLaunchScript)
-  if($start.TimedOut){throw 'Pinokio konnte Stable Audio nicht rechtzeitig starten.'}
+  # `pterm run` may intentionally remain attached while the launched web app is
+  # healthy.  Treat the probed API state as authoritative instead of turning a
+  # still-open launcher process into a false failed audio job.
+  $start=Invoke-PtermBounded 'run' 45 $stableAudioRef @('--default',$stableAudioLaunchScript)
+  if($start.TimedOut){
+    if(Wait-PinokioReady $stableAudioRef 90){return [string](Get-PinokioStatus $stableAudioRef).ready_url}
+    throw 'Pinokio konnte Stable Audio nicht rechtzeitig starten.'
+  }
   if(-not (Wait-PinokioReady $stableAudioRef 900)){throw 'Stable Audio wurde nicht rechtzeitig bereit.'}
   $ready=[string](Get-PinokioStatus $stableAudioRef).ready_url
   if(-not $ready){throw 'Stable Audio meldet keine lokale API-URL.'}
@@ -309,13 +423,13 @@ function Stop-OwnedComfy {
   }
   Remove-Item -LiteralPath $ownedPidPath -Force -ErrorAction SilentlyContinue
 }
-function Invoke-ZImage([string]$Prompt,[string]$Prefix,[int]$Seed,[int]$Steps=12,[string]$NegativePrompt='') {
+function Invoke-ZImage([string]$Prompt,[string]$Prefix,[int]$Seed,[int]$Steps=12,[string]$NegativePrompt='',[int]$Width=768,[int]$Height=448,[double]$Cfg=1.0) {
   Ensure-Comfy
   $env:COMFY_URL=$config.ComfyUrl
   $imageTimeout=if($config.ImageTimeoutSeconds){[Math]::Max(120,[int]$config.ImageTimeoutSeconds)}else{900}
   $baseNegative='contact sheet, storyboard grid, collage, split screen, multiple panels, model sheet, turnaround sheet, white background, text, caption, watermark, logo, malformed anatomy, duplicate people, extra limbs, flat lighting, open door on a moving vehicle, laptop outside a vehicle, physically impossible vehicle, floating objects'
   $effectiveNegative=if($NegativePrompt){"$baseNegative, $NegativePrompt"}else{$baseNegative}
-  try { Invoke-BoundedPython @($imageClient,$Prompt,'--negativ',$effectiveNegative,'--breite','768','--hoehe','448','--schritte',[string]$Steps,'--seed',[string]$Seed,'--name',$Prefix) $imageTimeout 'ComfyUI Z-Image' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
+  try { Invoke-BoundedPython @($imageClient,$Prompt,'--cfg',$Cfg.ToString([Globalization.CultureInfo]::InvariantCulture),'--negativ',$effectiveNegative,'--breite',[string]$Width,'--hoehe',[string]$Height,'--schritte',[string]$Steps,'--seed',[string]$Seed,'--name',$Prefix) $imageTimeout 'ComfyUI Z-Image' } finally { Remove-Item Env:COMFY_URL -ErrorAction SilentlyContinue }
   $folder=Split-Path $Prefix -Parent
   $leaf=Split-Path $Prefix -Leaf
   $result=Get-ChildItem -LiteralPath (Join-Path $comfyOutputRoot $folder) -Filter "$leaf*.png"|Sort-Object LastWriteTime -Descending|Select-Object -First 1
@@ -346,12 +460,75 @@ function Test-KeyframeHasWhiteStudioBackground([string]$Path) {
           if($pixel.R -ge 242 -and $pixel.G -ge 242 -and $pixel.B -ge 242){$nearWhite++}
         }
       }
-      return $samples -gt 0 -and (($nearWhite / $samples) -ge 0.76)
+      if($samples -gt 0 -and (($nearWhite / $samples) -ge 0.76)){return $true}
+      # Reject a tall, near-white side panel too. This is the typical signature
+      # of a character turnaround/reference card embedded in an otherwise valid
+      # scene; bright skies and lamps do not fill almost the entire height.
+      $columns=96;$rows=72;$whitePanelColumns=0
+      for($column=0;$column -lt $columns;$column++){
+        $x=[Math]::Min($bitmap.Width-1,[int](($column+0.5)*$bitmap.Width/$columns))
+        $whiteRows=0
+        for($row=0;$row -lt $rows;$row++){
+          $y=[Math]::Min($bitmap.Height-1,[int](($row+0.5)*$bitmap.Height/$rows))
+          $pixel=$bitmap.GetPixel($x,$y)
+          if($pixel.R -ge 242 -and $pixel.G -ge 242 -and $pixel.B -ge 242){$whiteRows++}
+        }
+        if(($whiteRows/$rows) -ge 0.68){$whitePanelColumns++}
+      }
+      # The portrayed person interrupts a white card, so a contiguous strip is
+      # not enough; count its near-white full-height columns across the frame.
+      return $whitePanelColumns -ge 18
     } finally { $bitmap.Dispose() }
   } catch { return $false }
 }
+function Clean-GuideText([string]$Text) {
+  if (-not $Text) { return '' }
+  $t = $Text -replace '(?i)\b(the|this) (image|picture|photo|illustration|drawing|render) (depicts|shows|features|presents|portrays|displays)\s*', ''
+  $t = $t -replace '(?i)\b(isolated|cut[- ]?out|on (a )?(plain |pure |clean |solid )?white (background|backdrop)|white (background|backdrop|studio|paper)|character sheet|model sheet|turnaround( sheet)?|reference (sheet|image|card|photo)|contact sheet|studio backdrop|no background|blank background)\b', ''
+  $t = $t -replace '(?i)\bvector[- ]?(like )?(rendering|aesthetic|art|style)?\b', 'crisp line art'
+  $t = $t -replace '(?i)--(ar|v)\s+\S+', ''
+  $t = $t -replace '\s+([,.;])', '$1' -replace '([,.;])\s*[,.;]+', '$1' -replace '\s{2,}', ' '
+  return $t.Trim(' ', ',', ';')
+}
+function Get-SharedSceneGuidePrompt($Contract,$Shot) {
+  $locations=@();$subjects=@()
+  foreach($reference in @($Contract.references)){
+    if([string]$reference.role -eq 'style'){continue}
+    # English appearance tags (generated server-side) keep characters on-model far better than German prose.
+    $detail=if([string]$reference.visual_tags){[string]$reference.visual_tags}else{Clean-GuideText ((@([string]$reference.summary,[string]$reference.visual_notes)|Where-Object {$_}|ForEach-Object {$_.Trim()}) -join ' ')}
+    if($detail.Length -gt 320){$detail=$detail.Substring(0,320)}
+    $line=("{0}: {1}" -f [string]$reference.name,$detail)
+    if([string]$reference.kind -eq 'location'){$locations+=$line}else{$subjects+=$line}
+  }
+  $style=Clean-GuideText ([string]$Contract.style)
+  if(-not $style){$style='coherent cinematic animation with one consistent visual medium and palette'}
+  $locationText=if($locations.Count){$locations -join '; '}else{'the place described in the scene action'}
+  $subjectText=if($subjects.Count){$subjects -join '; '}else{'only the setting and props named in the scene action'}
+  $guide=@"
+A single cinematic film frame taken inside one real, lived-in location, with depth from foreground to far background.
+Scene action: $(Clean-GuideText ([string]$Shot.prompt))
+Camera: $([string]$Shot.camera)
+Location: $locationText. The environment is fully rendered in every corner of the frame: floor, walls, ceiling or sky, furniture, props, atmosphere and lighting continue edge to edge behind and around everyone.
+Acting in this frame, each appearing exactly once and interacting inside the location: $subjectText
+Visual style: $style, applied equally to the characters and the richly detailed surrounding environment.
+"@
+  return $guide.Replace("`r",' ').Replace("`n",' ')
+}
 function Invoke-BoundedPython([string[]]$Arguments,[int]$TimeoutSeconds,[string]$Operation) {
-  $pythonExe=(Get-Command python -ErrorAction Stop).Source
+  $pythonExe = if ($config.PythonPath -and (Test-Path -LiteralPath $config.PythonPath)) {
+    $config.PythonPath
+  } elseif (Test-Path -LiteralPath (Join-Path $pinokioHome 'bin\miniforge\python.exe')) {
+    Join-Path $pinokioHome 'bin\miniforge\python.exe'
+  } elseif (Test-Path -LiteralPath (Join-Path $pinokioHome 'bin\py\env\Scripts\python.exe')) {
+    Join-Path $pinokioHome 'bin\py\env\Scripts\python.exe'
+  } else {
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -notmatch 'WindowsApps\\python\.exe' -and (Test-Path -LiteralPath $cmd.Source)) {
+      $cmd.Source
+    } else {
+      throw 'Python wurde weder in Pinokio noch im Systempfad gefunden.'
+    }
+  }
   $task=Start-Job -ScriptBlock {
     param($exe,$childArgs)
     & $exe @childArgs
@@ -483,7 +660,10 @@ function Invoke-StableAudioCue($Cue,[string]$JobRoot) {
   }
   $spec = Join-Path $JobRoot 'stable-audio-cue.json'
   $output = Join-Path $JobRoot 'generated-audio.wav'
-  @{prompt=[string]$Cue.prompt;duration_seconds=[Math]::Max(1,[Math]::Ceiling(([double]$Cue.target_duration_ms)/1000));output=$output}|ConvertTo-Json -Compress|Set-Content -LiteralPath $spec -Encoding utf8
+  # Episode quality settings reach this function through the calling job (empty = 8 steps, cfg 1.0).
+  $audioSteps=if($payload.job.audio_steps){[int]$payload.job.audio_steps}else{8}
+  $audioCfg=if($payload.job.audio_cfg){[double]$payload.job.audio_cfg}else{1.0}
+  @{prompt=[string]$Cue.prompt;duration_seconds=[Math]::Max(1,[Math]::Ceiling(([double]$Cue.target_duration_ms)/1000));output=$output;steps=$audioSteps;cfg=$audioCfg}|ConvertTo-Json -Compress|Set-Content -LiteralPath $spec -Encoding utf8
   $stdout = Join-Path $JobRoot 'stable-audio-stdout.log'; $stderr = Join-Path $JobRoot 'stable-audio-stderr.log'
   $argLine="`"$stableAudioClient`" --base-url `"$baseUrl`" --spec `"$spec`""
   Write-Host ("Stable Audio 3 erzeugt {0} ({1}s) ..." -f $Cue.kind,([Math]::Ceiling(([double]$Cue.target_duration_ms)/1000))) -ForegroundColor Cyan
@@ -504,17 +684,71 @@ function Process-AudioCueJob($payload) {
   if(-not $ffmpegExe){throw 'ffmpeg fehlt; Audio-Spuren können nicht auf den Produktionsstandard normalisiert werden.'}
   Free-Models $config.ComfyUrl;Free-Models $config.H3Url
   if($cue.kind -eq 'dialogue' -or $cue.kind -eq 'narration') {
+    # Stable Audio and Qwen share the local GPU. Release Stable Audio before a
+    # speech job so dialogue does not fail because of stale VRAM allocations.
+    if($stableAudioRef) {
+      $stable=Get-PinokioStatus $stableAudioRef
+      if($stable -and $stable.running) {
+        Write-Host 'Stable Audio wird für die Sprachspur kontrolliert beendet …' -ForegroundColor DarkYellow
+        try { Invoke-PtermBounded 'stop' 90 $stableAudioRef | Out-Null; Start-Sleep -Seconds 4 } catch { Write-Warning "Stable Audio konnte nicht sauber beendet werden: $($_.Exception.Message)" }
+      }
+    }
     $raw=Join-Path $root 'speech-raw.wav'
-    [void](Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;language=$cue.language;output=$raw}) -JobRoot $root)
+    [void](Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;performance=$cue.performance_direction;language=$cue.language;output=$raw}) -JobRoot $root)
   } elseif($cue.kind -eq 'sfx' -or $cue.kind -eq 'music' -or $cue.kind -eq 'ambience') {
     $raw=Invoke-StableAudioCue $cue $root
   } else { throw "Unbekannter Audio-Cue-Typ: $($cue.kind)" }
   if(-not (Test-Path -LiteralPath $raw)){throw 'Die Audio-Engine meldete Erfolg, aber die WAV-Datei fehlt.'}
   $normal=Join-Path $root 'audio-ready.wav'
-  & $ffmpegExe -y -loglevel error -i $raw -ar 48000 -ac 2 -c:a pcm_s16le $normal 2>&1|Out-Null
+  $audioFilter='loudnorm=I=-22:TP=-2:LRA=9'
+  if($cue.kind -eq 'dialogue' -or $cue.kind -eq 'narration'){
+    $direction=([string]$cue.performance_direction).ToLowerInvariant()
+    $tempo=1.0
+    if($direction -match 'sehr schnell|panisch|hektisch|atemlos|eilig'){$tempo=1.15}
+    elseif($direction -match 'schnell|aufgeregt|dringlich'){$tempo=1.08}
+    elseif($direction -match 'langsam|ruhig|bedacht|besonnen'){$tempo=0.94}
+    $gain=if($direction -match 'sehr laut|schrei'){'2.5dB'}elseif($direction -match 'laut'){'1.5dB'}elseif($direction -match 'leise|flüster'){'-2.5dB'}else{'0dB'}
+    $rawDuration=Get-ClipDurationSeconds $raw
+    $targetSeconds=[Math]::Max(0.65,([double]$cue.target_duration_ms/1000))
+    # Qwen's natural pause length varies per voice.  Calculate the required
+    # pace explicitly as doubles; without the casts PowerShell may retain a
+    # culture-sensitive value and skip the adaptive pace calculation.
+    $requiredTempo=1.0
+    if($null -ne $rawDuration -and [double]$rawDuration -gt [double]$targetSeconds){
+      $requiredTempo=[double]$rawDuration/[double]$targetSeconds
+      # Beyond ~1.12x speech sounds rushed. A longer line now extends its shot instead
+      # (lip sync renders the picture from the voice), so no dialogue is ever rejected.
+      $tempo=[Math]::Max([double]$tempo,[Math]::Min(1.12,[double]$requiredTempo))
+    }
+    $fittedDuration=if($null -ne $rawDuration){[double]$rawDuration/[double]$tempo}else{$targetSeconds}
+    Write-Host ("Dialog-Timing: roh {0:N2}s, Ziel {1:N2}s, Tempo {2:N2}x" -f $rawDuration,$targetSeconds,$tempo) -ForegroundColor DarkGray
+    $speechSeconds=$null
+    if($fittedDuration -gt ($targetSeconds+0.05)){
+      Write-Host ("Dialog laenger als geplant ({0:N2}s statt {1:N2}s): Shot wird serverseitig verlaengert." -f $fittedDuration,$targetSeconds) -ForegroundColor Cyan
+      $targetSeconds=[Math]::Round([double]$fittedDuration+0.05,3)
+      $speechSeconds=$targetSeconds
+    }
+    $tempoText=$tempo.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $audioFilter="atempo=$tempoText,volume=$gain,loudnorm=I=-18:TP=-1.5:LRA=7,apad=pad_dur=$($targetSeconds.ToString([Globalization.CultureInfo]::InvariantCulture)),atrim=duration=$($targetSeconds.ToString([Globalization.CultureInfo]::InvariantCulture))"
+  }
+  & $ffmpegExe -y -loglevel error -i $raw -af $audioFilter -ar 48000 -ac 2 -c:a pcm_s16le $normal 2>&1|Out-Null
   if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $normal)){throw 'ffmpeg konnte die Audio-Spur nicht in 48 kHz Stereo normalisieren.'}
   $headers=Headers;$headers['x-framecut-cue-id']=[string]$cue.id
-  Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-cue" -Headers $headers -ContentType 'audio/wav' -InFile $normal | Out-Null
+  if($speechSeconds){$headers['x-framecut-speech-seconds']=([double]$speechSeconds).ToString([Globalization.CultureInfo]::InvariantCulture)}
+  $lastUploadError=$null
+  for($uploadAttempt=1;$uploadAttempt -le 3;$uploadAttempt++) {
+    try {
+      Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-cue" -Headers $headers -ContentType 'audio/wav' -InFile $normal | Out-Null
+      $lastUploadError=$null; break
+    } catch {
+      $lastUploadError=$_.Exception
+      if($uploadAttempt -lt 3) {
+        Write-Warning ("Audio-Upload unterbrochen; erneuter Versuch {0}/3 in 3 Sekunden." -f ($uploadAttempt+1))
+        Start-Sleep -Seconds 3
+      }
+    }
+  }
+  if($lastUploadError){throw "Audio-Upload nach 3 Versuchen fehlgeschlagen: $($lastUploadError.Message)"}
   Write-Host ("Audio-Spur fertig: {0}" -f $cue.id) -ForegroundColor Green
 }
 function Process-AudioPreviewJob($payload) {
@@ -531,19 +765,46 @@ function Process-AudioMixJob($payload) {
   if(-not $ffmpegExe){throw 'ffmpeg fehlt; ein Audio-Master kann nicht gemischt werden.'}
   Free-Models $config.ComfyUrl;Free-Models $config.H3Url
   $clips=@($payload.clips|Sort-Object sequence)
+  $targetWidth=if($payload.outputProfile.width){[int]$payload.outputProfile.width}else{768}
+  $targetHeight=if($payload.outputProfile.height){[int]$payload.outputProfile.height}else{448}
+  $targetFps=if($payload.outputProfile.fps){[int]$payload.outputProfile.fps}else{24}
+  if($targetWidth -lt 320 -or $targetHeight -lt 180){throw 'Ungültiges Masterprofil: Die Exportauflösung ist zu klein.'}
   $concat=Join-Path $root 'clips.txt';$clipLines=@();$total=0.0
-  foreach($clip in $clips){$local=Join-Path $root ("clip-{0:d3}.mp4" -f [int]$clip.sequence);Invoke-WebRequest -Uri ($config.ServerUrl+$clip.downloadUrl) -Headers (Headers) -OutFile $local;$clipLines += "file '$($local.Replace("'","'\''"))'";$total += [double]$clip.duration_seconds}
+  foreach($clip in $clips){
+    $sequence=[int]$clip.sequence
+    $duration=[Math]::Max(0.1,[double]$clip.duration_seconds)
+    $local=Join-Path $root ("clip-{0:d3}-source.mp4" -f $sequence)
+    $normalized=Join-Path $root ("clip-{0:d3}-normalized.mp4" -f $sequence)
+    Invoke-WebRequest -Uri ($config.ServerUrl+$clip.downloadUrl) -Headers (Headers) -OutFile $local
+    $sourceWidth=0;$sourceHeight=0
+    if($ffprobeExe){
+      $dimensions=& $ffprobeExe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 $local 2>$null
+      if($LASTEXITCODE -eq 0 -and ($dimensions -join '') -match '^(\d+)x(\d+)$'){$sourceWidth=[int]$Matches[1];$sourceHeight=[int]$Matches[2]}
+    }
+    Write-Host ("Clip {0:000}: {1}x{2} -> {3}x{4}, {5:N1}s, ohne Modellton" -f $sequence,$sourceWidth,$sourceHeight,$targetWidth,$targetHeight,$duration) -ForegroundColor DarkCyan
+    $durationText=$duration.ToString([Globalization.CultureInfo]::InvariantCulture)
+    # Every source becomes an independent, closed GOP H.264 clip with the exact
+    # master geometry and authored duration. This prevents 192x160 preview/reference
+    # SPS data from corrupting the following 768x448 clips during concat.
+    $videoFilter="scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:color=black,fps=${targetFps},tpad=stop_mode=clone:stop_duration=${durationText},trim=duration=${durationText},setpts=PTS-STARTPTS,format=yuv420p"
+    & $ffmpegExe -y -loglevel error -i $local -map 0:v:0 -vf $videoFilter -an -c:v libx264 -preset medium -crf 18 -g ($targetFps*2) -keyint_min ($targetFps*2) -sc_threshold 0 -movflags +faststart $normalized 2>&1|Out-Null
+    if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $normalized)){throw ("Clip {0} konnte nicht auf das Masterprofil normalisiert werden." -f $sequence)}
+    $clipLines += "file '$($normalized.Replace("'","'\''"))'"
+    $total += $duration
+  }
   if($total -le 0){throw 'Die Video-Timeline hat keine gültige Dauer.'}
   # FFmpeg's concat demuxer treats a UTF-8 BOM as part of its first keyword
   # ("\ufefffile"), so emit plain UTF-8 explicitly rather than PowerShell 5.1's
   # BOM-prefixed Set-Content encoding.
   [IO.File]::WriteAllText($concat,($clipLines -join "`n"),(New-Object Text.UTF8Encoding($false)))
-  $video=Join-Path $root 'picture-cut.mp4';& $ffmpegExe -y -loglevel error -f concat -safe 0 -i $concat -map 0:v:0 -c:v copy -an $video 2>&1|Out-Null
+  $video=Join-Path $root 'picture-cut.mp4';& $ffmpegExe -y -loglevel error -f concat -safe 0 -i $concat -map 0:v:0 -c:v copy -an -movflags +faststart $video 2>&1|Out-Null
   if($LASTEXITCODE -ne 0 -or -not(Test-Path $video)){throw 'Der Bildschnitt für den Audio-Mix konnte nicht erstellt werden.'}
   $tracks=@($payload.audio.manifest.cues|Where-Object {$_.state -eq 'ready' -and $_.artifact.downloadUrl})
-  if($tracks.Count -eq 0){throw 'Keine bestätigten Audio-Spuren zum Mischen vorhanden.'}
+  if($tracks.Count -eq 0){throw 'Keine bestätigten externen Audio-Spuren vorhanden. MiniMax-Modellton wird aus Qualitätsgründen nicht als Master verwendet.'}
   $index=0;foreach($cue in $tracks){$index++;$cue|Add-Member -NotePropertyName local_path -NotePropertyValue (Join-Path $root ("cue-{0:d3}.wav" -f $index)) -Force;Invoke-WebRequest -Uri ($config.ServerUrl+$cue.artifact.downloadUrl) -Headers (Headers) -OutFile $cue.local_path}
   $args=@('-y','-loglevel','error','-i',$video);foreach($cue in $tracks){$args += @('-i',$cue.local_path)}
+  # The mix always starts from silence. MiniMax native speech/music is deliberately
+  # discarded; only separately rendered and reviewable dialogue/SFX/music cues enter.
   $filters=@("anullsrc=r=48000:cl=stereo,atrim=duration=$([Math]::Round($total,3).ToString([Globalization.CultureInfo]::InvariantCulture))[base]")
   $musicLabels=@();$foregroundLabels=@('[base]')
   for($i=0;$i -lt $tracks.Count;$i++){
@@ -552,7 +813,7 @@ function Process-AudioMixJob($payload) {
     # In a double-quoted PowerShell string `$n:a` means a scoped variable and
     # `` `a`` is an ANSI escape character.  Build the FFmpeg input label and
     # `atrim` filter explicitly so the graph gets `[1:a]...atrim`, not `[]...`.
-    $filters += ("[{0}:a]aresample=48000,{1}atrim=duration={2},volume={3},adelay={4}|{4}[a{0}]" -f $n,$loop,$duration.ToString([Globalization.CultureInfo]::InvariantCulture),$gain.ToString([Globalization.CultureInfo]::InvariantCulture),$delay)
+    $filters += ("[{0}:a]aresample=48000,{1}atrim=duration={2},volume={3}dB,adelay={4}|{4}[a{0}]" -f $n,$loop,$duration.ToString([Globalization.CultureInfo]::InvariantCulture),$gain.ToString([Globalization.CultureInfo]::InvariantCulture),$delay)
     if($cue.kind -eq 'music' -or $cue.kind -eq 'ambience'){$musicLabels += "[a$n]"}else{$foregroundLabels += "[a$n]"}
   }
   if($musicLabels.Count -gt 0){$filters += ("{0}amix=inputs={1}:duration=longest:normalize=0[bed]" -f ($musicLabels -join ''),$musicLabels.Count)}
@@ -581,90 +842,58 @@ function Process-Job($payload) {
   Free-Models $config.H3Url
   Free-Models $config.ComfyUrl
   $jobRoot=Join-Path $runtimeRoot ("jobs\{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $jobRoot|Out-Null
-  $allRefs=@($shot.references|Where-Object {$_.role -ne 'style'})
-  $sourceRef=@($allRefs|Where-Object {$_.kind -eq 'source'}|Select-Object -First 1)
-  # Assets linked to this shot in the database are a deliberate choice. Prefer the ones the
-  # prompt also names, but never drop a linked reference just because the prompt phrased it
-  # differently ("the narrator" instead of "Michel") - that silently broke character
-  # consistency whenever the wording did not match the asset name exactly.
-  # Episode assets often remain linked as continuity candidates even though they
-  # are absent from a particular shot.  Passing all of them to the keyframe prompt
-  # is what caused buses, excavators and extra Leos to be invented in unrelated
-  # scenes.  Only an asset explicitly named by title/prompt is an active subject.
-  $shotText = ("{0} {1}" -f $shot.title,$shot.prompt)
-  $visualRefs=@($allRefs|Where-Object { $_.kind -ne 'source' -and $_.name -and $shotText -match [regex]::Escape([string]$_.name) })
-  if($visualRefs.Count -eq 0 -and $allRefs.Count -eq 1){$visualRefs=@($allRefs|Where-Object {$_.kind -ne 'source'}|Select-Object -First 1)}
-  $inactiveNames=@($allRefs|Where-Object { $_.kind -ne 'source' -and $visualRefs.id -notcontains $_.id }|ForEach-Object {$_.name}|Where-Object {$_})
-  $assetText=if ($visualRefs.Count -gt 0) { ($visualRefs|ForEach-Object {
-    $measurements=@()
-    if($null -ne $_.age_years -and [string]$_.age_years -ne ''){$measurements += "age $($_.age_years) years"}
-    if($null -ne $_.height_cm -and [string]$_.height_cm -ne ''){$measurements += "height $($_.height_cm) cm"}
-    $scale=if($measurements.Count){" Locked physical scale: $($measurements -join ', ')."}else{''}
-    "$($_.name): $($_.summary) $($_.visual_notes). Exactly one instance; preserve face, hairstyle, clothing, body proportions and relative scale.$scale"
-  }) -join ' | ' } else { 'No asset is active in this shot.' }
-  $inactiveRule=if($inactiveNames.Count -gt 0){"Do not show these inactive continuity assets in this shot: $($inactiveNames -join ', ')."}else{''}
-  $teslaRequested=($shot.prompt -match '(?i)\btesla\b') -or (($visualRefs|Where-Object {$_.name -match '(?i)\btesla\b'}).Count -gt 0)
-  # A named prop such as Polo (the excavator) may be a vehicle in the broad sense.
-  # Never let the Tesla safeguard contradict an explicitly active prop; it only bans
-  # unrequested passenger cars and road traffic.
-  $teslaRule=if($teslaRequested){'A Tesla may appear only in the exact role described by the shot.'}else{'ABSOLUTE EXCLUSION: do not introduce a Tesla or any unrequested passenger car. No automobile, sedan, SUV, parked traffic or road traffic. Explicitly named active props remain allowed exactly once.'}
-  $vehicleNegative=if($teslaRequested){''}else{'Tesla, passenger car, automobile, sedan, SUV, electric car, parked car, traffic, road traffic'}
-  # The server resolves project defaults and episode overrides before handing us a job.
-  # Send it to Z-Image as an actual negative conditioning prompt, and phrase it as an
-  # explicit exclusion for H3 (which only exposes a positive text field).
-  $configuredNegative=if($null -ne $job.negative_prompt){([string]$job.negative_prompt).Replace("`r",' ').Replace("`n",' ').Trim()}else{''}
-  $effectiveNegative=@($vehicleNegative,$configuredNegative)|Where-Object {$_}|ForEach-Object {$_.Trim()}|Select-Object -Unique
-  $negativePrompt=$effectiveNegative -join ', '
-  $negativeRule=if($configuredNegative){"ABSOLUTE USER EXCLUSIONS: Do not show or introduce any of these: $configuredNegative."}else{''}
-  $keyframePrompt=("SINGLE FULL-BLEED CINEMATIC FRAME, one continuous image, not a storyboard, not a collage, not a reference card. Opening instant of this exact shot: {0}. Camera: {1}. Active identity constraints: {2}. Show only the subjects and objects required by the stated action, each exactly once; no doubles, twins, clones or duplicate vehicles/props. {3} {4} {5} Everything must be physically plausible. Exterior views of a moving car show a completely closed body and closed doors; occupants stay hidden behind glass unless the shot explicitly requests an interior or person close-up. Project style: {6}. 16:9 widescreen composition, cinematic depth, realistic coherent anatomy, no visible writing, no subtitles, no border, no reference layout, no white studio background." -f $shot.prompt,$shot.camera,$assetText,$inactiveRule,$teslaRule,$negativeRule,$job.style_profile).Replace("`r",' ').Replace("`n",' ')
-  $approvedKeyframe=Join-Path $runtimeRoot ("approved-keyframes\shot-{0}.png" -f [int]$shot.id)
-  $photoSteps=if($job.photo_steps){[int]$job.photo_steps}else{8}
-  if($sourceRef.Count -gt 0){
-    $uploadedScene=Join-Path $jobRoot 'uploaded-scene-reference'
-    Invoke-WebRequest -Uri ($config.ServerUrl+$sourceRef[0].downloadUrl) -Headers (Headers) -OutFile $uploadedScene
-    Write-Host 'Vom Benutzer festgelegtes Shot-Referenzfoto wird als Szenenführung verwendet.' -ForegroundColor Cyan
-    $sceneKeyframe=$uploadedScene
-  } elseif(Test-Path -LiteralPath $approvedKeyframe){
-    Write-Host ("Geprueften Keyframe wiederverwenden: {0}" -f $approvedKeyframe) -ForegroundColor Cyan
-    $sceneKeyframe=$approvedKeyframe
-  } else {
-    $sceneKeyframe=$null
-    for($attempt=0;$attempt -lt 3 -and -not $sceneKeyframe;$attempt++){
-      $attemptSeed=[int]$shot.seed + $attempt*104729
-      $candidate=Invoke-ZImage $keyframePrompt ("framecut-v2/scene-job-{0}-try-{1}" -f [int]$job.id,$attempt) $attemptSeed $photoSteps ($negativePrompt + ', duplicate character, cloned person, twin, duplicate vehicle, duplicate bus, duplicate excavator, duplicate robot, white studio background, product card')
-      if(Test-KeyframeHasWhiteStudioBackground $candidate){Write-Host ("Keyframe-Versuch {0} verworfen: weißer Studio-/Referenzhintergrund." -f ($attempt+1)) -ForegroundColor Yellow;continue}
-      $sceneKeyframe=$candidate
-    }
-    if(-not $sceneKeyframe){throw 'Kein verwendbarer Keyframe: alle Versuche enthielten einen weißen Referenz-/Studiohintergrund.'}
-  }
-  Copy-Item -LiteralPath $sceneKeyframe -Destination (Join-Path $jobRoot 'scene-keyframe.png') -Force
-  # Real identity pictures are semantic Ref2VA inputs. The generated scene keyframe remains a
-  # separate frame-0 guide in render_shot.py, so portraits/contact sheets cannot become the clip's
-  # visible first frame.
+  # A new immutable contract and fresh downloads for EVERY job. No text-only
+  # keyframe, name matching, first-nine truncation or legacy approved-keyframe cache.
+  $contract=$payload.sceneContract
+  if(-not $contract -or [int]$contract.version -ne 4){throw 'Server/Worker inkompatibel: Szenenvertrag v4 fehlt.'}
   $cleanRefs=@()
-  $referenceDirectives=@()
-  if($useH3ReferenceConditioning){
-    $pictureNumber=0
-    foreach($item in @($visualRefs|Select-Object -First 9)){
-      $pictureNumber++
-      $localRef=Join-Path $jobRoot ("identity-{0}" -f [int]$item.id)
-      Invoke-WebRequest -Uri ($config.ServerUrl+$item.downloadUrl) -Headers (Headers) -OutFile $localRef
-      $cleanRefs+=$localRef
-      $measurements=@()
-      if($null -ne $item.age_years -and [string]$item.age_years -ne ''){$measurements += "age $($item.age_years) years"}
-      if($null -ne $item.height_cm -and [string]$item.height_cm -ne ''){$measurements += "height $($item.height_cm) cm"}
-      $physical=if($measurements.Count){" Physical scale: $($measurements -join ', ')."}else{''}
-      $referenceDirectives += ("<Picture {0}> is the sole identity reference for {1}. Show {1} exactly once. Preserve the same face, age, hairstyle, clothing, colors, body proportions and distinguishing features; do not copy the reference background or pose.{2}" -f $pictureNumber,$item.name,$physical)
+  $pictureNumber=0
+  if($useH3ReferenceConditioning -and $contract.rawReferenceImages -eq $true){
+    foreach($item in @($contract.references)){
+      foreach($photo in @($item.photos)){
+        $pictureNumber++
+        $localRef=Join-Path $jobRoot ("reference-{0}-{1}.png" -f $pictureNumber,[guid]::NewGuid().ToString('N'))
+        Invoke-WebRequest -Uri ($config.ServerUrl+$photo.downloadUrl) -Headers (Headers) -OutFile $localRef
+        $actualHash=Get-Sha256Hex $localRef
+        if($actualHash -ne [string]$photo.sha256){throw 'Referenzfoto wurde während des Downloads verändert. Auftrag bitte neu starten.'}
+        $cleanRefs+=$localRef
+      }
     }
+  } else { Write-Host 'Roh-Referenzbilder sind für MiniMax deaktiviert; es wird nur der vollflächige Szenenguide animiert.' -ForegroundColor Cyan }
+  if($cleanRefs.Count -gt 9){throw 'Mehr als 9 Referenzfotos: Szene aufteilen; keine Referenzen werden ausgelassen.'}
+  foreach($warning in @($contract.warnings)){Write-Host $warning -ForegroundColor Yellow}
+  $sceneKeyframe=$null
+  if($cleanRefs.Count -eq 0 -or $config.UseGeneratedSceneGuide -ne $false){
+    # H3 Ref2VA must receive a separate composition guide. Without it the first
+    # semantic reference can become frame 0 (character sheet/contact-sheet bug).
+    # The keyframe establishes composition and the project look. Identity remains
+    # controlled by H3's freshly downloaded reference photos, never by embedding a
+    # reference card as frame zero. Keep audio instructions out of this still-image
+    # prompt, but always retain the locked episode style.
+    $guidePrompt = Get-SharedSceneGuidePrompt $contract $shot
+    # A guide controls framing only; it is deliberately low-resolution and quick.
+    # H3 receives the real reference photos independently and renders the final
+    # preview/final resolution, so this does not trade away character fidelity.
+    $guideNegative=(@([string]$job.negative_prompt,'character sheet','model sheet','reference image','turnaround','split screen','collage','portrait insert','white studio panel','white background','border','cutout')|Where-Object {$_}) -join ', '
+    $sceneKeyframe=$null
+    for($guideAttempt=1;$guideAttempt -le 3;$guideAttempt++){
+      $guideSeed=[int]$shot.seed+(($guideAttempt-1)*7919)
+      # Episode quality settings (empty = proven defaults: 4 steps, cfg 1.0).
+      $guideSteps=if($job.guide_steps){[int]$job.guide_steps}else{4}
+      $guideCfg=if($job.guide_cfg){[double]$job.guide_cfg}else{1.0}
+      $candidate=Invoke-ZImage $guidePrompt ("framecut-v2/scene-job-{0}" -f [int]$job.id) $guideSeed $guideSteps $guideNegative 512 320 $guideCfg
+      if(-not (Test-KeyframeHasWhiteStudioBackground $candidate)){$sceneKeyframe=$candidate;break}
+      Write-Host ("Szenenguide Versuch {0}/3 enthielt eine Referenzkarte; neuer Guide wird erzeugt ..." -f $guideAttempt) -ForegroundColor Yellow
+      Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+    }
+    if(-not $sceneKeyframe){throw 'Szenenguide enthält nach drei Versuchen noch einen weißen Referenzhintergrund; bitte Szenenprompt oder Referenzen prüfen.'}
   }
   Free-Models $config.ComfyUrl
   Stop-OwnedComfy
   Ensure-H3
   $promptFile=Join-Path $jobRoot 'prompt.txt'
-  $conditioning='The supplied frame-0 guide defines only the exact full-screen composition and opening moment.'
-  $identityNote=if($cleanRefs.Count -gt 0){' '+($referenceDirectives -join ' ')+' Never display a reference sheet, portrait background, white studio backdrop, split screen or contact sheet.'}else{' The supplied opening frame is the sole visual identity source; preserve every depicted face, hairstyle, outfit, prop and environment exactly.'}
-  $fullPrompt=("{0}{1} {2} Camera: {3}. One continuous unbroken shot, no edit, no cut, no sudden viewpoint change. Show exactly one instance of each named character unless the stated action explicitly requires more; never add, clone, replace or merge people. {4} {5} Project style: {6}. The audio track is discarded after rendering, so audio content does not matter." -f $conditioning,$identityNote,$shot.prompt,$shot.camera,$teslaRule,$negativeRule,$job.style_profile)
-  Set-Content -LiteralPath $promptFile -Value $fullPrompt -Encoding utf8
+  [IO.File]::WriteAllText($promptFile,[string]$contract.prompt,(New-Object Text.UTF8Encoding($false)))
+  $contract|ConvertTo-Json -Depth 15|Set-Content -LiteralPath (Join-Path $jobRoot 'scene-contract.json') -Encoding utf8
   $outputDir=Join-Path $runtimeRoot ("outputs-v2\project-{0}\episode-{1}" -f $job.project_id,$job.episode_number);New-Item -ItemType Directory -Force -Path $outputDir|Out-Null
   # H3 only accepts 5 + 17n frames. Round() created clips shorter than the authored shot
   # (for example 4.0s became 3.75s). Ceiling keeps the production timeline conservative:
@@ -674,15 +903,66 @@ function Process-Job($payload) {
   $isPreview = $shot.render_tier -eq 'Vorschau'
   $renderWidth = if ($isPreview) { if($job.preview_width){[int]$job.preview_width}else{384} } else { if($job.final_width){[int]$job.final_width}else{768} }
   $renderHeight = if ($isPreview) { if($job.preview_height){[int]$job.preview_height}else{224} } else { if($job.final_height){[int]$job.final_height}else{448} }
-  $videoSteps = if($job.video_steps){[int]$job.video_steps}else{4}
+  $videoSteps = if($job.video_steps){[int]$job.video_steps}elseif($isPreview){4}else{10}
   Write-Host ("Qualitaet: {0} ({1}x{2}, {3} Steps)" -f $shot.render_tier,$renderWidth,$renderHeight,$videoSteps) -ForegroundColor DarkCyan
-  $renderArgs=@($renderClient,'--base-url',$config.H3Url,'--image',(Join-Path $jobRoot 'scene-keyframe.png'),'--prompt-file',$promptFile,'--output-dir',$outputDir,'--name',$name,'--width',[string]$renderWidth,'--height',[string]$renderHeight,'--frames',[string]$frames,'--steps',[string]$videoSteps,'--seed',[string]([int]$shot.seed),'--low-vram')
-  if($useH3ReferenceConditioning){
-    foreach($refPath in $cleanRefs){ $renderArgs += @('--reference-image',$refPath) }
+  # Lip sync: the shot's finished Qwen dialogue is placed at its offsets and handed to H3
+  # as an audio guide, so mouths follow the real voice instead of invented speech.
+  $promptText=[string]$contract.prompt
+  $noAudioLine='One continuous shot; no cuts. Do not generate dialogue, narration or music. Production audio is created and quality-checked separately.'
+  # Guides are either spoken lines (lip sync) or, for a shot without dialogue, the shot's
+  # own scene sound so H3 has no silent gap to fill with invented speech.
+  $guideLines=@($payload.dialogueAudio | Where-Object { $_ -and $_.downloadUrl })
+  $dialogueLines=@($guideLines | Where-Object { [string]$_.kind -ne 'ambience' })
+  $speechGuide=$null
+  $fittedSeconds=$null
+  if($guideLines.Count -gt 0 -and $ffmpegExe){
+    $guideInputs=@();$guideFilters=@();$labels='';$n=0;$speechEnd=0.0
+    foreach($line in $guideLines){
+      $local=Join-Path $jobRoot ("dialogue-{0}.wav" -f $n)
+      Invoke-WebRequest -Uri ($config.ServerUrl+$line.downloadUrl) -Headers (Headers) -OutFile $local
+      $lineSeconds=Get-ClipDurationSeconds $local
+      if([string]$line.kind -ne 'ambience' -and $null -ne $lineSeconds){$speechEnd=[Math]::Max($speechEnd,([double]$line.offset_ms/1000)+$lineSeconds)}
+      $guideInputs+=@('-i',$local)
+      $guideFilters+=("[{0}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={1}|{1}[d{0}]" -f $n,[int]$line.offset_ms)
+      $labels+="[d$n]";$n++
+    }
+    # H3 invents further speech for any part of the clip without a supplied voice, so a
+    # dialogue shot ends shortly after its last word (on the 17k+5 frame grid).
+    if($speechEnd -gt 0){
+      $fitFrames=5+(17*[Math]::Max(1,[Math]::Ceiling((($speechEnd+0.45)*24-5)/17)))
+      if($fitFrames -lt $frames){
+        Write-Host ("Dialog-Shot auf Satzlaenge gekuerzt: {0:N2}s -> {1:N2}s" -f ([double]$frames/24),([double]$fitFrames/24)) -ForegroundColor Cyan
+        $frames=$fitFrames;$fittedSeconds=[double]$fitFrames/24
+      }
+    }
+    $clipText=([double]$frames/24).ToString([Globalization.CultureInfo]::InvariantCulture)
+    $speechGuide=Join-Path $jobRoot 'speech-guide.wav'
+    $guideFilter=($guideFilters -join ';')+(";{0}amix=inputs={1}:normalize=0:duration=longest,apad=whole_dur={2},atrim=duration={2}[g]" -f $labels,$n,$clipText)
+    & $ffmpegExe -y -loglevel error @guideInputs -filter_complex $guideFilter -map '[g]' -ar 48000 -ac 2 $speechGuide 2>&1|Out-Null
+    if($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $speechGuide)){
+      Write-Warning 'Sprachfuehrung konnte nicht erstellt werden; Clip wird ohne Lippensynchronisierung gerendert.'
+      $speechGuide=$null;$fittedSeconds=$null
+    } elseif($dialogueLines.Count -eq 0) {
+      $promptText=$promptText.Replace($noAudioLine,'One continuous shot; no cuts.')+' Nobody speaks in this shot: every character keeps the mouth closed, no talking, no lip movement. The only sound is the provided natural scene ambience and effects.'
+      Write-Host 'Stummer Shot: Szenenton fuehrt H3 (keine erfundene Sprache).' -ForegroundColor Cyan
+    } else {
+      $spoken=($dialogueLines|ForEach-Object { if([string]$_.speaker){'{0} says in German: "{1}"' -f $_.speaker,$_.text}else{'A voice says in German: "{0}"' -f $_.text} }) -join ' Then '
+      $speakers=(@($dialogueLines|ForEach-Object{[string]$_.speaker}|Where-Object{$_}|Select-Object -Unique) -join ' and ')
+      if(-not $speakers){$speakers='the speaker'}
+      $promptText=$promptText.Replace($noAudioLine,'One continuous shot; no cuts.')+(" DIALOGUE, lip-synchronised to the provided speech audio: {0} Only {1} moves the lips, exactly in time with the words; every other character keeps the mouth closed. When the words end, the mouth closes. No music, no other voices." -f $spoken,$speakers)
+      Write-Host ("Lippensynchron: {0} Dialogzeile(n) fuehren H3 ({1})." -f $dialogueLines.Count,$speakers) -ForegroundColor Cyan
+    }
+  } else {
+    $promptText+=' Nobody speaks in this shot: every character keeps the mouth closed, no talking, no lip movement.'
+  }
+  [IO.File]::WriteAllText($promptFile,$promptText,(New-Object Text.UTF8Encoding($false)))
+  $renderArgs=@($renderClient,'--base-url',$config.H3Url,'--prompt-file',$promptFile,'--output-dir',$outputDir,'--name',$name,'--width',[string]$renderWidth,'--height',[string]$renderHeight,'--frames',[string]$frames,'--steps',[string]$videoSteps,'--seed',[string]([int]$shot.seed),'--low-vram')
+  if($sceneKeyframe){$renderArgs += @('--image',$sceneKeyframe)}
+  if($speechGuide){$renderArgs += @('--guide-audio',$speechGuide)}
+  foreach($refPath in $cleanRefs){$renderArgs += @('--reference-image',$refPath)}
+  if($cleanRefs.Count -gt 0){
     $renderArgs += @('--reference-image-size',$h3ReferenceImageSize)
-    if($cleanRefs.Count -gt 0){ Write-Host ("H3-Referenzmodus aktiv: {0} Bild(er)" -f $cleanRefs.Count) -ForegroundColor DarkCyan }
-  } elseif($visualRefs.Count -gt 0) {
-    Write-Host 'H3 bleibt im stabilen Bildstart-Modus; Besetzungsbilder steuern den Keyframe, nicht den ersten Videoframe.' -ForegroundColor DarkCyan
+    Write-Host ("Referenzgeführte Szene ohne falsches Text-Startbild: {0} Fotos" -f $cleanRefs.Count) -ForegroundColor Cyan
   }
   $renderTimeout=if($config.RenderTimeoutSeconds){[Math]::Max(300,[int]$config.RenderTimeoutSeconds)}else{1800}
   Invoke-BoundedPython $renderArgs $renderTimeout 'MiniMax H3'
@@ -692,7 +972,7 @@ function Process-Job($payload) {
   # clip is delivered silent. Dialogue, SFX and score are meant to be added as separate layers.
   if($stripAudio){
     $silent=Join-Path $jobRoot 'render-silent.mp4'
-    & $ffmpegExe -y -loglevel error -i $result.FullName -c:v copy -an $silent 2>&1 | Out-Null
+    & $ffmpegExe -y -loglevel error -i $result.FullName -f lavfi -i anullsrc=r=48000:cl=stereo -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 128k -shortest $silent 2>&1 | Out-Null
     if($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $silent)){
       $result=Get-Item -LiteralPath $silent
       Write-Host 'Tonspur entfernt (stumm ausgeliefert).' -ForegroundColor DarkCyan
@@ -701,7 +981,10 @@ function Process-Job($payload) {
     }
   }
   $actualDuration=Get-ClipDurationSeconds $result.FullName
-  Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/video" -Headers (Headers) -ContentType 'video/mp4' -InFile $result.FullName | Out-Null
+  $videoHeaders=Headers
+  $videoHeaders['x-framecut-scene-fingerprint']=[string]$contract.fingerprint
+  if($fittedSeconds -and $actualDuration){$videoHeaders['x-framecut-fitted-seconds']=([Math]::Round([double]$actualDuration,3)).ToString([Globalization.CultureInfo]::InvariantCulture)}
+  Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/video" -Headers $videoHeaders -ContentType 'video/mp4' -InFile $result.FullName | Out-Null
   if($null -ne $actualDuration){
     $requestedDuration=[double]$shot.duration_seconds
     $delta=[Math]::Abs($actualDuration-$requestedDuration)
@@ -757,7 +1040,8 @@ Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
 $Host.UI.RawUI.WindowTitle='FrameCut Worker - aktiv'
 Set-Awake $true
 Write-Host 'FrameCut Worker ist aktiv. Der Computer bleibt wach; der Bildschirm darf sich ausschalten.' -ForegroundColor Red
-Write-Host ("Server: {0} | Worker: {1}" -f $config.ServerUrl,$config.WorkerId) -ForegroundColor Gray
+Write-Host ("Server: {0} | Worker: {1} | Version: {2}" -f $config.ServerUrl,$config.WorkerId,$workerVersion) -ForegroundColor Gray
+Report-WorkerVersion
 try {
   do {
     if(Test-Path -LiteralPath $stopPath){break}
@@ -766,6 +1050,11 @@ try {
     # or vendor power-management software, but both together keep a remote render host awake.
     Set-Awake $true
     try {
+      # Updates are only considered before a job is claimed, therefore a render is
+      # never interrupted. The detached updater waits for this process to exit,
+      # verifies the server-provided SHA-256 and relaunches the worker.
+      $pendingUpdate=Get-PendingWorkerUpdate
+      if($pendingUpdate){Start-WorkerUpdate $pendingUpdate;break}
       Invoke-ExpiredWorkspaceCleanup
       if (Test-WorkerStorageAvailable) {
         $payload=Invoke-RestMethod -Method Get -Uri "$($config.ServerUrl)/api/worker/next" -Headers (Headers)

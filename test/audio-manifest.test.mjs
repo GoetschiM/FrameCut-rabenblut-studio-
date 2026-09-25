@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { audioPreflight, createEpisodeAudioManifest, validateAudioManifest } from '../lib/audio-manifest.mjs';
+import { AUDIO_PIPELINE_VERSION, audioPreflight, createEpisodeAudioManifest, reconcileAudioManifest, validateAudioManifest } from '../lib/audio-manifest.mjs';
 
 const shots = [
   { id: 10, sequence: 1, duration_seconds: 4 },
@@ -44,6 +44,28 @@ test('does not fabricate narration when the direction explicitly excludes it', (
   assert.equal(manifest.auto_narration_fallback, false);
 });
 
+test('converts legacy native MiniMax dialogue into external reviewable cues', () => {
+  const nativeShots = [{ id: 10, sequence: 1, duration_seconds: 5, title: 'Opi bleibt gelassen', audio_direction_json: JSON.stringify({ mode: 'native' }) }];
+  const manifest = createEpisodeAudioManifest({ ownerId: 1, projectId: 2, episodeId: 3, shots: nativeShots, dialogue: [
+    { id: 1, shot_id: 10, asset_id: 7, sequence: 1, text: 'Ich kümmere mich darum.' },
+  ], includeNarrationFallback: true });
+  assert.equal(manifest.cues.filter(cue => cue.kind === 'dialogue').length, 1);
+  assert.equal(manifest.cues.filter(cue => cue.kind === 'sfx').length, 0);
+  assert.equal(manifest.auto_narration_fallback, false);
+});
+
+test('rejects embedded MiniMax audio as a substitute for reviewable cues', () => {
+  const manifest = createEpisodeAudioManifest({ ownerId: 1, projectId: 2, episodeId: 3, shots: [], dialogue: [] });
+  const report = audioPreflight(manifest, {
+    expectedSourceRevision: manifest.source_revision,
+    embeddedAudioExpected: true,
+    mixingWorkerAvailable: false,
+  });
+  assert.equal(report.cuesReady, false);
+  assert.equal(report.readyForMaster, false);
+  assert.match(report.blockers.join(' '), /keine Audio-Cues/i);
+});
+
 test('reports a draft as blocked instead of silently accepting it as a master', () => {
   const manifest = createEpisodeAudioManifest({ ownerId: 1, projectId: 2, episodeId: 3, shots, dialogue });
   const report = audioPreflight(manifest, { expectedSourceRevision: manifest.source_revision, mixingWorkerAvailable: false });
@@ -58,4 +80,33 @@ test('detects a changed shot or dialogue source revision', () => {
   assert.equal(report.sourceCurrent, false);
   assert.equal(report.readyForMaster, false);
   assert.match(report.blockers.join(' '), /geändert/);
+});
+
+test('upgrades a legacy partial plan, restores dialogue, and preserves only identical ready audio', () => {
+  const generated = createEpisodeAudioManifest({ ownerId:1, projectId:2, episodeId:3, shots, dialogue });
+  const old = {
+    ...structuredClone(generated), audio_pipeline_version:1,
+    cues:[
+      { ...generated.cues[0], state:'ready', artifact:{path:'data/uploads/voice.wav'} },
+      { id:'manual-music', kind:'music', state:'ready', start_ms:0, target_duration_ms:10_000, gain_db:-22, prompt:'instrumental only', artifact:{path:'data/uploads/music.wav'} },
+    ],
+    mix:{state:'ready',artifact:{path:'data/uploads/obsolete.mp4'}},
+  };
+  const upgraded = reconcileAudioManifest(generated, old);
+  assert.equal(upgraded.audio_pipeline_version, AUDIO_PIPELINE_VERSION);
+  assert.equal(upgraded.cues.find(cue => cue.id === generated.cues[0].id).state, 'ready');
+  assert.equal(upgraded.cues.find(cue => cue.id === generated.cues[1].id).state, 'pending');
+  assert.equal(upgraded.cues.find(cue => cue.id === 'manual-music').state, 'ready');
+  assert.equal(upgraded.mix, undefined);
+});
+
+test('performance direction changes invalidate an old voice artifact', () => {
+  const directedShots = [{ id:10, sequence:1, duration_seconds:4, audio_direction_json:JSON.stringify({emotion:'panisch',delivery:'schnell und laut'}) }];
+  const generated = createEpisodeAudioManifest({ ownerId:1, projectId:2, episodeId:3, shots:directedShots, dialogue:[dialogue[1]] });
+  const old = structuredClone(generated);
+  old.cues[0].performance_direction = 'ruhig';
+  old.cues[0].state = 'ready'; old.cues[0].artifact = {path:'data/uploads/old.wav'};
+  const upgraded = reconcileAudioManifest(generated, old);
+  assert.equal(upgraded.cues[0].state, 'pending');
+  assert.equal(upgraded.cues[0].artifact, undefined);
 });

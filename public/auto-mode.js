@@ -2,8 +2,34 @@
 (() => {
   const $ = selector => document.querySelector(selector);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const BUILTIN_STYLES={noir:'Original adult supernatural ink-noir comic. Dense hand-drawn black crosshatching, crushed charcoal shadows, restrained blood-red accents, wet reflective environments, printed halftone texture, dramatic negative space. Cinematic 16:9 composition, strong silhouettes, consistent anatomy and costumes. No white backgrounds, no glossy 3D look, no typography, logos or watermarks.',cinema:'Grounded cinematic realism, natural skin and materials, controlled practical lighting, subtle film grain, consistent production design, 16:9 framing, realistic camera inertia and physical motion. No plastic CGI look, no text, logos or watermarks.',graphic:'Original high-contrast graphic novel illustration, bold brush inks, angular shadows, limited color palette, tactile paper grain, expressive perspective, consistent character model sheets, cinematic widescreen staging. No photorealism, no 3D render, no text or logos.',anime:'Original mature animated action style, clean expressive linework, controlled cel shading, dramatic perspective, readable silhouettes, consistent character proportions, purposeful speed lines only during action, cinematic 16:9 staging. No text, logos or watermarks.'};
+
+  async function decorateEpisodeStyleLibrary() {
+    const form=$('#episode-settings-form');
+    if(!form || form.dataset.styleLibraryReady==='1') return;
+    form.dataset.styleLibraryReady='1';
+    const preset=$('#episode-style-preset'),styleBox=form.elements.styleProfile,saveBtn=$('#episode-save-style-preset'),updateBtn=$('#episode-update-style-preset'),deleteBtn=$('#episode-delete-style-preset'),status=$('#episode-style-library-notice');
+    let savedStyles=[];
+    const option=(value,label)=>`<option value="${esc(value)}">${esc(label)}</option>`;
+    const renderOptions=()=>{
+      const current=preset.value;
+      preset.innerHTML=`${option('custom','Eigene Stilbeschreibung')}<optgroup label="Mitgelieferte Vorlagen">${option('noir','Düsterer Ink-Noir-Comic')}${option('cinema','Realistischer Kinofilm')}${option('graphic','Kontrastreicher Graphic Novel')}${option('anime','Dynamische Anime-Inszenierung')}</optgroup>${savedStyles.length?`<optgroup label="Meine gespeicherten Stile">${savedStyles.map(item=>option(`saved:${item.id}`,item.name)).join('')}</optgroup>`:''}`;
+      const matching=savedStyles.find(item=>item.description===styleBox.value.trim());
+      preset.value=savedStyles.some(item=>`saved:${item.id}`===current)?current:(matching?`saved:${matching.id}`:'custom');
+    };
+    const selected=()=>preset.value.startsWith('saved:')?savedStyles.find(item=>item.id===Number(preset.value.slice(6))):null;
+    const sync=()=>{const item=selected();updateBtn.hidden=!item;deleteBtn.hidden=!item;};
+    try { savedStyles=(await api('/api/style-presets')).presets||[]; renderOptions(); status.textContent='Stilvorlagen gelten erst nach „Speichern“ für diese Episode.'; }
+    catch(error) { status.textContent=`Stilbibliothek konnte nicht geladen werden: ${error.message}`; }
+    preset.onchange=()=>{const item=selected();if(item)styleBox.value=item.description;else if(BUILTIN_STYLES[preset.value])styleBox.value=BUILTIN_STYLES[preset.value];sync();};
+    saveBtn.onclick=async()=>{const description=styleBox.value.trim();if(!description)return notice('Schreibe zuerst eine Stilbeschreibung.');const name=prompt('Name für die neue Stilvorlage:');if(!name?.trim())return;try{const result=await api('/api/style-presets',{method:'POST',body:JSON.stringify({name:name.trim(),description})});savedStyles.push(result.preset);renderOptions();preset.value=`saved:${result.preset.id}`;sync();status.textContent=`Stil „${result.preset.name}“ gespeichert. Jetzt Episoden-Einstellungen speichern.`;notice(`Stil „${result.preset.name}“ gespeichert.`);}catch(error){status.textContent=`Stil konnte nicht gespeichert werden: ${error.message}`;}};
+    updateBtn.onclick=async()=>{const item=selected(),description=styleBox.value.trim();if(!item||!description)return;try{const result=await api(`/api/style-presets/${item.id}`,{method:'PATCH',body:JSON.stringify({description})});Object.assign(item,result.preset);status.textContent=`Stil „${item.name}“ aktualisiert.`;notice(`Stil „${item.name}“ aktualisiert.`);}catch(error){status.textContent=`Stil konnte nicht aktualisiert werden: ${error.message}`;}};
+    deleteBtn.onclick=async()=>{const item=selected();if(!item||!confirm(`Stil „${item.name}“ wirklich löschen?`))return;try{await api(`/api/style-presets/${item.id}`,{method:'DELETE'});savedStyles=savedStyles.filter(x=>x.id!==item.id);renderOptions();preset.value='custom';sync();status.textContent='Stilvorlage gelöscht. Die aktuelle Beschreibung bleibt für diese Episode erhalten.';notice(`Stil „${item.name}“ gelöscht.`);}catch(error){status.textContent=`Stil konnte nicht gelöscht werden: ${error.message}`;}};
+    sync();
+  }
 
   function decorateStory() {
+    decorateEpisodeStyleLibrary();
     const actions = $('#view-story .section-lead > div:last-child') || $('#view-story div[style*="display:flex"] > div:last-child');
     if (!actions || $('#auto-plan')) return;
     const button = document.createElement('button');
@@ -71,14 +97,46 @@
   async function renderWorkers() {
     const panel = $('#workers-panel'); if (!panel) return;
     try {
-      const { workers } = await api('/api/workers');
+      const [{ workers }, release] = await Promise.all([
+        api('/api/workers'),
+        api('/api/worker/installer/manifest').catch(() => null),
+      ]);
       if (!workers.length) { panel.innerHTML = '<p class="upload-note">Noch kein zusätzlicher Worker registriert. Über „Worker verbinden“ erzeugst du einen einmaligen Code für den Installer.</p>'; return; }
-      panel.innerHTML = workers.map(worker => {
+      const onlineCount = workers.filter(worker => {
+        const pollAge = worker.last_poll_at ? Math.max(0, Math.round((Date.now() - new Date(worker.last_poll_at).getTime()) / 1000)) : null;
+        return Boolean(worker.activeJob) || (worker.status === 'ready' && pollAge !== null && pollAge < 100);
+      }).length;
+      panel.innerHTML = `<div class="service" style="margin-bottom:10px;"><span><b>Worker-Flotte</b><br><small>${onlineCount} von ${workers.length} online · Aufträge werden atomar und ohne Doppelvergabe verteilt.</small></span><span class="pill">${onlineCount} ONLINE</span></div>` + workers.map(worker => {
         const age = worker.last_seen ? Math.max(0, Math.round((Date.now() - new Date(worker.last_seen).getTime()) / 1000)) : null;
-        const online = age !== null && age < 100;
-        const state = worker.status === 'ready' ? (online ? 'bereit' : 'offline') : 'Runtime einrichten';
-        return `<div class="service"><span><b>${esc(worker.name || worker.id)}</b><br><small>${esc(worker.machine || 'unbekannter Rechner')} · ${esc(worker.gpu?.description || 'GPU nicht gemeldet')} · zuletzt ${age === null ? 'nie' : `vor ${age}s`}</small></span><span class="pill">${esc(state)}</span></div>`;
+        const pollAge = worker.last_poll_at ? Math.max(0, Math.round((Date.now() - new Date(worker.last_poll_at).getTime()) / 1000)) : null;
+        const connected = age !== null && age < 100;
+        const online = Boolean(worker.activeJob) || (worker.status === 'ready' && pollAge !== null && pollAge < 100);
+        const state = worker.status === 'ready' ? (online ? 'bereit' : (connected ? 'Worker nicht gestartet' : 'offline')) : 'Runtime einrichten';
+        const installed = worker.installer_version || 'unbekannt';
+        const current = release?.version || '';
+        const update = current && installed !== current;
+        const versionLabel = current
+          ? `Worker ${installed}${update ? ` · Update ${current} wartet` : ' · aktuell'}`
+          : `Worker ${installed}`;
+        const job = worker.activeJob;
+        const jobLabel = job ? ` · rendert: ${esc(job.label || 'Auftrag')}` : ' · kein Auftrag aktiv';
+        const requested = worker.update_requested_version ? ` · Update ${esc(worker.update_requested_version)} vorgemerkt` : '';
+        const updateButton = update ? `<button class="ghost" type="button" data-worker-update="${esc(worker.id)}">Update ${esc(current)} anfordern</button>` : '';
+        const lastSeen = worker.last_seen ? new Date(worker.last_seen).toLocaleString('de-CH',{dateStyle:'short',timeStyle:'medium'}) : 'noch nie';
+        const pollLabel = worker.last_poll_at ? new Date(worker.last_poll_at).toLocaleString('de-CH',{dateStyle:'short',timeStyle:'medium'}) : 'noch nie';
+        const runtime = worker.runtime || {};
+        const runtimeChecks = [['Pinokio',runtime.pinokio],['H3-App',runtime.h3App],['Ref2VA',runtime.h3RefModel],['FL2VA',runtime.h3FlModel],['Textmodell',runtime.h3TextEncoder],['Video-VAE',runtime.h3VideoVae],['Audio-VAE',runtime.h3AudioVae],['Turbo-LoRA',runtime.h3TurboLora],['FFmpeg',runtime.ffmpeg]];
+        const runtimeLabel = Object.keys(runtime).length ? runtimeChecks.map(([label,ok]) => `${ok ? '✓' : '✕'} ${label}`).join(' · ') : 'Runtime-Details werden nach dem Start des aktuellen Workers gemeldet.';
+        return `<div class="service" style="align-items:flex-start;gap:12px;"><span><b>${esc(worker.name || worker.id)}</b><br><small>${esc(worker.machine || 'unbekannter Rechner')} · ${esc(worker.os || 'OS unbekannt')} ${esc(worker.architecture || '')} · ${esc(worker.gpu?.description || 'GPU nicht gemeldet')}<br>${esc(versionLabel)}${jobLabel}${requested}<br>${esc(runtimeLabel)}<br>Letzter Kontakt: ${esc(lastSeen)}${age === null ? '' : ` · vor ${age}s`}<br>Letzter Queue-Abruf: ${esc(pollLabel)}${pollAge === null ? '' : ` · vor ${pollAge}s`}</small></span><span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;"><span class="pill">${esc(update ? (worker.update_requested_version ? 'Update vorgemerkt' : 'Update bereit') : state)}</span>${updateButton}</span></div>`;
       }).join('');
+      panel.querySelectorAll('[data-worker-update]').forEach(button => button.onclick = async () => {
+        button.disabled = true;
+        try {
+          const result = await api(`/api/workers/${encodeURIComponent(button.dataset.workerUpdate)}/update`, { method:'POST', body:'{}' });
+          notice(result.alreadyCurrent ? `Worker ist bereits auf Version ${result.version}.` : `Update ${result.version} vorgemerkt. Es startet automatisch, sobald der Worker keinen Auftrag mehr bearbeitet.`);
+          await renderWorkers();
+        } catch (err) { notice(`Worker-Update konnte nicht vorgemerkt werden: ${err.message}`); button.disabled = false; }
+      });
     } catch (err) { panel.innerHTML = `<p class="upload-note">Worker konnten nicht geladen werden: ${esc(err.message)}</p>`; }
   }
 
@@ -86,7 +144,7 @@
     showModal(`<h3>GPU-Worker verbinden</h3><form><p class="upload-note">Dieser einmalige Code wird nur auf dem Render-PC im FrameCut-Installer eingegeben. Er ist nach Ablauf oder nach der ersten Verwendung ungültig.</p><label>Gültigkeit in Minuten<input name="expiresMinutes" type="number" min="5" max="1440" value="30"></label><p id="modal-error" class="error"></p><button class="form-button">Code erzeugen</button></form>`, async form => {
       const values = Object.fromEntries(new FormData(form));
       const result = await api('/api/workers/join-codes', { method:'POST', body:JSON.stringify(values) });
-      form.innerHTML = `<p class="eyebrow">EINMALIGER JOIN-CODE</p><output style="display:block;font:700 22px var(--font-mono);letter-spacing:.08em;padding:14px;background:var(--bg-elevated);border:1px solid var(--line);border-radius:8px;user-select:all;">${esc(result.code)}</output><p class="upload-note">Gültig bis ${esc(new Date(result.expiresAt).toLocaleString('de-CH'))}. Starte auf dem Render-PC <code>Install-FrameCutWorker.bat</code> und gib genau diesen Code ein.</p><button type="button" class="form-button" id="copy-worker-code">Code kopieren</button>`;
+      form.innerHTML = `<p class="eyebrow">EINMALIGER JOIN-CODE</p><output style="display:block;font:700 22px var(--font-mono);letter-spacing:.08em;padding:14px;background:var(--bg-elevated);border:1px solid var(--line);border-radius:8px;user-select:all;">${esc(result.code)}</output><p class="upload-note">Gültig bis ${esc(new Date(result.expiresAt).toLocaleString('de-CH'))}. Lade auf dem Render-PC zuerst den aktuellen Installer herunter, entpacke ihn, starte <code>Install-FrameCutWorker.bat</code> und gib genau diesen Code ein.</p><div style="display:flex;gap:8px;flex-wrap:wrap;"><a class="form-button" href="/api/worker/installer/bootstrap" download="FrameCut-Worker-Installer.zip" style="text-decoration:none;display:inline-flex;align-items:center;">Aktuellen Installer herunterladen</a><button type="button" class="ghost" id="copy-worker-code">Code kopieren</button></div>`;
       $('#copy-worker-code').onclick = async () => { await navigator.clipboard.writeText(result.code); notice('Join-Code kopiert.'); };
     });
   }
@@ -259,10 +317,9 @@
     };
     const provider=$('#modal [name=provider]'),model=$('#modal [name=model]'),preset=$('#modal [name=stylePreset]'),styleBox=$('#modal [name=styleProfile]'),saveStyle=$('#save-style-preset'),updateStyle=$('#update-style-preset'),deleteStyle=$('#delete-style-preset');
     provider.onchange=()=>{model.placeholder={gemini:'gemini-2.5-flash',openai:'gpt-4.1-mini',deepseek:'deepseek-chat'}[provider.value]};
-    const builtInStyles={noir:'Original adult supernatural ink-noir comic. Dense hand-drawn black crosshatching, crushed charcoal shadows, restrained blood-red accents, wet reflective environments, printed halftone texture, dramatic negative space. Cinematic 16:9 composition, strong silhouettes, consistent anatomy and costumes. No white backgrounds, no glossy 3D look, no typography, logos or watermarks.',cinema:'Grounded cinematic realism, natural skin and materials, controlled practical lighting, subtle film grain, consistent production design, 16:9 framing, realistic camera inertia and physical motion. No plastic CGI look, no text, logos or watermarks.',graphic:'Original high-contrast graphic novel illustration, bold brush inks, angular shadows, limited color palette, tactile paper grain, expressive perspective, consistent character model sheets, cinematic widescreen staging. No photorealism, no 3D render, no text or logos.',anime:'Original mature animated action style, clean expressive linework, controlled cel shading, dramatic perspective, readable silhouettes, consistent character proportions, purposeful speed lines only during action, cinematic 16:9 staging. No text, logos or watermarks.'};
     const selectedSavedStyle=()=>preset.value.startsWith('saved:')?savedStyles.find(item=>item.id===Number(preset.value.split(':')[1])):null;
     const syncStyleButtons=()=>{const selected=selectedSavedStyle();updateStyle.hidden=!selected;deleteStyle.hidden=!selected;};
-    preset.onchange=()=>{const selected=selectedSavedStyle();if(selected)styleBox.value=selected.description;else if(builtInStyles[preset.value])styleBox.value=builtInStyles[preset.value];syncStyleButtons();};
+    preset.onchange=()=>{const selected=selectedSavedStyle();if(selected)styleBox.value=selected.description;else if(BUILTIN_STYLES[preset.value])styleBox.value=BUILTIN_STYLES[preset.value];syncStyleButtons();};
     saveStyle.onclick=async()=>{const description=styleBox.value.trim();if(!description)return notice('Schreibe zuerst eine Stilbeschreibung.');const name=prompt('Name für die neue Stilvorlage:');if(!name?.trim())return;try{const result=await api('/api/style-presets',{method:'POST',body:JSON.stringify({name:name.trim(),description})});savedStyles.push(result.preset);const option=document.createElement('option');option.value=`saved:${result.preset.id}`;option.textContent=result.preset.name;let group=[...preset.querySelectorAll('optgroup')].find(item=>item.label==='Meine gespeicherten Stile');if(!group){group=document.createElement('optgroup');group.label='Meine gespeicherten Stile';preset.appendChild(group);}group.appendChild(option);preset.value=option.value;syncStyleButtons();notice(`Stil „${result.preset.name}“ gespeichert.`);}catch(err){notice(`Stil konnte nicht gespeichert werden: ${err.message}`);}};
     updateStyle.onclick=async()=>{const selected=selectedSavedStyle();if(!selected)return;const description=styleBox.value.trim();if(!description)return notice('Die Stilbeschreibung darf nicht leer sein.');try{const result=await api(`/api/style-presets/${selected.id}`,{method:'PATCH',body:JSON.stringify({description})});Object.assign(selected,result.preset);notice(`Stil „${selected.name}“ aktualisiert.`);}catch(err){notice(`Stil konnte nicht aktualisiert werden: ${err.message}`);}};
     deleteStyle.onclick=async()=>{const selected=selectedSavedStyle();if(!selected||!confirm(`Stil „${selected.name}“ wirklich löschen?`))return;try{await api(`/api/style-presets/${selected.id}`,{method:'DELETE'});savedStyles=savedStyles.filter(item=>item.id!==selected.id);preset.querySelector(`option[value="saved:${selected.id}"]`)?.remove();preset.value='custom';syncStyleButtons();notice(`Stil „${selected.name}“ gelöscht. Die aktuelle Beschreibung bleibt im Textfeld.`);}catch(err){notice(`Stil konnte nicht gelöscht werden: ${err.message}`);}};
@@ -287,11 +344,33 @@
       submit.innerHTML='<span class="pulse" style="display:inline-block;width:8px;height:8px;margin-right:6px;"></span> 2/2 Shots & Szenen werden angelegt (bitte warten)...';
       try {
         const useRequested=form.elements.durationChoice.value==='requested';
-        const plan=await api(`/api/auto-plans/${result.draftId}/commit`,{method:'POST',body:JSON.stringify({useRequested,replaceExisting})});
-        closeModal();
-        await load();
-        openView('shots');
-        notice(`Produktionsplan erfolgreich erstellt: ${plan.createdAssets} neue Elemente und ${plan.createdShots} editierbare Shots angelegt!`);
+        await api(`/api/auto-plans/${result.draftId}/commit`,{method:'POST',body:JSON.stringify({useRequested,replaceExisting})});
+        submit.innerHTML='<span class="pulse" style="display:inline-block;width:8px;height:8px;margin-right:6px;"></span> Shots werden serverseitig erstellt – du kannst diese Seite geöffnet lassen.';
+        const deadline=Date.now()+15*60*1000;
+        while(Date.now()<deadline){
+          await new Promise(resolve=>setTimeout(resolve,2000));
+          const status=await api(`/api/auto-plans/${result.draftId}`);
+          if(status.state==='fertig'){
+            // The plan belongs to one exact episode.  Pin the dashboard to it
+            // before reloading so a concurrent queue refresh cannot paint an
+            // older episode while the sidebar highlights the new one.
+            if (status.projectId) currentProject=Number(status.projectId);
+            if (status.episodeId) currentEpisode=Number(status.episodeId);
+            let audioPlanNote = '';
+            try {
+              const audioPlan = await api(`/api/episodes/${currentEpisode}/audio-auto-soundtrack`, { method:'POST', body:'{}' });
+              const sfxCount = audioPlan.added.filter(kind => kind === 'sfx').length;
+              audioPlanNote = ` Dialoge, Musik, Atmosphäre und ${sfxCount} Szenen-SFX wurden ebenfalls editierbar vorbereitet.`;
+            } catch (audioError) {
+              audioPlanNote = ` Der Bildplan ist fertig; Audio konnte noch nicht automatisch ergänzt werden: ${audioError.message}`;
+            }
+            closeModal();await load();openView('shots');
+            notice(`Produktionsplan erstellt: ${status.createdShots} Shots sind jetzt verfügbar.${audioPlanNote}`);
+            return;
+          }
+          if(status.state==='fehlgeschlagen')throw new Error(status.error||'Die KI konnte den Produktionsplan nicht fertigstellen.');
+        }
+        throw new Error('Die Planung läuft weiter im Hintergrund. Bitte in einer Minute aktualisieren – nicht erneut starten.');
       } catch (err) {
         submit.disabled = false;
         submit.textContent = 'Produktionsplan übernehmen & Shots generieren';

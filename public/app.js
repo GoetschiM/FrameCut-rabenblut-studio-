@@ -1,5 +1,9 @@
 const $ = s => document.querySelector(s);
 let data = {}, currentProject, currentEpisode, assetFilter = 'all', shotFilter = 'all', currentView = 'overview', renderQualityTier = 'Fertig', shotSearch = '', shotAssetFilter = 'all';
+const selectedShotIds = new Set();
+// A queue refresh may finish after the user has selected another episode.  Only
+// the newest dashboard request is allowed to paint the screen.
+let dashboardLoadRevision = 0;
 
 function syncUrl() {
   const params = new URLSearchParams();
@@ -14,8 +18,14 @@ function syncUrl() {
 }
 
 async function api(path, options = {}) {
-  const r = await fetch(path, { headers: { 'content-type': 'application/json' }, ...options });
-  const d = await r.json();
+  // Live render and worker status must never be served from a browser or tunnel cache.
+  const r = await fetch(path, { cache: 'no-store', headers: { 'content-type': 'application/json' }, ...options });
+  const raw = await r.text();
+  let d;
+  try { d = raw ? JSON.parse(raw) : {}; } catch {
+    const html = /<\s*!doctype\b|<\s*html\b/i.test(raw) || /text\/html/i.test(r.headers.get('content-type') || '');
+    throw new Error(html ? `Der Serverzugang lieferte eine HTML-Fehlerseite (HTTP ${r.status}). Der Auftrag läuft möglicherweise weiter; bitte nicht erneut starten.` : `Der Server lieferte keine lesbare Antwort (HTTP ${r.status}).`);
+  }
   if (!r.ok) throw new Error(d.error || 'Etwas ist schiefgelaufen.');
   return d;
 }
@@ -93,14 +103,19 @@ async function openStudio() {
 }
 
 async function load() {
+  const revision = ++dashboardLoadRevision;
   const q = new URLSearchParams();
   if (currentProject) q.set('projectId', currentProject);
   if (currentEpisode) q.set('episodeId', currentEpisode);
-  data = await api('/api/dashboard?' + q);
-  if (data.selected) {
-    currentProject = data.selected.project.id;
-    currentEpisode = data.selected.episode.id;
+  const nextData = await api('/api/dashboard?' + q);
+  if (revision !== dashboardLoadRevision) return;
+  data = nextData;
+  if (nextData.selected) {
+    currentProject = nextData.selected.project.id;
+    currentEpisode = nextData.selected.episode.id;
   }
+  const currentShotIds = new Set((nextData.selected?.shots || []).map(shot => shot.id));
+  for (const id of [...selectedShotIds]) if (!currentShotIds.has(id)) selectedShotIds.delete(id);
   render();
   syncUrl();
 }
@@ -124,12 +139,12 @@ function renderProjectSwitcher() {
   document.querySelectorAll('[data-switch-project]').forEach(btn => btn.onclick = () => {
     const id = Number(btn.dataset.switchProject);
     if (id === currentProject) return;
-    currentProject = id; currentEpisode = null; load();
+    selectedShotIds.clear(); currentProject = id; currentEpisode = null; load();
   });
   document.querySelectorAll('[data-switch-episode]').forEach(btn => btn.onclick = () => {
     const id = Number(btn.dataset.switchEpisode);
     if (id === currentEpisode) return;
-    currentEpisode = id; load();
+    selectedShotIds.clear(); currentEpisode = id; load();
   });
 }
 
@@ -152,7 +167,7 @@ function shotCard(s) {
   } else if (isQueued) {
     badge = `<div class="shot-badge queued">⏳ ${hasVideo ? 'NEU IN QUEUE' : 'QUEUE'}</div>`;
   } else if (isDone) {
-    badge = `<div class="shot-badge done"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> ${s.render_tier === 'Vorschau' ? 'VORSCHAU' : 'FERTIG'}</div>`;
+    badge = `<div class="shot-badge done"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> ${s.visual_review?.approved ? 'GEPRÜFT' : 'SICHTPRÜFUNG OFFEN'}</div>`;
   }
 
   const media = hasVideo
@@ -163,8 +178,10 @@ function shotCard(s) {
       </div>`;
 
   const refs = [...new Map((s.references || []).map(r => [r.id, r])).values()].map(r => `<span class="shot-tag">${esc(r.name)}</span>`).join('');
+  const sceneAudio = (s.audio_cues || []).map(c => `<div style="display:flex;align-items:center;gap:6px;margin-top:8px;"><span class="shot-tag">🔊 ${esc(c.kind === 'dialogue' ? 'Dialog' : c.kind === 'narration' ? 'Erzähler' : 'SFX')}</span><audio controls preload="none" src="${c.url}" style="height:28px;min-width:180px;max-width:100%;" aria-label="${esc(c.text || 'Audio dieser Szene')}"></audio></div>`).join('');
 
-  return `<article class="shot-card ${isDone ? 'is-done' : ''}">
+  return `<article class="shot-card ${isDone ? 'is-done' : ''} ${selectedShotIds.has(s.id) ? 'is-selected' : ''}" data-shot-card="${s.id}">
+    <label class="shot-select" title="Shot auswählen"><input type="checkbox" data-select-shot="${s.id}" aria-label="${esc(s.title)} auswählen" ${selectedShotIds.has(s.id) ? 'checked' : ''}><span></span></label>
     <div class="shot-card-media">
       ${badge}
       ${media}
@@ -172,11 +189,13 @@ function shotCard(s) {
     <div class="shot-card-content">
       <div class="shot-meta-top">
         <span class="shot-num">#${String(s.sequence || s.id).padStart(2, '0')}</span>
-        <span class="shot-timing">${Number(s.duration_seconds || s.frames / 24).toFixed(1)}s · Seed ${s.seed || 'auto'}</span>
+        <span class="shot-timing">${Number(s.duration_seconds || s.frames / 24).toFixed(1)}s · ${esc(s.render_tier || 'Vorschau')} · Seed ${s.seed || 'auto'}${s.completed_at ? ` · fertig ${new Date(s.completed_at).toLocaleString('de-CH',{dateStyle:'short',timeStyle:'short'})}` : s.created_at ? ` · angelegt ${new Date(s.created_at).toLocaleString('de-CH',{dateStyle:'short',timeStyle:'short'})}` : ''}</span>
       </div>
       <div class="shot-title">${s.kind === 'intro' ? '<span class="shot-tag" style="background:rgba(255,183,3,0.15);color:#ffb703;border-color:rgba(255,183,3,0.3);margin-right:6px;">🎬 INTRO</span>' : s.kind === 'outro' ? '<span class="shot-tag" style="background:rgba(255,183,3,0.15);color:#ffb703;border-color:rgba(255,183,3,0.3);margin-right:6px;">🎬 OUTRO</span>' : ''}${esc(s.title.replace(/^\d+[_–-]/, '').replaceAll('_', ' '))}</div>
       <p class="shot-prompt-preview">${esc(s.prompt || 'Noch kein Prompt hinterlegt.')}</p>
       <div class="shot-tags">${refs || '<span class="shot-tag" style="opacity:0.5;">Keine Referenzen</span>'}</div>
+      ${sceneAudio ? `<div class="shot-scene-audio"><small style="display:block;margin-top:10px;color:var(--text-muted);font-weight:600;">Audio dieser Szene</small>${sceneAudio}</div>` : ''}
+      ${hasVideo ? `<button class="shot-btn" data-review-shot="${s.id}" ${(isQueued || isRunning) ? 'disabled' : ''}>Clip prüfen und freigeben</button>` : ''}
       <div class="shot-actions">
         <button class="shot-btn" data-edit-shot="${s.id}">✏️ Bearbeiten</button>
         <button class="shot-btn render ${isDone ? 'is-done' : ''}" data-render-shot="${s.id}" ${(isQueued || isRunning) ? 'disabled' : ''}>${(isQueued || isRunning) ? '⏳ läuft bereits' : (hasVideo ? '🔄 Neu' : '🎬 Rendern')}</button>
@@ -232,9 +251,9 @@ function render() {
         </div>
       </div>
       <div class="hero-actions">
-        <button class="emerald-btn" id="hero-batch-render">
+        <button class="emerald-btn" id="hero-batch-render" ${openCount === 0 ? 'disabled title="Alle Shots dieser Episode sind bereits gerendert. Im Storyboard kannst du einzelne Shots markieren und neu rendern."' : ''}>
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-          <span>Render Pipeline starten</span>
+          <span>${openCount === 0 ? 'Alle Shots fertig' : `Render Pipeline starten (${openCount})`}</span>
         </button>
         <div style="display:flex;gap:8px;">
           <button class="icon-btn" style="flex:1;height:38px;font-size:12px;font-weight:600;" data-go="shots">Storyboard</button>
@@ -248,8 +267,6 @@ function render() {
     <button class="create-side" id="new-project-mobile">+ Neues Projekt</button>
     <div id="project-switcher-mobile"></div>
     ${heroHtml}
-
-    <div id="queue-status"></div>
 
     <div class="production-flow" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:24px;">
       <button data-go="story" class="shot-card" style="padding:14px;cursor:pointer;text-align:left;border-color:${story ? 'var(--emerald)' : 'var(--line)'};">
@@ -309,12 +326,28 @@ function render() {
     <details style="margin-top:16px;">
       <summary style="cursor:pointer;color:var(--text-dim);font-size:12px;font-family:var(--font-mono);">⚙️ Nur für diese Episode: Stil & Qualität überschreiben (sonst gilt der Projekt-Standard)</summary>
       <form id="episode-settings-form" style="margin-top:12px;padding:14px;background:var(--bg-card);border:1px solid var(--line);border-radius:var(--radius-md);">
+        <label>Stil-Grundlage<select id="episode-style-preset" name="stylePreset"><option value="custom">Eigene Stilbeschreibung</option></select><small>Wähle eine Vorlage oder einen gespeicherten Stil. Die Beschreibung darunter bleibt für diese Episode frei editierbar.</small></label>
         <label>Style-Prompt für diese Episode<textarea name="styleProfile" placeholder="Leer lassen = Projekt-Stil übernehmen">${esc(episode.style_profile || '')}</textarea></label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin:-4px 0 12px;">
+          <button class="ghost" type="button" id="episode-save-style-preset">+ Als neuen Stil speichern</button>
+          <button class="ghost" type="button" id="episode-update-style-preset" hidden>Gespeicherten Stil aktualisieren</button>
+          <button class="ghost" type="button" id="episode-delete-style-preset" hidden style="color:#ff6b6b;">Stil löschen</button>
+        </div>
+        <p id="episode-style-library-notice" class="upload-note">Lade Stilbibliothek …</p>
         <label>Negativ-Prompt für diese Episode<textarea name="negativePrompt" maxlength="2400" placeholder="Leer lassen = Projekt-Negativ-Prompt übernehmen">${esc(episode.negative_prompt || '')}</textarea><small>Zusätzliche Ausschlüsse für Keyframes und Videos, z. B. keine Schrift oder keine Fahrzeuge.</small></label>
         <div class="shot-modal-grid">
           <label>Foto-Steps<input name="photoSteps" type="number" min="1" max="40" placeholder="Projekt: ${project.photo_steps ?? 8}" value="${episode.photo_steps ?? ''}"></label>
           <label>Video-Steps<input name="videoSteps" type="number" min="1" max="40" placeholder="Projekt: ${project.video_steps ?? 4}" value="${episode.video_steps ?? ''}"></label>
         </div>
+        <div class="shot-modal-grid">
+          <label>Szenenbild-Steps<input name="guideSteps" type="number" min="1" max="40" placeholder="Standard: 4" value="${episode.guide_steps ?? ''}"></label>
+          <label>Szenenbild-CFG<input name="guideCfg" type="number" min="1" max="10" step="0.1" placeholder="Standard: 1.0" value="${episode.guide_cfg ?? ''}"></label>
+        </div>
+        <div class="shot-modal-grid">
+          <label>Audio-Steps (Musik/Geräusche)<input name="audioSteps" type="number" min="1" max="40" placeholder="Standard: 8" value="${episode.audio_steps ?? ''}"></label>
+          <label>Audio-CFG (Musik/Geräusche)<input name="audioCfg" type="number" min="1" max="10" step="0.1" placeholder="Standard: 1.0" value="${episode.audio_cfg ?? ''}"></label>
+        </div>
+        <p class="upload-note">Szenenbild = Startbild jedes Shots. CFG über 1.0 lässt den Negativ-Prompt wirken, dauert aber länger. Mehr Steps = mehr Details, längere Renderzeit.</p>
         <div class="shot-modal-grid">
           <label>Vorschau-Breite<input name="previewWidth" type="number" min="160" max="2048" step="32" placeholder="Projekt: ${project.preview_width ?? 384}" value="${episode.preview_width ?? ''}"></label>
           <label>Vorschau-Höhe<input name="previewHeight" type="number" min="160" max="2048" step="32" placeholder="Projekt: ${project.preview_height ?? 224}" value="${episode.preview_height ?? ''}"></label>
@@ -360,9 +393,9 @@ function render() {
           <button class="filter-tab ${renderQualityTier === 'Vorschau' ? 'active' : ''}" data-quality-tier="Vorschau">🔍 Vorschau</button>
           <button class="filter-tab ${renderQualityTier === 'Fertig' ? 'active' : ''}" data-quality-tier="Fertig">✨ Fertig</button>
         </div>
-        <button class="icon-btn hero-btn-stop" id="shots-stop-queue" style="width:auto;padding:0 12px;font-size:12px;font-weight:700;">🛑 Queue stoppen</button>
+        <button class="icon-btn hero-btn-stop hidden" id="shots-stop-queue" style="width:auto;padding:0 12px;font-size:12px;font-weight:700;">Episode stoppen</button>
         <button class="icon-btn" id="assemble-episode" style="width:auto;padding:0 14px;border-color:var(--emerald);color:var(--emerald);font-weight:700;font-size:12px;">🎞️ Film schneiden</button>
-        <button class="emerald-btn" id="shots-batch-render">⚡ Alle Rendern (${openCount})</button>
+        <button class="emerald-btn" id="shots-batch-render" ${openCount === 0 ? 'disabled title="Keine offenen Shots. Bereits fertige Shots kannst du markieren und mit Auswahl rendern erneut einreihen."' : ''}>${openCount === 0 ? '✓ Alle Shots fertig' : `⚡ Alle Rendern (${openCount})`}</button>
         <button class="icon-btn" id="shots-force-rerender" style="width:auto;padding:0 12px;font-size:12px;font-weight:600;" title="Rendert wirklich ALLE Shots dieser Folge neu, auch bereits fertige">🔁 Alles neu rendern</button>
         <button class="icon-btn" id="new-shot" style="width:auto;padding:0 12px;font-size:12px;font-weight:600;">+ Shot</button>
         <button class="icon-btn" id="generate-intro" style="width:auto;padding:0 12px;font-size:12px;font-weight:600;" title="Lässt die KI eine eigenständige Titel-/Stimmungseinstellung vor der Handlung erzeugen">🎬 Intro</button>
@@ -386,6 +419,13 @@ function render() {
       </div>
     </div>
     ${(shotSearch || shotAssetFilter !== 'all') ? `<p class="upload-note" style="margin:-8px 0 12px;">${visibleShots.length} von ${totalCount} Shots entsprechen dem Filter.</p>` : ''}
+
+    <div class="shot-selection-bar" aria-label="Mehrfachauswahl für Storyboard-Shots">
+      <label><input id="shot-select-visible" type="checkbox"> <span>Sichtbare auswählen</span></label>
+      <span id="shot-selection-count">Nichts ausgewählt</span>
+      <button type="button" class="icon-btn" id="shot-selection-clear" disabled>Auswahl aufheben</button>
+      <button type="button" class="emerald-btn" id="shot-selection-render" disabled>Auswahl rendern</button>
+    </div>
 
     <div class="shots-grid">
       ${visibleShots.map(shotCard).join('') || '<div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--text-dim);border:1px dashed var(--line);border-radius:var(--radius-md);">Keine Shots in dieser Ansicht vorhanden.</div>'}
@@ -580,7 +620,7 @@ async function refreshAudioPreflight() {
     const settings = audio.settings || {};
     const mode = settings.mode || 'narrator_and_characters';
     const cueList = Array.isArray(audio.manifest?.cues) ? audio.manifest.cues : [];
-    const renderableCount = cueList.filter(item => item.state === 'pending' && (
+    const renderableCount = cueList.filter(item => ['pending', 'failed'].includes(item.state) && (
       ((item.kind === 'dialogue' || item.kind === 'narration') && String(item.text || '').trim()) ||
       (!['dialogue', 'narration'].includes(item.kind) && String(item.prompt || '').trim())
     )).length;
@@ -590,6 +630,8 @@ async function refreshAudioPreflight() {
     const emptyCueNotice = !cueList.length
       ? `<div style="margin-top:12px;padding:11px;border:1px dashed var(--line);border-radius:8px;color:var(--text-muted);font-size:12px;line-height:1.5;">${mode === 'characters_only' ? 'Der Modus „Nur Figuren“ erzeugt bewusst keine Erzählerstimme. Ergänze Dialogzeilen in den betreffenden Shots oder wechsle zu einem Erzähler-Modus.' : 'Noch keine sprachfähigen Shot-Titel oder Dialogzeilen vorhanden. Ergänze zuerst Text im Storyboard.'}<br><button type="button" class="ghost" id="audio-open-shots" style="margin-top:8px;">Storyboard öffnen</button></div>`
       : '';
+    const automation = audio.manifest?.automation;
+    const automationNotice = automation ? `<div style="margin:12px 0;padding:11px;border:1px solid ${automation.state === 'complete' ? 'var(--emerald)' : '#ffb703'};border-radius:8px;color:var(--text-muted);font-size:12px;"><b style="color:${automation.state === 'complete' ? 'var(--emerald)' : '#ffca63'};">Automatische Audio-Produktion: ${automation.state === 'complete' ? 'fertig' : 'läuft'}</b>${automation.ai_provider ? ` · Regie: ${esc(automation.ai_provider)}` : ''}<br>Dialog, Foley, Atmosphäre und Musik werden als getrennte Spuren erzeugt; danach folgen Mix und MP4-Export automatisch.</div>` : '';
     target.innerHTML = `
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
         <div>
@@ -629,29 +671,40 @@ async function refreshAudioPreflight() {
         </div>
       </div>
       <div style="font-size:12px;line-height:1.55;color:${audio.readyForMaster ? 'var(--emerald)' : '#ffca63'};">${audio.readyForMaster ? 'Der Mix-Worker hat alle erforderlichen Cues bestätigt.' : `<b>Noch nicht exportierbar als Audio-Master:</b><ul style="margin:6px 0 0;padding-left:18px;">${blockers}</ul>`}</div>
+      ${automationNotice}
       <div style="border-top:1px solid var(--line);margin-top:16px;padding-top:15px;">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
           <div><h4 style="margin:0 0 4px;">Spuren auf der Timeline</h4><p style="margin:0;color:var(--text-muted);font-size:12px;line-height:1.45;">Dialoge und Off-Texte kommen aus den Shots. Musik, Atmosphäre und Effekte kannst du gezielt ergänzen. Jede Spur wird separat erzeugt und bleibt vor dem Mix nachvollziehbar.</p></div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;"><button type="button" class="ghost" id="audio-auto-soundtrack">✦ Musik + Ambiente vorschlagen</button><button type="button" class="ghost" id="audio-add-sfx">SFX / Atmosphäre hinzufügen</button><button type="button" class="ghost" id="audio-add-music">Musik hinzufügen</button></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;"><button type="button" class="ghost" id="audio-auto-soundtrack">✦ Musik + Ambiente + Szenen-SFX planen</button><button type="button" class="ghost" id="audio-add-sfx">SFX / Atmosphäre hinzufügen</button><button type="button" class="ghost" id="audio-add-music">Musik hinzufügen</button></div>
         </div>
         <div style="display:grid;gap:8px;margin-top:12px;">
           ${(audio.manifest?.cues || []).map(c => {
             const detail = c.kind === 'dialogue' || c.kind === 'narration' ? c.text : c.prompt;
             const kind = c.kind === 'dialogue' ? 'Dialog' : c.kind === 'narration' ? 'Off / Erzähler' : c.kind === 'music' ? 'Musik' : c.kind === 'ambience' ? 'Atmosphäre' : 'SFX';
-            const state = c.state === 'ready' ? 'fertig' : c.state === 'rendering' ? 'in Queue' : c.state === 'skipped' ? 'übersprungen' : 'offen';
-            return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg-elevated);"><div style="min-width:0;"><b style="font-size:12px;">${esc(kind)} · ${esc(state)}</b><span style="display:block;margin-top:3px;color:var(--text-muted);font-size:12px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(detail || 'Kein Inhalt')}</span><small style="color:var(--text-dim);font-family:var(--font-mono);">${(Number(c.start_ms || 0) / 1000).toFixed(1)}s · ${(Number(c.target_duration_ms || 0) / 1000).toFixed(1)}s · ${Number(c.gain_db || 0).toFixed(1)} dB</small></div><div style="display:flex;gap:6px;align-items:center;">${c.artifact?.path ? `<audio controls preload="none" src="/media/${encodeURIComponent(c.artifact.path)}" style="width:150px;height:30px;"></audio>` : ''}${['music','ambience','sfx'].includes(c.kind) ? `<button type="button" class="ghost" data-delete-audio-cue="${esc(c.id)}">Entfernen</button>` : ''}</div></div>`;
+            const state = c.state === 'ready' ? 'fertig' : c.state === 'rendering' ? 'in Queue' : c.state === 'failed' ? 'fehlgeschlagen' : c.state === 'skipped' ? 'übersprungen' : 'offen';
+            const canRender = ['pending', 'failed'].includes(c.state) && detail;
+            return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg-elevated);"><div style="min-width:0;"><b style="font-size:12px;">${esc(kind)} · ${esc(state)}</b><span style="display:block;margin-top:3px;color:var(--text-muted);font-size:12px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(detail || 'Kein Inhalt')}</span><small style="color:var(--text-dim);font-family:var(--font-mono);">${(Number(c.start_ms || 0) / 1000).toFixed(1)}s · ${(Number(c.target_duration_ms || 0) / 1000).toFixed(1)}s · ${Number(c.gain_db || 0).toFixed(1)} dB</small></div><div style="display:flex;gap:6px;align-items:center;">${c.artifact?.path ? `<audio controls preload="none" src="/media/${encodeURIComponent(c.artifact.path)}" style="width:150px;height:30px;"></audio>` : ''}${canRender ? `<button type="button" class="ghost" data-render-audio-cue="${encodeURIComponent(c.id)}">${c.state === 'failed' ? 'Erneut testen' : 'Spur testen'}</button>` : ''}${['music','ambience','sfx'].includes(c.kind) ? `<button type="button" class="ghost" data-delete-audio-cue="${esc(c.id)}">Entfernen</button>` : ''}</div></div>`;
           }).join('') || '<p style="margin:0;color:var(--text-dim);font-size:12px;">Noch keine Audio-Spuren geplant.</p>'}
         </div>
         ${fallbackNotice}
         ${emptyCueNotice}
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">
+        <button type="button" class="form-button" id="audio-produce-all">⚡ DeepSeek-Audioregie + kompletten Ton produzieren</button>
         <button type="button" class="form-button" id="audio-render-tracks" ${renderableCount ? '' : 'disabled'} title="${renderableCount ? `${renderableCount} offene Spur(en) einreihen` : 'Es gibt keine offenen Spuren mit Text oder Audio-Prompt'}">Alle offenen Spuren rendern${renderableCount ? ` (${renderableCount})` : ''}</button>
         <button type="button" class="ghost" id="audio-render" ${(!audio.cuesReady || audio.readyForMaster) ? 'disabled' : ''}>Audio-Master mischen</button>
         <span style="font-size:11px;color:var(--text-dim);align-self:center;">1. Spuren lokal erzeugen · 2. automatisch oder manuell mischen · 3. MP4-Master mit verständlicher Sprache herunterladen.</span>
       </div>
       ${validation ? `<details style="margin-top:10px;font-size:12px;color:#ff8a80;"><summary>Manifest-Fehler anzeigen</summary><ul style="margin:6px 0 0;padding-left:18px;">${validation}</ul></details>` : ''}
     `;
+    $('#audio-produce-all').onclick = async () => {
+      const button = $('#audio-produce-all'); button.disabled = true; button.textContent = 'Audio-Regie wird vorbereitet …';
+      try {
+        const result = await api(`/api/episodes/${currentEpisode}/audio-production`, { method:'POST', body:JSON.stringify({ refineWithAi:true, allowUnreviewed:true }) });
+        notice(`${result.aiProvider ? `${result.aiProvider} hat Dialog und Klangregie geprüft. ` : ''}${result.queued} Tonspur(en) sind in der Queue. Danach werden Audio-Master und MP4 automatisch erstellt.`);
+        await load(); openView('audio');
+      } catch (err) { notice(`Komplette Audio-Produktion konnte nicht gestartet werden: ${err.message}`); button.disabled = false; button.textContent = '⚡ DeepSeek-Audioregie + kompletten Ton produzieren'; }
+    };
     $('#audio-preflight-refresh').onclick = refreshAudioPreflight;
     $('#audio-manifest-download').onclick = () => {
       const blob = new Blob([JSON.stringify(audio.generatedManifest || audio.manifest, null, 2)], { type: 'application/json' });
@@ -681,10 +734,19 @@ async function refreshAudioPreflight() {
       });
     const addSfx = $('#audio-add-sfx'); if (addSfx) addSfx.onclick = () => addCue('sfx');
     const addMusic = $('#audio-add-music'); if (addMusic) addMusic.onclick = () => addCue('music');
-    const autoSoundtrack = $('#audio-auto-soundtrack'); if (autoSoundtrack) autoSoundtrack.onclick = async () => { try { await api(`/api/episodes/${currentEpisode}/audio-auto-soundtrack`, { method:'POST', body:'{}' }); notice('Musik und Atmosphäre sind vorgeschlagen. Prüfe die Spuren und starte dann „Alle offenen Spuren rendern“.'); await load(); } catch (err) { notice(`Soundtrack-Vorschlag fehlgeschlagen: ${err.message}`); } };
+    const autoSoundtrack = $('#audio-auto-soundtrack'); if (autoSoundtrack) autoSoundtrack.onclick = async () => { try { const result = await api(`/api/episodes/${currentEpisode}/audio-auto-soundtrack`, { method:'POST', body:'{}' }); notice(`Musik, Atmosphäre und ${result.added.filter(kind => kind === 'sfx').length} Szenen-SFX sind geplant. Prüfe die Spuren und starte danach den Renderlauf.`); await load(); } catch (err) { notice(`Soundtrack-Vorschlag fehlgeschlagen: ${err.message}`); } };
     document.querySelectorAll('[data-delete-audio-cue]').forEach(btn => btn.onclick = async () => {
       if (!confirm('Diese zusätzliche Audio-Spur wirklich aus dem Plan entfernen?')) return;
       try { const manifest = structuredClone(audio.manifest); manifest.cues = manifest.cues.filter(c => c.id !== btn.dataset.deleteAudioCue); delete manifest.mix; await api(`/api/episodes/${currentEpisode}/audio-manifest`, { method:'POST', body:JSON.stringify({ manifest }) }); await load(); notice('Audio-Spur entfernt.'); } catch (err) { notice(`Audio-Spur konnte nicht entfernt werden: ${err.message}`); }
+    });
+    document.querySelectorAll('[data-render-audio-cue]').forEach(btn => btn.onclick = async () => {
+      const cueId = decodeURIComponent(btn.dataset.renderAudioCue);
+      btn.disabled = true;
+      try {
+        const result = await api(`/api/episodes/${currentEpisode}/audio-cues/render`, { method:'POST', body:JSON.stringify({ cueIds:[cueId] }) });
+        notice(`${result.queued.length ? 'Audio-Testspur eingereiht' : 'Audio-Testspur ist bereits in der Queue'}. Sobald sie fertig ist, erscheint hier ein Player.`);
+        await load(); openView('audio');
+      } catch (err) { notice(`Audio-Testspur konnte nicht eingereiht werden: ${err.message}`); btn.disabled = false; }
     });
     const renderTracks = $('#audio-render-tracks'); if (renderTracks) renderTracks.onclick = async () => {
       try {
@@ -706,6 +768,8 @@ async function refreshAudioPreflight() {
 }
 
 function bindDynamic() {
+  const episode = data.selected?.episode;
+  const openShotCount = (data.selected?.shots || []).filter(shot => !shot.output_video_path).length;
   const npMobile = $('#new-project-mobile'); if (npMobile) npMobile.onclick = newProject;
   if ($('#audio-preflight')) refreshAudioPreflight();
   const missingPhotoToggle = $('#toggle-missing-photo-filter'); if (missingPhotoToggle) missingPhotoToggle.onclick = () => { assetFilter = assetFilter === 'missing' ? 'all' : 'missing'; render(); };
@@ -731,8 +795,63 @@ function bindDynamic() {
   const shotFilterClear = $('#shot-filter-clear');
   if (shotFilterClear) shotFilterClear.onclick = () => { shotSearch = ''; shotAssetFilter = 'all'; render(); };
 
+  // The filtered shot collection is local to render(). Derive visible cards
+  // from the DOM here so event binding cannot abort with a ReferenceError.
+  // That exception used to make every handler registered below this block
+  // (single render, batch render, stop queue, edit, delete, …) silently dead.
+  const visibleShotIds = () => [...document.querySelectorAll('[data-shot-card]')]
+    .map(card => Number(card.dataset.shotCard))
+    .filter(Number.isInteger);
+  const updateShotSelectionUi = () => {
+    document.querySelectorAll('[data-shot-card]').forEach(card => card.classList.toggle('is-selected', selectedShotIds.has(Number(card.dataset.shotCard))));
+    document.querySelectorAll('[data-select-shot]').forEach(input => { input.checked = selectedShotIds.has(Number(input.dataset.selectShot)); });
+    const currentVisibleIds = visibleShotIds();
+    const selectedVisibleCount = currentVisibleIds.filter(id => selectedShotIds.has(id)).length;
+    const selectVisible = $('#shot-select-visible');
+    if (selectVisible) {
+      selectVisible.checked = currentVisibleIds.length > 0 && selectedVisibleCount === currentVisibleIds.length;
+      selectVisible.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < currentVisibleIds.length;
+    }
+    const count = $('#shot-selection-count');
+    if (count) count.textContent = selectedShotIds.size ? `${selectedShotIds.size} Shot${selectedShotIds.size === 1 ? '' : 's'} ausgewählt` : 'Nichts ausgewählt';
+    const clear = $('#shot-selection-clear'); if (clear) clear.disabled = selectedShotIds.size === 0;
+    const renderSelected = $('#shot-selection-render');
+    if (renderSelected) {
+      renderSelected.disabled = selectedShotIds.size === 0;
+      renderSelected.textContent = selectedShotIds.size ? `${selectedShotIds.size} Shot${selectedShotIds.size === 1 ? '' : 's'} rendern` : 'Auswahl rendern';
+    }
+  };
+  document.querySelectorAll('[data-select-shot]').forEach(input => input.onchange = event => {
+    const id = Number(input.dataset.selectShot);
+    if (event.target.checked) selectedShotIds.add(id); else selectedShotIds.delete(id);
+    updateShotSelectionUi();
+  });
+  const selectVisible = $('#shot-select-visible');
+  if (selectVisible) selectVisible.onchange = event => {
+    visibleShotIds().forEach(id => event.target.checked ? selectedShotIds.add(id) : selectedShotIds.delete(id));
+    updateShotSelectionUi();
+  };
+  const clearSelection = $('#shot-selection-clear');
+  if (clearSelection) clearSelection.onclick = () => { selectedShotIds.clear(); updateShotSelectionUi(); };
+  const renderSelection = $('#shot-selection-render');
+  if (renderSelection) renderSelection.onclick = async () => {
+    const shotIds = [...selectedShotIds]; if (!shotIds.length) return;
+    renderSelection.disabled = true;
+    try {
+      const result = await api('/api/jobs/batch', { method:'POST', body:JSON.stringify({ episodeId:currentEpisode, shotIds, tier:renderQualityTier }) });
+      selectedShotIds.clear();
+      notice(`${result.queued} ausgewählte Shot${result.queued === 1 ? '' : 's'} eingereiht${result.skipped ? `, ${result.skipped} bereits aktiv oder nicht renderbar` : ''}.`);
+      await load(); openView('shots');
+    } catch (err) { notice(err.message); updateShotSelectionUi(); }
+  };
+  updateShotSelectionUi();
+
   // Batch rendering handlers
   const triggerBatch = async () => {
+    if (openShotCount === 0) {
+      notice('Alle Shots dieser Episode sind bereits fertig. Markiere im Storyboard gezielt Shots und nutze „Auswahl rendern“, um sie neu zu erzeugen.');
+      return;
+    }
     try {
       notice('Starte Render-Pipeline für alle noch offenen Szenen...');
       const res = await api('/api/jobs/batch', { method: 'POST', body: JSON.stringify({ episodeId: currentEpisode, tier: renderQualityTier }) });
@@ -759,7 +878,7 @@ function bindDynamic() {
 
   // Stop Render Queue handlers
   const triggerStopQueue = async () => {
-    if (!confirm('Möchtest du alle laufenden und wartenden Render-Aufträge wirklich sofort abbrechen?')) return;
+    if (!confirm('Möchtest du wirklich alle laufenden und wartenden Render-Aufträge abbrechen?')) return;
     try {
       notice('Breche alle Render-Aufträge ab...');
       const res = await api('/api/jobs/cancel-all', { method: 'POST' });
@@ -769,13 +888,21 @@ function bindDynamic() {
       notice(`Fehler: ${err.message}`);
     }
   };
+  const triggerStopEpisodeQueue = async () => {
+    if (!confirm(`Nur die Render-Aufträge für „${episode.title}“ abbrechen? Andere Projekte und Episoden laufen weiter.`)) return;
+    try {
+      const res = await api(`/api/episodes/${currentEpisode}/jobs/cancel`, { method:'POST', body:'{}' });
+      notice(`${res.canceled} Auftrag/Aufträge dieser Episode abgebrochen.`);
+      await load(); await pollQueueStatus(); openView('shots');
+    } catch (err) { notice(`Fehler: ${err.message}`); }
+  };
 
   document.querySelectorAll('[data-quality-tier]').forEach(btn => btn.onclick = () => {
     renderQualityTier = btn.dataset.qualityTier;
     render();
   });
   const heroStopBtn = $('#hero-stop-queue'); if (heroStopBtn) heroStopBtn.onclick = triggerStopQueue;
-  const shotsStopBtn = $('#shots-stop-queue'); if (shotsStopBtn) shotsStopBtn.onclick = triggerStopQueue;
+  const shotsStopBtn = $('#shots-stop-queue'); if (shotsStopBtn) shotsStopBtn.onclick = triggerStopEpisodeQueue;
   const heroAutoplanBtn = $('#hero-start-autoplan');
   if (heroAutoplanBtn) {
     heroAutoplanBtn.onclick = () => {
@@ -783,6 +910,25 @@ function bindDynamic() {
       else { openView('story'); setTimeout(() => $('#auto-plan')?.click(), 100); }
     };
   }
+
+  document.querySelectorAll('[data-review-shot]').forEach(button => button.onclick = e => {
+    e.stopPropagation();
+    const s=data.selected.shots.find(s=>s.id===Number(button.dataset.reviewShot));
+    const checks=[['identity','Gesichter, Kleidung und Referenztreue stimmen.'],['count','Jede Figur und jedes Objekt erscheint nur so oft wie vorgesehen.'],['scale','Alter und Größenverhältnisse stimmen.'],['style','Zeichenstil, Licht und Farben passen zur Episode.'],['story','Ort und Handlung entsprechen dieser Szene; keine fremden Requisiten.']];
+    showModal(`<h3>Sichtprüfung: ${esc(s.title)}</h3>
+      <video src="${esc(s.video)}" controls playsinline style="width:100%;max-height:45vh"></video>
+      <p>Bitte den ganzen Clip ansehen und mit den Referenzfotos vergleichen. Dies ist eine manuelle Prüfung, keine automatische Erkennung.</p>
+      <p>${esc(s.visual_review?.error || '')}</p>
+      <form>${checks.map(([key,label])=>`<label style="display:flex;gap:10px;align-items:start"><input style="width:auto" type="checkbox" name="${key}" required> ${label}</label>`).join('')}
+      <p id="modal-error" class="error" role="alert"></p>
+      <button class="form-button">Geprüften Clip freigeben</button></form>`,async form=>{
+        const submit=form.querySelector('button');submit.disabled=true;
+        try {
+          await api(`/api/shots/${s.id}/visual-review`,{method:'POST',body:JSON.stringify({videoPath:s.output_video_path,checks:Object.fromEntries(checks.map(([key])=>[key,form.elements[key].checked]))})});
+          await load();notice('Clip für den Schnitt freigegeben.');
+        } finally {submit.disabled=false;}
+      });
+  });
 
   // Single shot render, edit & delete
   document.querySelectorAll('[data-render-shot]').forEach(x => x.onclick = async e => {
@@ -825,6 +971,11 @@ function bindDynamic() {
     const totalShots = (d?.shots || []).length;
     const doneShots = (d?.shots || []).filter(s => s.output_video_path).length;
     const openShots = totalShots - doneShots;
+    const uncheckedShots = (d?.shots || []).filter(s => !s.visual_review?.approved).length;
+    const missingAudioCues = (audio.manifest?.cues || []).filter(cue => ['pending', 'failed'].includes(cue.state));
+    const renderingAudioCues = (audio.manifest?.cues || []).filter(cue => cue.state === 'rendering').length;
+    const readyAudioCues = (audio.manifest?.cues || []).filter(cue => cue.state === 'ready' && cue.artifact?.path).length;
+    const partialMixReady = audio.manifest?.mix?.state === 'ready' && audio.manifest?.mix?.artifact?.path && !audio.readyForMaster;
     const incompleteWarning = openShots > 0 ? `
       <div style="background:rgba(255,193,7,0.1);border:1px solid rgba(255,193,7,0.35);border-radius:var(--radius-sm);padding:12px;margin-bottom:14px;font-size:12px;color:#ffc107;">
         ⚠️ ${openShots} von ${totalShots} Shots sind noch nicht fertig gerendert. Diese fehlen im Zusammenschnitt, wenn du jetzt fortfährst.
@@ -837,27 +988,65 @@ function bindDynamic() {
       </p>
       ${incompleteWarning}
       <div style="background:var(--bg-card);border:1px solid ${audio.readyForMaster ? 'var(--emerald)' : 'rgba(255,193,7,0.45)'};border-radius:var(--radius-sm);padding:12px;margin-bottom:16px;font-size:12px;">
-        <div style="color:${audio.readyForMaster ? 'var(--emerald)' : '#ffc107'};font-weight:700;margin-bottom:4px;">Audio-Status: ${audio.readyForMaster ? 'Audio-Master bereit' : 'Audio-Master blockiert'}</div>
-        ${audio.readyForMaster ? '<div>Alle Cue-Dateien wurden vom Mix-Worker bestätigt.</div>' : `<div>${esc((audio.blockers || []).join(' · ') || 'Audio-Plan ist noch nicht vollständig.')}</div><div style="margin-top:5px;color:var(--text-muted);">Ein Bildschnitt entfernt Tonspuren bewusst und wird klar so bezeichnet.</div>`}
+        <div style="color:${audio.readyForMaster ? 'var(--emerald)' : '#ffc107'};font-weight:700;margin-bottom:4px;">Audio-Status: ${audio.readyForMaster ? 'Audio-Master bereit' : partialMixReady ? 'Teilton-Testmix bereit' : 'Audio-Master noch nicht erstellt'}</div>
+        ${audio.readyForMaster ? '<div>Alle Cue-Dateien wurden gemischt und bestätigt.</div>' : partialMixReady ? `<div>${readyAudioCues} fertige Audio-Spur${readyAudioCues === 1 ? '' : 'en'} sind im Testmix enthalten. Fehlende Spuren bleiben bewusst weg.</div>` : `<div>${esc((audio.blockers || []).join(' · ') || 'Audio-Plan ist noch nicht vollständig.')}</div><div style="margin-top:5px;color:var(--text-muted);">Du kannst entweder fehlende Spuren rendern oder mit bereits fertigen Spuren einen Teilton-Testmix erstellen.</div>`}
       </div>
+      ${missingAudioCues.length || renderingAudioCues || (audio.cuesReady && !audio.readyForMaster) || (!audio.cuesReady && readyAudioCues) ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin:-4px 0 14px;">${missingAudioCues.length ? `<button type="button" class="ghost" id="assemble-render-audio">🔊 ${missingAudioCues.length} offene Audio-Spur${missingAudioCues.length === 1 ? '' : 'en'} jetzt rendern</button>` : ''}${renderingAudioCues ? `<span class="upload-note" style="align-self:center;">${renderingAudioCues} Audio-Spur${renderingAudioCues === 1 ? '' : 'en'} bereits in der Queue.</span>` : ''}${audio.cuesReady && !audio.readyForMaster ? `<button type="button" class="ghost" id="assemble-audio-mix">🎚️ ${openShots ? `Testmix mit ${doneShots}/${totalShots} fertigen Clips einreihen` : 'Vollständigen Audio-Master einreihen'}</button>` : ''}${!audio.cuesReady && readyAudioCues ? `<button type="button" class="ghost" id="assemble-partial-audio-mix">🎚️ Testmix mit ${readyAudioCues} vorhandenem Ton erstellen</button>` : ''}</div>` : ''}
+      ${uncheckedShots ? `<label class="check-row" style="flex-direction:row;align-items:flex-start;gap:9px;background:rgba(255,193,7,0.08);padding:11px;border-radius:8px;border:1px solid rgba(255,193,7,0.34);margin-bottom:14px;"><input id="allow-unreviewed-assemble" type="checkbox" style="width:auto;margin-top:2px;"><span><b>Testexport trotz offener Sichtprüfung erlauben</b><small style="display:block;margin-top:3px;">${uncheckedShots} Szene${uncheckedShots === 1 ? '' : 'n'} sind noch nicht freigegeben. Der Export wird deutlich als TESTEXPORT markiert und ersetzt keinen geprüften Final-Export.</small></span></label>` : ''}
+      ${readyAudioCues ? `<button type="button" id="assemble-auto-test-export" class="form-button" style="width:100%;margin:0 0 10px;background:#d97706;">🎬 Testexport mit Ton automatisch erstellen</button><p class="upload-note" style="margin:-2px 0 14px;">Verwendet alle jetzt fertigen Clips und Audios, ignoriert fehlende Spuren und offene Sichtprüfungen und legt die MP4 nach dem Mix automatisch unter „Ergebnisse“ ab.</p>` : ''}
       <div style="display:flex;gap:10px;">
-        ${audio.readyForMaster ? `<button type="button" id="confirm-assemble-btn" class="form-button" style="flex:1;">${openShots > 0 ? `Trotzdem mit ${doneShots}/${totalShots} Shots mischen` : 'Audio-Master jetzt erstellen'}</button>` : `<button type="button" id="confirm-picture-only-btn" class="form-button" style="background:var(--bg-elevated);border:1px solid var(--line);color:#fff;flex:1;">Bildschnitt ohne Ton erstellen</button>`}
+        ${audio.readyForMaster ? `<button type="button" id="confirm-assemble-btn" class="form-button" style="flex:1;">${openShots > 0 ? `Trotzdem mit ${doneShots}/${totalShots} Shots mischen` : 'Film mit Audio exportieren'}</button>` : partialMixReady ? `<button type="button" id="confirm-partial-assemble-btn" class="form-button" style="flex:1;background:#d97706;">🎧 Testexport mit vorhandenem Ton</button>` : `<button type="button" id="confirm-picture-only-btn" class="form-button" style="background:var(--bg-elevated);border:1px solid var(--line);color:#fff;flex:1;">Bildschnitt ohne Ton erstellen</button>`}
         <button type="button" class="form-button" style="background:var(--bg-elevated);border:1px solid var(--line);color:#fff;flex:1;" onclick="closeModal()">Abbrechen</button>
       </div>
     `, () => {});
 
-    const assemble = async pictureOnly => {
+    const renderMissingAudio = $('#assemble-render-audio'); if (renderMissingAudio) renderMissingAudio.onclick = async () => {
+      renderMissingAudio.disabled = true;
+      try {
+        const result = await api(`/api/episodes/${currentEpisode}/audio-cues/render`, { method:'POST', body:JSON.stringify({ cueIds:missingAudioCues.map(cue => cue.id) }) });
+        closeModal(); await load(); openView('queue');
+        notice(`${result.queued.length} Audio-Spur${result.queued.length === 1 ? '' : 'en'} wurde${result.queued.length === 1 ? '' : 'n'} in die Queue gelegt. Nach dem Rendern hier erneut „Film schneiden“ öffnen.`);
+      } catch (err) { notice(`Audio-Spuren konnten nicht eingereiht werden: ${err.message}`); renderMissingAudio.disabled = false; }
+    };
+    const queueAudioMix = $('#assemble-audio-mix'); if (queueAudioMix) queueAudioMix.onclick = async () => {
+      const allowPartialTimeline = openShots > 0;
+      const allowUnreviewed = $('#allow-unreviewed-assemble')?.checked === true || allowPartialTimeline;
+      queueAudioMix.disabled = true;
+      try {
+        const result = await api(`/api/episodes/${currentEpisode}/audio-render`, { method:'POST', body:JSON.stringify({ allowUnreviewed, allowPartialTimeline, autoExport:true }) });
+        closeModal(); await load(); openView('queue');
+        notice(`${result.testMix ? 'Audio-Testmix' : 'Audio-Master'} ist jetzt als Job #${result.job.id} in der Queue. Nach Abschluss wird der MP4-Testexport automatisch unter „Ergebnisse“ abgelegt.`);
+      } catch (err) { notice(`Audio-Mix konnte nicht eingereiht werden: ${err.message}`); queueAudioMix.disabled = false; }
+    };
+    const autoTestExport = $('#assemble-auto-test-export'); if (autoTestExport) autoTestExport.onclick = async () => {
+      autoTestExport.disabled = true;
+      try {
+        const result = await api(`/api/episodes/${currentEpisode}/audio-render`, { method:'POST', body:JSON.stringify({ allowPartialAudio:true, allowPartialTimeline:true, allowUnreviewed:true, autoExport:true }) });
+        closeModal(); await load(); openView('queue');
+        notice(`Testexport mit Ton läuft als Job #${result.job.id}. Nach Abschluss findest du die MP4 automatisch unter „Ergebnisse“.`);
+      } catch (err) { notice(`Testexport konnte nicht gestartet werden: ${err.message}`); autoTestExport.disabled = false; }
+    };
+    const queuePartialAudioMix = $('#assemble-partial-audio-mix'); if (queuePartialAudioMix) queuePartialAudioMix.onclick = async () => {
+      queuePartialAudioMix.disabled = true;
+      try {
+        await api(`/api/episodes/${currentEpisode}/audio-render`, { method:'POST', body:JSON.stringify({ allowPartialAudio:true, allowPartialTimeline:true, allowUnreviewed:true, autoExport:true }) });
+        closeModal(); await load(); openView('queue');
+        notice(`Teilton-Testmix mit ${readyAudioCues} vorhandenen Audio-Spur${readyAudioCues === 1 ? '' : 'en'} wurde eingereiht. Fehlende Spuren werden nicht abgewartet; der Testexport wird danach automatisch erstellt.`);
+      } catch (err) { notice(`Teilton-Testmix konnte nicht eingereiht werden: ${err.message}`); queuePartialAudioMix.disabled = false; }
+    };
+    const assemble = async (pictureOnly, allowUnreviewed = false, allowPartialAudio = false) => {
       closeModal();
       try {
-        notice(pictureOnly ? 'Erstelle ausdrücklich einen Bildschnitt ohne Ton …' : 'Mische alle Szenen zu einem Audio-Master …');
-        const res = await api(`/api/episodes/${currentEpisode}/assemble`, { method: 'POST', body: JSON.stringify({ pictureOnly }) });
-        notice(`${pictureOnly ? 'Bildschnitt' : 'Film'} fertiggestellt: ${res.name}!`);
+        notice(allowPartialAudio ? 'Erstelle Testexport mit vorhandenem Ton …' : pictureOnly ? `Erstelle ${allowUnreviewed ? 'einen Test-' : 'ausdrücklich einen '}Bildschnitt ohne Ton …` : `${allowUnreviewed ? 'Erstelle einen Testexport trotz offener Sichtprüfung …' : 'Mische alle Szenen zu einem Audio-Master …'}`);
+        const res = await api(`/api/episodes/${currentEpisode}/assemble`, { method: 'POST', body: JSON.stringify({ pictureOnly, allowUnreviewed, allowPartialAudio }) });
+        notice(`${allowPartialAudio || allowUnreviewed ? 'Testexport' : pictureOnly ? 'Bildschnitt' : 'Film'} fertiggestellt: ${res.name}!`);
         await load();
         openView('exports');
       } catch (err) { notice(err.message); }
     };
-    const audioBtn = $('#confirm-assemble-btn'); if (audioBtn) audioBtn.onclick = () => assemble(false);
-    const pictureBtn = $('#confirm-picture-only-btn'); if (pictureBtn) pictureBtn.onclick = () => assemble(true);
+    const audioBtn = $('#confirm-assemble-btn'); if (audioBtn) audioBtn.onclick = () => assemble(false, $('#allow-unreviewed-assemble')?.checked === true);
+    const partialAudioBtn = $('#confirm-partial-assemble-btn'); if (partialAudioBtn) partialAudioBtn.onclick = () => assemble(false, true, true);
+    const pictureBtn = $('#confirm-picture-only-btn'); if (pictureBtn) pictureBtn.onclick = () => assemble(true, $('#allow-unreviewed-assemble')?.checked === true);
   };
   const aBtn = $('#assemble-episode'); if (aBtn) aBtn.onclick = assembleHandler;
   const eBtn = $('#exports-assemble-btn'); if (eBtn) eBtn.onclick = assembleHandler;
@@ -962,7 +1151,7 @@ function bindDynamic() {
   if (episodeSettingsReset) episodeSettingsReset.onclick = async () => {
     if (!confirm('Alle Episode-Überschreibungen entfernen? Diese Episode nutzt danach wieder die Projekt-Standardwerte.')) return;
     try {
-      await api(`/api/episodes/${currentEpisode}/settings`, { method: 'PATCH', body: JSON.stringify({ styleProfile: '', negativePrompt: '', videoSteps: '', photoSteps: '', previewWidth: '', previewHeight: '', finalWidth: '', finalHeight: '' }) });
+      await api(`/api/episodes/${currentEpisode}/settings`, { method: 'PATCH', body: JSON.stringify({ styleProfile: '', negativePrompt: '', videoSteps: '', photoSteps: '', previewWidth: '', previewHeight: '', finalWidth: '', finalHeight: '', guideSteps: '', guideCfg: '', audioSteps: '', audioCfg: '' }) });
       await load();
       notice('Auf Projekt-Standard zurückgesetzt.');
     } catch (err) { notice(`Fehler: ${err.message}`); }
@@ -1086,6 +1275,14 @@ async function cancelQueueItem(jobId) {
 }
 window.cancelQueueItem = cancelQueueItem;
 
+async function cancelAllQueueItems() {
+  if (!confirm('Wirklich alle laufenden und wartenden Aufträge aus sämtlichen Projekten abbrechen? Fertige Ergebnisse bleiben erhalten.')) return;
+  try {
+    const result = await api('/api/jobs/cancel-all', { method:'POST', body:'{}' });
+    selectedQueueJobIds.clear(); notice(`${result.canceled} Auftrag/Aufträge aus der globalen Queue abgebrochen.`); await pollQueueStatus(); await load();
+  } catch (err) { notice(err.message); }
+}
+
 function updateQueueBulkUi(queue) {
   const selected = queue.filter(item => selectedQueueJobIds.has(item.id));
   // Browsers may restore checked controls after a reload. Reapply our in-memory selection on
@@ -1140,33 +1337,43 @@ function updateWorkerPill(worker, queueLength) {
   runner.style.borderColor = online ? '' : 'rgba(255,82,82,0.4)';
 }
 
-function toggleStopButtons(visible) {
-  document.querySelectorAll('#hero-stop-queue, #shots-stop-queue').forEach(btn => { btn.classList.toggle('hidden', !visible); });
+function toggleStopButtons(queue) {
+  const globalVisible = queue.length > 0;
+  const episodeVisible = queue.some(item => Number(item.episode_id) === Number(currentEpisode));
+  document.querySelectorAll('#hero-stop-queue').forEach(btn => { btn.classList.toggle('hidden', !globalVisible); });
+  document.querySelectorAll('#shots-stop-queue').forEach(btn => { btn.classList.toggle('hidden', !episodeVisible); });
 }
 
 async function pollQueueStatus() {
   const el = $('#queue-status');
   if (!el) return;
   try {
-    const { queue, avgSeconds, worker, runningCount = 0, waitingCount = 0 } = await api('/api/queue');
+    const { queue, recent = [], workers = [], avgSeconds, worker, onlineWorkerCount = 0, runningCount = 0, waitingCount = 0 } = await api('/api/queue');
     for (const id of [...selectedQueueJobIds]) if (!queue.some(item => item.id === id)) selectedQueueJobIds.delete(id);
-    toggleStopButtons(queue.length > 0);
+    toggleStopButtons(queue);
     updateWorkerPill(worker, queue.length);
-    if (!queue.length) { el.innerHTML = ''; return; }
+    const recentHtml = recent.length ? `<section class="render-queue-panel" style="margin-top:14px;"><div class="render-queue-heading"><div><h3>Kürzlich fertiggestellt</h3><p>Die zuletzt abgeschlossenen Renders – direkt anklickbar zur Kontrolle.</p></div></div><div class="render-queue-list">${recent.map(item => `<div class="render-queue-row"><span class="shot-badge done" style="position:static;">✓ FERTIG</span><div class="render-queue-item-copy"><strong>${esc(item.shot_title || item.label)}</strong><span>${esc(item.project_title || '')} · ${esc(item.episode_title || '')} · ${esc(item.render_tier || 'Vorschau')}</span></div><div class="render-queue-eta"><span>${item.completed_at ? new Date(item.completed_at).toLocaleString('de-CH',{dateStyle:'short',timeStyle:'short'}) : 'fertig'}</span></div>${item.videoUrl ? `<a class="render-queue-cancel" href="${item.videoUrl}" target="_blank" rel="noopener" title="Video öffnen" aria-label="Video öffnen">▶</a>` : ''}</div>`).join('')}</div></section>` : '';
+    const workerFleetHtml = `<section class="render-queue-panel" style="margin-bottom:14px;"><div class="render-queue-heading"><div><h3>Render-Farm</h3><p>${onlineWorkerCount} von ${workers.length} Worker online. Jeder Worker beansprucht atomar genau einen anderen Auftrag.</p></div></div><div class="render-queue-list">${workers.map(item => {
+      const state = item.online ? (item.activeJob ? 'RENDERT' : 'BEREIT') : (item.connected ? 'NICHT GESTARTET' : (item.status === 'awaiting_runtime' ? 'RUNTIME FEHLT' : 'OFFLINE'));
+      const seen = item.secondsSinceSeen === null ? 'noch nie' : (item.secondsSinceSeen < 5 ? 'gerade eben' : `vor ${formatEta(item.secondsSinceSeen)}`);
+      const work = item.activeJob ? `${item.activeJob.label} · ${item.activeJob.projectTitle || ''} / ${item.activeJob.episodeTitle || ''}` : (item.connected && !item.online ? 'Installer/Runtime verbunden, Render-Worker noch nicht gestartet' : 'Kein Auftrag aktiv');
+      return `<div class="render-queue-row ${item.activeJob ? 'is-running' : ''}"><span class="shot-badge ${item.online ? (item.activeJob ? 'running' : 'done') : 'queued'}" style="position:static;">${esc(state)}</span><div class="render-queue-item-copy"><strong>${esc(item.name || item.machine || item.id)}</strong><span>${esc(work)}</span></div><div class="render-queue-eta"><span>Version ${esc(item.installer_version || 'unbekannt')}</span><small>zuletzt ${esc(seen)}</small></div></div>`;
+    }).join('') || '<div class="render-idle-note">Noch kein Worker registriert.</div>'}</div></section>`;
+    if (!queue.length) { el.innerHTML = `${workerFleetHtml}<div class="render-idle-note">Die Render-Queue ist leer. Neue Storyboard-Renders erscheinen automatisch hier.</div>${recentHtml}`; return; }
     const workerWarning = (worker && !worker.online)
       ? `<div style="background:rgba(255,82,82,0.12);border:1px solid rgba(255,82,82,0.35);color:#ff8a80;border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12.5px;line-height:1.5;">
           ⚠️ <b>Kein Render-Worker verbunden.</b> Die Aufträge bleiben liegen, bis auf dem Render-PC <code>FrameCut-Worker.bat</code> läuft.
           ${worker.secondsSinceSeen !== null ? `Zuletzt gesehen vor ${formatEta(worker.secondsSinceSeen) || 'wenigen Sekunden'}.` : 'Es hat sich noch nie ein Worker gemeldet.'}
         </div>`
       : '';
-    const activeJob = queue.find(item => item.state === 'läuft');
-    const activePhase = activeJob ? renderJobPhase(activeJob) : null;
+    const activeJobs = queue.filter(item => item.state === 'läuft');
     el.innerHTML = `
       <section class="render-queue-panel" aria-live="polite" aria-label="Renderstatus">
+        ${workerFleetHtml}
         <div class="render-queue-heading">
           <div>
             <h3>Renderstatus</h3>
-            <p>Eine GPU verarbeitet immer genau einen Auftrag. Neue Videos bleiben sicher in der Reihenfolge.</p>
+            <p>Jeder verfügbare Worker verarbeitet genau einen eigenen Auftrag. Freie Worker übernehmen parallel den nächsten wartenden Job.</p>
           </div>
           <div class="render-queue-metrics">
             <span class="render-metric ${runningCount ? 'is-active' : ''}">${runningCount ? `${runningCount} aktiv` : 'bereit'}</span>
@@ -1174,19 +1381,10 @@ async function pollQueueStatus() {
           </div>
         </div>
         ${workerWarning}
-        ${activeJob ? `
-          <div class="render-now">
-            <div class="render-now-indicator"><span class="pulse"></span><span>Jetzt auf der GPU</span></div>
-            <div class="render-now-copy">
-              <strong>${esc(queueRowLabel(activeJob))}</strong>
-              <span>${esc(queueRowContext(activeJob))}</span>
-              <p><b>${esc(activePhase.label)}:</b> ${esc(activePhase.text)}</p>
-            </div>
-            <div class="render-now-time">${formatElapsed(activeJob.started_at, avgSeconds).text}</div>
-          </div>
-        ` : `
-          <div class="render-idle-note">Der Worker ist verbunden und übernimmt den nächsten Auftrag automatisch.</div>
-        `}
+        ${activeJobs.length ? activeJobs.map(activeJob => {
+          const activePhase = renderJobPhase(activeJob);
+          return `<div class="render-now"><div class="render-now-indicator"><span class="pulse"></span><span>${esc(activeJob.worker_name || activeJob.worker_machine || activeJob.worker_id || 'Worker')}</span></div><div class="render-now-copy"><strong>${esc(queueRowLabel(activeJob))}</strong><span>${esc(queueRowContext(activeJob))}</span><p><b>${esc(activePhase.label)}:</b> ${esc(activePhase.text)}</p></div><div class="render-now-time">${formatElapsed(activeJob.started_at, avgSeconds).text}</div></div>`;
+        }).join('') : `<div class="render-idle-note">Die verbundenen Worker sind bereit und übernehmen neue Aufträge automatisch.</div>`}
         <div class="render-queue-bulk" aria-label="Sammelaktionen für die Warteschlange">
           <label class="queue-select-all"><input id="queue-select-all" type="checkbox"> <span>Alle sichtbaren markieren</span></label>
           <span id="queue-selection-count" class="queue-selection-count">Nichts ausgewählt</span>
@@ -1211,7 +1409,7 @@ async function pollQueueStatus() {
               ${running
                 ? `<span class="${elapsed.overdue ? 'is-overdue' : ''}">${elapsed.overdue ? 'Prüfe Laufzeit · ' : ''}${elapsed.text}</span>`
                 : (item.etaSeconds ? `<span>frühestens ${formatEta(item.etaSeconds)}</span>` : '<span>wartet auf GPU</span>')}
-              <small>${esc(item.owner_display_name || item.owner_username || 'unbekannt')}</small>
+              <small>${running ? `Worker: ${esc(item.worker_name || item.worker_machine || item.worker_id || 'unbekannt')} · ` : ''}${esc(item.owner_display_name || item.owner_username || 'unbekannt')}</small>
             </div>
             <button class="render-queue-cancel" onclick="cancelQueueItem(${item.id})" title="Diesen Auftrag abbrechen" aria-label="${esc(queueRowLabel(item))} abbrechen">×</button>
           </div>
@@ -1219,6 +1417,7 @@ async function pollQueueStatus() {
         }).join('')}
         </div>
         ${avgSeconds ? `<p class="render-queue-footnote">Vergleichswert: durchschnittlich ${formatEta(avgSeconds)} pro fertigem Video. Referenzbilder und ein frischer Modellstart können länger dauern.</p>` : '<p class="render-queue-footnote">Nach den ersten fertigen Videos zeigt FrameCut hier eine realistische durchschnittliche Dauer.</p>'}
+        ${recentHtml}
       </section>
     `;
     document.querySelectorAll('[data-queue-select]').forEach(input => input.onchange = () => {
@@ -1248,6 +1447,7 @@ function openView(name) {
   document.querySelectorAll('.nav').forEach(x => x.classList.toggle('active', x.dataset.view === name));
   document.querySelectorAll('.tab-item').forEach(x => x.classList.toggle('active', x.dataset.view === name));
   document.querySelectorAll('.view').forEach(x => x.classList.toggle('hidden', x.id !== `view-${name}`));
+  if (name === 'queue') pollQueueStatus();
   syncUrl();
 }
 
@@ -1690,9 +1890,31 @@ function newEpisode() {
 // Nav bindings
 document.querySelectorAll('.nav').forEach(b => b.onclick = () => openView(b.dataset.view));
 document.querySelectorAll('.tab-item').forEach(b => b.onclick = () => openView(b.dataset.view));
-$('#project-switch').onchange = e => { currentProject = Number(e.target.value); currentEpisode = null; load(); };
-$('#episode-switch').onchange = e => { currentEpisode = Number(e.target.value); load(); };
+$('#project-switch').onchange = e => { selectedShotIds.clear(); currentProject = Number(e.target.value); currentEpisode = null; load(); };
+$('#episode-switch').onchange = e => { selectedShotIds.clear(); currentEpisode = Number(e.target.value); load(); };
 $('#refresh').onclick = () => load().then(() => notice('Aktualisiert.')).catch(e => notice(e.message));
 $('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
+
+const userMenuTrigger = $('#user-menu-trigger');
+const userMenu = $('#user-menu');
+function closeUserMenu() {
+  if (!userMenu || !userMenuTrigger) return;
+  userMenu.classList.add('hidden'); userMenuTrigger.setAttribute('aria-expanded', 'false');
+}
+function toggleUserMenu() {
+  const opening = userMenu.classList.contains('hidden');
+  userMenu.classList.toggle('hidden', !opening); userMenuTrigger.setAttribute('aria-expanded', String(opening));
+  if (opening) userMenu.querySelector('[role="menuitem"]')?.focus();
+}
+if (userMenuTrigger) userMenuTrigger.onclick = event => { event.stopPropagation(); toggleUserMenu(); };
+document.addEventListener('click', event => { if (!event.target.closest('.user-menu-wrap')) closeUserMenu(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape') { closeUserMenu(); userMenuTrigger?.focus(); } });
+document.querySelectorAll('[data-user-action]').forEach(button => button.onclick = async () => {
+  const action = button.dataset.userAction; closeUserMenu();
+  if (action === 'queue') openView('queue');
+  if (action === 'settings') document.querySelector('.nav[data-view="settings"]')?.click();
+  if (action === 'logout') { await api('/api/logout', { method:'POST' }); location.reload(); }
+});
+const queueStopAll = $('#queue-stop-all'); if (queueStopAll) queueStopAll.onclick = cancelAllQueueItems;
 
 openStudio().catch(init);

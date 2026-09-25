@@ -4,8 +4,9 @@ from pathlib import Path
 
 def main():
     p=argparse.ArgumentParser()
-    for arg in ['base-url','image','prompt-file','output-dir','name']:
+    for arg in ['base-url','prompt-file','output-dir','name']:
         p.add_argument('--'+arg,required=True)
+    p.add_argument('--image', help='Optional explicitly approved scene guide; omit for reference-led scenes')
     p.add_argument('--width',type=int,default=608)
     p.add_argument('--height',type=int,default=352)
     p.add_argument('--frames',type=int,default=124)
@@ -15,8 +16,15 @@ def main():
     p.add_argument('--crop',nargs=4,type=int,metavar=('X','Y','WIDTH','HEIGHT'))
     p.add_argument('--reference-image',action='append',default=[])
     p.add_argument('--reference-image-size',choices=('match','max'),default='match')
+    p.add_argument('--guide-audio', help='Finished dialogue WAV aligned to frame 0; H3 animates lips to it')
     a=p.parse_args()
     assert a.width%32==0 and a.height%32==0 and (a.frames-5)%17==0
+    if not a.image and not a.reference_image:
+        raise ValueError('At least one reference image or scene guide is required')
+    if len(a.reference_image) > 9:
+        raise ValueError('At most 9 reference images; split the scene instead of dropping references')
+    if a.crop and not a.image:
+        raise ValueError('Crop requires a scene guide')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     statepath=out/(a.name+'.state.json')
     if statepath.exists():
@@ -25,11 +33,14 @@ def main():
     def api(route,data=None):
         req=urllib.request.Request(base+route,data=None if data is None else json.dumps(data).encode(),headers={'Content-Type':'application/json'})
         with urllib.request.urlopen(req,timeout=120) as r:return json.load(r)
-    image=Path(a.image);boundary=uuid.uuid4().hex
-    filename='rabenblut_'+boundary+image.suffix
-    body=(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n').encode()+image.read_bytes()+f'\r\n--{boundary}--\r\n'.encode()
-    req=urllib.request.Request(base+'/upload/image',data=body,headers={'Content-Type':'multipart/form-data; boundary='+boundary})
-    with urllib.request.urlopen(req,timeout=120) as r:uploaded=json.load(r)
+    image=Path(a.image) if a.image else None
+    uploaded=None
+    if image:
+        boundary=uuid.uuid4().hex
+        filename='rabenblut_'+boundary+image.suffix
+        body=(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{filename}"\r\nContent-Type: image/png\r\n\r\n').encode()+image.read_bytes()+f'\r\n--{boundary}--\r\n'.encode()
+        req=urllib.request.Request(base+'/upload/image',data=body,headers={'Content-Type':'multipart/form-data; boundary='+boundary})
+        with urllib.request.urlopen(req,timeout=120) as r:uploaded=json.load(r)
     prompt=Path(a.prompt_file).read_text(encoding='utf-8')
     g={
       'clip':{'class_type':'CLIPLoader','inputs':{'clip_name':'qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors','type':'minimax','device':'default'}},
@@ -37,7 +48,7 @@ def main():
       'avae':{'class_type':'VAELoader','inputs':{'vae_name':'minimax_h3_audio_vae_fp32.safetensors'}},
       'unet':{'class_type':'UNETLoader','inputs':{'unet_name':'minimax_h3_fl2va_pruned_int8_convrot.safetensors','weight_dtype':'default'}},
       'lora':{'class_type':'MiniMaxH3TurboLoRA','inputs':{'model':['unet',0],'lora_name':'minimax_h3_turbo_v4_step600_ema.safetensors','strength':1.0,'low_vram':a.low_vram}},
-      'image':{'class_type':'LoadImage','inputs':{'image':uploaded['name']}},
+      'image':{'class_type':'LoadImage','inputs':{'image':uploaded['name'] if uploaded else ''}},
       'cond':{'class_type':'MiniMaxH3ImageToVideo','inputs':{'clip':['clip',0],'vae':['vae',0],'prompt':prompt,'width':a.width,'height':a.height,'length':a.frames,'first_frame':['image',0]}},
       'guide':{'class_type':'BasicGuider','inputs':{'model':['lora',0],'conditioning':['cond',0]}},
       'sig':{'class_type':'BasicScheduler','inputs':{'model':['lora',0],'scheduler':'simple','steps':a.steps,'denoise':1.0}},
@@ -49,6 +60,8 @@ def main():
       'video':{'class_type':'CreateVideo','inputs':{'images':['decode',0],'audio':['decode_audio',0],'fps':24.0}},
       'save':{'class_type':'SaveVideo','inputs':{'video':['video',0],'filename_prefix':'rabenblut/film_v2/'+a.name,'format':'mp4','codec':'h264'}}
     }
+    if not image:
+        del g['image']
     scene_image=['image',0]
     if a.crop:
         x,y,w,h=a.crop
@@ -72,11 +85,21 @@ def main():
             key='reference_'+str(index+1)
             g[key]={'class_type':'LoadImage','inputs':{'image':refmeta['name']}}
             g['cond']['inputs']['ref_images.ref_image_'+str(index)]=[key,0]
-        g['scene_guide']={'class_type':'MiniMaxH3AddGuide','inputs':{'positive':['cond',0],'vae':['vae',0],'latent':['cond',1],'image':scene_image,'frame_idx':0}}
-        g['guide']['inputs']['conditioning']=['scene_guide',0]
+        if image:
+            g['scene_guide']={'class_type':'MiniMaxH3AddGuide','inputs':{'positive':['cond',0],'vae':['vae',0],'latent':['cond',1],'image':scene_image,'frame_idx':0}}
+            g['guide']['inputs']['conditioning']=['scene_guide',0]
+    if a.guide_audio:
+        ga=Path(a.guide_audio);gb=uuid.uuid4().hex
+        gbody=(f'--{gb}\r\nContent-Disposition: form-data; name="image"; filename="dlg_{gb}.wav"\r\nContent-Type: audio/wav\r\n\r\n').encode()+ga.read_bytes()+f'\r\n--{gb}--\r\n'.encode()
+        request=urllib.request.Request(base+'/upload/image',data=gbody,headers={'Content-Type':'multipart/form-data; boundary='+gb})
+        with urllib.request.urlopen(request,timeout=120) as r:gmeta=json.load(r)
+        g['guide_audio_file']={'class_type':'LoadAudio','inputs':{'audio':gmeta['name']}}
+        # Anchoring the finished speech in H3's joint audio latent makes the picture follow it (lip sync).
+        g['audio_guide']={'class_type':'MiniMaxH3AddGuide','inputs':{'positive':g['guide']['inputs']['conditioning'],'audio_vae':['avae',0],'latent':['cond',1],'audio':['guide_audio_file',0],'frame_idx':0}}
+        g['guide']['inputs']['conditioning']=['audio_guide',0]
     (out/(a.name+'.workflow.json')).write_text(json.dumps(g,indent=2),encoding='utf-8')
     result=api('/prompt',{'prompt':g,'client_id':'rabenblut-film-v2'})
-    state={'prompt_id':result['prompt_id'],'input':str(image.resolve()),'prompt':prompt,'settings':vars(a),'status':'queued'}
+    state={'prompt_id':result['prompt_id'],'input':str(image.resolve()) if image else None,'prompt':prompt,'settings':vars(a),'status':'queued'}
     statepath.write_text(json.dumps(state,indent=2),encoding='utf-8')
     print('QUEUED '+a.name+' '+state['prompt_id'],flush=True)
     started=time.time()

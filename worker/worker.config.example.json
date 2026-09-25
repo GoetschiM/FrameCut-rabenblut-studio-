@@ -5,7 +5,7 @@
   "ComfyRef": "pinokio://comfyui",
   "H3Url": "http://127.0.0.1:8188",
   "H3AppPath": "C:\\Users\\YOUR_USER\\Documents\\Pinokio\\api\\minimax-h3-pinokio.git\\app",
-  "UseH3ReferenceConditioning": true,
+  "UseH3ReferenceConditioning": false,
   "H3ReferenceImageSize": "match",
   "ComfyUrl": "http://127.0.0.1:8190",
   "ComfyAppPath": "C:\\Users\\YOUR_USER\\Documents\\Pinokio\\api\\comfy.git\\app",

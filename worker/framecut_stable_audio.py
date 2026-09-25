@@ -38,6 +38,8 @@ def main() -> int:
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8-sig"))
     prompt = str(spec.get("prompt") or "").strip()
     duration = max(1, min(120, int(spec.get("duration_seconds") or 1)))
+    steps = max(1, min(100, int(spec.get("steps") or 8)))
+    cfg = max(1.0, min(10.0, float(spec.get("cfg") or 1.0)))
     output = Path(str(spec.get("output") or "")).resolve()
     if not prompt:
         raise RuntimeError("Stable Audio needs a non-empty prompt.")
@@ -46,7 +48,7 @@ def main() -> int:
     # Stable Audio 3's launcher exposes this documented /generate endpoint. Values map
     # to its public UI controls: RF-friendly defaults, WAV output and exact duration.
     result = client.predict(
-        prompt, "", duration, 1.0, 8, 0, -1, "pingpong", 1.0,
+        prompt, "", duration, cfg, steps, 0, -1, "pingpong", 1.0,
         0.0, 1.0, 0.0, 0.0, 1.0, "wav", "output.wav", True,
         None, 1.0, "", "", None, "Init audio", 100, 0.3, False,
         0.0, 1, None,
