@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSceneContract, separateStyle } from '../lib/scene-contract.mjs';
+import { buildSceneContract, separateStyle, stripStyleTags } from '../lib/scene-contract.mjs';
 import { createEpisodeAudioManifest, reconcileAudioManifest, validateAudioManifest } from '../lib/audio-manifest.mjs';
 
 const shot = { id: 263, title: 'Portal schliesst', prompt: 'Rick zieht den Hebel und erklärt Morty etwas.', camera: 'Totale', seed: 1, duration_seconds: 5, audio_direction_json: '{}', dialogue_lines: [] };
@@ -65,4 +65,12 @@ test('changed dialogue text still forces a new voice recording', () => {
   const result = reconcileAudioManifest(createEpisodeAudioManifest({ ownerId: 1, projectId: 1, episodeId: 1, shots: shots(6), dialogue: changed }), saved);
   assert.notEqual(result.cues.find(c => c.id === 'dialogue-1-10').state, 'ready');
   assert.equal(result.cues.find(c => c.id === 'dialogue-2-11').state, 'ready');
+});
+
+test('art-style words in appearance tags never reach the prompt; the episode style decides the look', () => {
+  assert.equal(stripStyleTags('young boy, blonde hair, clean comic book style, bold black outlines, flat colors, vector-like, OG letters'), 'young boy, blonde hair, OG letters');
+  const contract = buildSceneContract({ shot, style: 'Modern European 3D animation style.', references: [{ ...rick, visual_tags: 'spiky light-blue hair, clean comic style, white lab coat' }] });
+  assert.match(contract.prompt, /spiky light-blue hair, white lab coat/);
+  assert.doesNotMatch(contract.prompt, /comic/);
+  assert.equal(contract.references[0].visual_tags, 'spiky light-blue hair, white lab coat');
 });

@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { readFile, stat, mkdir, writeFile, copyFile, rm } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
-import { buildSceneContract, reviewIsCurrent, REVIEW_CHECKS } from './lib/scene-contract.mjs';
+import { buildSceneContract, reviewIsCurrent, REVIEW_CHECKS, stripStyleTags } from './lib/scene-contract.mjs';
 import { createHash, randomBytes, scryptSync, timingSafeEqual, createCipheriv, createDecipheriv } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
@@ -796,7 +796,7 @@ async function callProviderJson(provider, key, model, instruction, meta = {}) {
   return parseModelJson(provider,text);
 }
 async function callPlanner(provider,key,model,instruction,meta={}){return cleanPlan(await callProviderJson(provider,key,model,instruction,meta));}
-function visualTagSource(asset) { return createHash('sha256').update(JSON.stringify(['tags-v2', asset.name, asset.kind, asset.summary || '', asset.visual_notes || '', asset.age_years ?? '', asset.height_cm ?? ''])).digest('hex'); }
+function visualTagSource(asset) { return createHash('sha256').update(JSON.stringify(['tags-v3', asset.name, asset.kind, asset.summary || '', asset.visual_notes || '', asset.age_years ?? '', asset.height_cm ?? ''])).digest('hex'); }
 let visualTagRefreshRunning = false;
 // Fills missing/stale English appearance tags for assets that waiting or running videos need.
 async function refreshVisualTags(limit = 8) {
@@ -815,6 +815,8 @@ async function refreshVisualTags(limit = 8) {
     for (const asset of assets) {
       if (updated >= limit || seen.has(asset.id)) continue;
       seen.add(asset.id);
+      // Tags written from the reference picture are authoritative and never regenerated.
+      if (asset.visual_tags && asset.visual_tags_source === 'manual') continue;
       const source = visualTagSource(asset);
       if (asset.visual_tags && asset.visual_tags_source === source) continue;
       if (!String(asset.summary || '').trim() && !String(asset.visual_notes || '').trim()) continue;
@@ -826,12 +828,12 @@ Height: ${asset.height_cm} cm` : ''}
 Description (may be German): ${String(asset.visual_notes || '').slice(0, 1500)}
 Story role (context only, do not describe actions): ${String(asset.summary || '').slice(0, 400)}
 Project visual style (context): ${String(asset.style || '').slice(0, 500)}
-Rules: comma-separated keywords, maximum 40 words, only visible appearance (age, build, face, hair colour and shape, clothing, colours, materials, distinguishing features). No sentences, no story, no actions, no emotions, no facial expressions, no mouth or lip states (never 'open mouth', 'drooling', 'smiling', 'talking'), no other characters. If the style clearly refers to an existing animated franchise and this is one of its known characters, use that character's canonical look. Return JSON: {"tags":"..."}`;
+Rules: comma-separated keywords, maximum 40 words, only visible appearance (age, build, face, hair colour and shape, clothing, colours, materials, distinguishing features). No sentences, no story, no actions, no emotions, no facial expressions, no mouth or lip states (never 'open mouth', 'drooling', 'smiling', 'talking'), no other characters, no art style, medium or rendering words (never 'comic', 'cartoon', '3D', 'outlines', 'flat colors', 'vector'); the style is applied separately. If the style clearly refers to an existing animated franchise and this is one of its known characters, use that character's canonical look. Return JSON: {"tags":"..."}`;
       for (const { provider } of available) {
         try {
           const stored = providerKey(account.user_id, provider); if (!stored) continue;
           const result = await callProviderJson(provider, stored.key, stored.model || '', instruction, { userId: account.user_id, purpose: 'visual_tags' });
-          const tags = String(result?.tags || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+          const tags = stripStyleTags(String(result?.tags || '').replace(/\s+/g, ' ').trim()).slice(0, 400);
           if (tags.length < 8) continue;
           run('UPDATE assets SET visual_tags=?, visual_tags_source=? WHERE id=?', tags, source, asset.id);
           event('Aussehens-Stichworte erzeugt', `${asset.name}: ${tags.slice(0, 120)}`);
