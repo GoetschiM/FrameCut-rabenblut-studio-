@@ -389,7 +389,8 @@ function Ensure-StableAudio {
   # still-open launcher process into a false failed audio job.
   $start=Invoke-PtermBounded 'run' 45 $stableAudioRef @('--default',$stableAudioLaunchScript)
   if($start.TimedOut){
-    if(Wait-PinokioReady $stableAudioRef 90){return [string](Get-PinokioStatus $stableAudioRef).ready_url}
+    # A cold start after a reboot loads the model for several minutes; 90 s was too short.
+    if(Wait-PinokioReady $stableAudioRef 600){return [string](Get-PinokioStatus $stableAudioRef).ready_url}
     throw 'Pinokio konnte Stable Audio nicht rechtzeitig starten.'
   }
   if(-not (Wait-PinokioReady $stableAudioRef 900)){throw 'Stable Audio wurde nicht rechtzeitig bereit.'}
