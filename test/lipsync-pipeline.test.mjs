@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSceneContract, separateStyle, stripStyleTags } from '../lib/scene-contract.mjs';
+import { buildSceneContract, separateStyle, stripStyleTags, mentionsAsset } from '../lib/scene-contract.mjs';
 import { createEpisodeAudioManifest, reconcileAudioManifest, validateAudioManifest } from '../lib/audio-manifest.mjs';
 
 const shot = { id: 263, title: 'Portal schliesst', prompt: 'Rick zieht den Hebel und erklärt Morty etwas.', camera: 'Totale', seed: 1, duration_seconds: 5, audio_direction_json: '{}', dialogue_lines: [] };
@@ -73,4 +73,14 @@ test('art-style words in appearance tags never reach the prompt; the episode sty
   assert.match(contract.prompt, /spiky light-blue hair, white lab coat/);
   assert.doesNotMatch(contract.prompt, /comic/);
   assert.equal(contract.references[0].visual_tags, 'spiky light-blue hair, white lab coat');
+});
+
+test('German inflections still count as a mention; unmentioned linked characters stay out', () => {
+  assert.ok(mentionsAsset('Der Fokus', 'Leo steht vor Nani und hält ihr den Fokus entgegen.'));
+  assert.ok(mentionsAsset('Nanis Smartphone', 'Nani legt ihr Smartphone beiseite.'));
+  assert.ok(mentionsAsset('Nani', 'Nanis Augen leuchten.'));
+  assert.ok(mentionsAsset('Mr. Guggisberg', 'Guggisberg hebt die Lupe.'));
+  assert.ok(!mentionsAsset('Nani', 'Leo sitzt allein am Bach.'));
+  assert.ok(!mentionsAsset('Urnani', 'Urnini lächelt.'));
+  assert.ok(!mentionsAsset('Leo', 'Leopold kommt herein.'));
 });
