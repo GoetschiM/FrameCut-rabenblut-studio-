@@ -58,16 +58,46 @@ try {
     Expand-Archive -LiteralPath $archive -DestinationPath $stage -Force
     $required=@('FrameCut-Worker.ps1','FrameCut-Worker.bat','FrameCut-Worker-Update.ps1','worker.version.json',[string]$manifest.entrypoint)
     foreach($file in $required){if(-not(Test-Path -LiteralPath (Join-Path $stage $file))){throw "Worker-Update enthält '$file' nicht."}}
-    Get-ChildItem -LiteralPath $stage -Force | ForEach-Object {
-      if($_.Name -ne 'data'){Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $WorkerRoot $_.Name) -Recurse -Force}
+    # Copy files by relative path. Copying the adapters directory into an existing
+    # adapters directory creates adapters/adapters on Windows and leaves old code active.
+    $stagePrefix=[IO.Path]::GetFullPath($stage).TrimEnd('\')+'\'
+    $rootPrefix=[IO.Path]::GetFullPath($WorkerRoot).TrimEnd('\')+'\'
+    $backup=Join-Path $updateRoot ('backup-'+[guid]::NewGuid().ToString('N'))
+    $installed=@()
+    try {
+      foreach($file in Get-ChildItem -LiteralPath $stage -File -Recurse -Force){
+        $relative=$file.FullName.Substring($stagePrefix.Length)
+        if($relative -match '^data[\\/]'){continue}
+        $target=[IO.Path]::GetFullPath((Join-Path $WorkerRoot $relative))
+        if(-not $target.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)){throw 'Ungültiger Pfad im Worker-Update.'}
+        $saved=Join-Path $backup $relative
+        $existed=Test-Path -LiteralPath $target
+        if($existed){New-Item -ItemType Directory -Force -Path (Split-Path $saved -Parent)|Out-Null;Copy-Item -LiteralPath $target -Destination $saved}
+        $installed+=@{Target=$target;Saved=$saved;Existed=$existed}
+        New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent)|Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+      }
+    } catch {
+      foreach($file in $installed){
+        if($file.Existed){Copy-Item -LiteralPath $file.Saved -Destination $file.Target -Force}
+        elseif(Test-Path -LiteralPath $file.Target){Remove-Item -LiteralPath $file.Target -Force}
+      }
+      throw
     }
     Log "Update auf Version $($manifest.version) installiert."
   } finally {
     Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    $resolvedStage=[IO.Path]::GetFullPath($stage)
+    $resolvedUpdates=[IO.Path]::GetFullPath($updateRoot).TrimEnd('\')+'\'
+    if($resolvedStage.StartsWith($resolvedUpdates,[StringComparison]::OrdinalIgnoreCase)){
+      Remove-Item -LiteralPath $resolvedStage -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
   $entry=Join-Path $WorkerRoot ([string]$manifest.entrypoint)
   Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c',('"'+$entry+'"')) -WorkingDirectory $WorkerRoot -WindowStyle Hidden
 } catch {
   try { Log "Update fehlgeschlagen: $($_.Exception.Message)" } catch {}
+  # A failed download must not leave a remote render machine permanently offline.
+  $fallback=Join-Path $WorkerRoot 'FrameCut-Worker.bat'
+  if(Test-Path -LiteralPath $fallback){Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c',('"'+$fallback+'"')) -WorkingDirectory $WorkerRoot -WindowStyle Hidden}
 }

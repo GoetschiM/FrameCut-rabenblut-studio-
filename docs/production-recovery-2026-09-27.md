@@ -6,7 +6,8 @@
 - Cache nach Videodatei, Quellrevision, Audio-Dateien, Zeitversatz und Lautstärke. Geänderte Spuren erhalten eine neue Vorschau. Maximal zwei gleichzeitige Vorschau-Mixe.
 - Worker bricht bei fehlgeschlagener Audio-Führung oder nicht entfernbarer Modelltonspur ab, statt still ein falsches Ergebnis auszuliefern.
 - Gemischte Stiltexte behalten Licht/Texturen; angehängte Werkstatt-/Bus-/Zahnrad-Inhalte werden getrennt. Gespeicherte Stiltexte bleiben unverändert.
-- Worker-Release 2026.09.27.2: vollständiger aktueller Code, inklusive Kaltstart- und H3-Timeout-Fixes. PowerShell-Dateien im Paket enthalten UTF-8-BOM für Windows PowerShell 5.1.
+- Worker-Release 2026.09.27.3: vollständiger aktueller Code, inklusive Kaltstart- und H3-Timeout-Fixes. PowerShell-Dateien im Paket enthalten UTF-8-BOM für Windows PowerShell 5.1.
+- Updater kopiert Adapter dateiweise an die korrekten Pfade, mit Sicherung und Rücknahme bei Kopierfehlern; `adapters/adapters` durch rekursives Verzeichniskopieren wird vermieden. Ein fehlgeschlagenes Update lässt den alten Worker wieder starten.
 - Versionsmeldung quittiert tatsächlich angeforderte Updates und erhält den bisherigen Runtime-Status, statt fehlende Modelle als bereit auszugeben.
 
 ## Nachprüfbare Tests
