@@ -968,7 +968,10 @@ function Process-Job($payload) {
     Write-Host ("Referenzgeführte Szene ohne falsches Text-Startbild: {0} Fotos" -f $cleanRefs.Count) -ForegroundColor Cyan
   }
   $renderTimeout=if($config.RenderTimeoutSeconds){[Math]::Max(300,[int]$config.RenderTimeoutSeconds)}else{1800}
-  Invoke-BoundedPython $renderArgs $renderTimeout 'MiniMax H3'
+  # A render that hits the limit means H3 hung (GPU idle, interrupt ignored) while Pinokio still
+  # reports it ready; without a reset every following shot would hang on the same process.
+  try { Invoke-BoundedPython $renderArgs $renderTimeout 'MiniMax H3' }
+  catch { if("$_" -match 'Zeitlimit'){Reset-H3}; throw }
   $result=Get-ChildItem -LiteralPath $outputDir -Filter "$name*.mp4"|Sort-Object LastWriteTime -Descending|Select-Object -First 1
   if(-not $result){throw 'MiniMax H3 meldete Erfolg, aber es wurde keine MP4-Datei gefunden.'}
   # The model always generates an audio track and its speech/music output is unusable, so the
