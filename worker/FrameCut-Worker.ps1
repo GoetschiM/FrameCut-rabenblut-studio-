@@ -75,15 +75,11 @@ $failedJobRetentionHours = if ($config.FailedJobRetentionHours -ne $null) { [Mat
 $minimumFreeDiskGb = if ($config.MinimumFreeDiskGb -ne $null) { [Math]::Max(1, [double]$config.MinimumFreeDiskGb) } else { 12 }
 $script:storageWarned = $false
 
-# Clips are delivered without sound by default; set StripAudio to false in worker.config.json
-# to keep whatever the video model generated.
-$stripAudio = -not ($config.PSObject.Properties.Name -contains 'StripAudio' -and $config.StripAudio -eq $false)
+# Production sound comes exclusively from reviewed external cues. A legacy
+# StripAudio=false must not reintroduce invented speech or model music.
+$stripAudio = $true
 $h3AppPath = if ($config.H3AppPath) { $config.H3AppPath } else { Join-Path $pinokioHome 'api\minimax-h3-pinokio.git\app' }
 $h3ReferenceModel = Join-Path $h3AppPath 'models\diffusion_models\minimax_h3_ref2va_pruned_int8_convrot.safetensors'
-# Auto-enable exact H3 identity conditioning when the local Ref2VA model exists.
-# An explicit false remains an emergency fallback to the ordinary image-to-video path.
-$useH3ReferenceConditioning = $config.PSObject.Properties.Name -contains 'UseH3ReferenceConditioning' -and $config.UseH3ReferenceConditioning -eq $true
-$h3ReferenceImageSize = if ($config.H3ReferenceImageSize -in @('match','max')) { [string]$config.H3ReferenceImageSize } else { 'match' }
 $ffmpegExe = if ($config.FfmpegPath -and (Test-Path -LiteralPath $config.FfmpegPath)) { $config.FfmpegPath }
   elseif ((Get-Command ffmpeg -ErrorAction SilentlyContinue)) { (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }
   elseif (Test-Path -LiteralPath (Join-Path $workerRoot 'tools\ffmpeg\bin\ffmpeg.exe')) { Join-Path $workerRoot 'tools\ffmpeg\bin\ffmpeg.exe' }
@@ -239,7 +235,7 @@ function Read-WorkerToken {
   $plain=[System.Security.Cryptography.ProtectedData]::Unprotect($bytes,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
   return [Text.Encoding]::Unicode.GetString($plain)
 }
-function Headers { return @{'x-framecut-worker'=(Read-WorkerToken);'x-framecut-worker-id'=$config.WorkerId} }
+function Headers { return @{'x-framecut-worker'=(Read-WorkerToken);'x-framecut-worker-id'=$config.WorkerId;'x-framecut-scene-pipeline'='5'} }
 function Get-RuntimeInventory {
   $modelRoot=Join-Path $h3AppPath 'models'
   return [ordered]@{
@@ -845,13 +841,13 @@ function Process-Job($payload) {
   Free-Models $config.H3Url
   Free-Models $config.ComfyUrl
   $jobRoot=Join-Path $runtimeRoot ("jobs\{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $jobRoot|Out-Null
-  # A new immutable contract and fresh downloads for EVERY job. No text-only
-  # keyframe, name matching, first-nine truncation or legacy approved-keyframe cache.
+  # A new immutable contract and fresh downloads for EVERY job. References only
+  # condition the scene-keyframe stage, never frame zero of the final video.
   $contract=$payload.sceneContract
-  if(-not $contract -or [int]$contract.version -ne 4){throw 'Server/Worker inkompatibel: Szenenvertrag v4 fehlt.'}
+  if(-not $contract -or [int]$contract.version -ne 5){throw 'Server/Worker inkompatibel: Szenenvertrag v5 fehlt. Worker und Server aktualisieren.'}
   $cleanRefs=@()
   $pictureNumber=0
-  if($useH3ReferenceConditioning -and $contract.rawReferenceImages -eq $true){
+  if($contract.keyframe -and $contract.keyframe.mode -eq 'h3-reference-keyframe-v1'){
     foreach($item in @($contract.references)){
       foreach($photo in @($item.photos)){
         $pictureNumber++
@@ -862,21 +858,30 @@ function Process-Job($payload) {
         $cleanRefs+=$localRef
       }
     }
-  } else { Write-Host 'Roh-Referenzbilder sind für MiniMax deaktiviert; es wird nur der vollflächige Szenenguide animiert.' -ForegroundColor Cyan }
+    if($cleanRefs.Count -eq 0){throw 'Referenzgeführtes Szenenbild angefordert, aber keine Fotos vorhanden.'}
+  } elseif(@($contract.references).Count -gt 0){throw 'Referenzfotos vorhanden, aber Referenz-Szenenbildplan fehlt. Kein stiller Text-only-Fallback.'}
   if($cleanRefs.Count -gt 9){throw 'Mehr als 9 Referenzfotos: Szene aufteilen; keine Referenzen werden ausgelassen.'}
   foreach($warning in @($contract.warnings)){Write-Host $warning -ForegroundColor Yellow}
   $sceneKeyframe=$null
-  if($cleanRefs.Count -eq 0 -or $config.UseGeneratedSceneGuide -ne $false){
-    # H3 Ref2VA must receive a separate composition guide. Without it the first
-    # semantic reference can become frame 0 (character sheet/contact-sheet bug).
-    # The keyframe establishes composition and the project look. Identity remains
-    # controlled by H3's freshly downloaded reference photos, never by embedding a
-    # reference card as frame zero. Keep audio instructions out of this still-image
-    # prompt, but always retain the locked episode style.
+  if($cleanRefs.Count -gt 0){
+    Free-Models $config.ComfyUrl
+    Stop-OwnedComfy
+    Ensure-H3
+    $keyframePrompt=Join-Path $jobRoot 'keyframe-prompt.txt'
+    [IO.File]::WriteAllText($keyframePrompt,[string]$contract.keyframe.prompt,(New-Object Text.UTF8Encoding($false)))
+    $keyframeName='scene-keyframe-'+[guid]::NewGuid().ToString('N')
+    $keyframeArgs=@($renderClient,'--base-url',$config.H3Url,'--prompt-file',$keyframePrompt,'--output-dir',$jobRoot,'--name',$keyframeName,'--keyframe','--width',[string]$contract.keyframe.width,'--height',[string]$contract.keyframe.height,'--frames',[string]$contract.keyframe.frames,'--steps',[string]$contract.keyframe.steps,'--seed',[string]([int]$shot.seed),'--low-vram')
+    foreach($refPath in $cleanRefs){$keyframeArgs+=@('--reference-image',$refPath)}
+    Write-Host ("Szenenbild mit {0} frisch geladenen Referenzfotos; keine Porträt-Startbilder im Video." -f $cleanRefs.Count) -ForegroundColor Cyan
+    $keyframeTimeout=if($config.RenderTimeoutSeconds){[Math]::Max(300,[int]$config.RenderTimeoutSeconds)}else{1800}
+    try {Invoke-BoundedPython $keyframeArgs $keyframeTimeout 'MiniMax H3 Referenz-Szenenbild'}
+    catch {if("$_" -match 'Zeitlimit'){Reset-H3};throw}
+    $sceneKeyframe=Join-Path $jobRoot ($keyframeName+'.png')
+    if(-not(Test-Path -LiteralPath $sceneKeyframe)){throw 'Referenz-Szenenbild fehlt. Video wird nicht mit einem Ersatzporträt gestartet.'}
+    if(Test-KeyframeHasWhiteStudioBackground $sceneKeyframe){throw 'Referenz-Szenenbild enthält noch einen weißen Studiohintergrund. Video gestoppt; Komposition prüfen.'}
+  } else {
+    # Scenes with no reference subjects can use the text-to-image composer.
     $guidePrompt = Get-SharedSceneGuidePrompt $contract $shot
-    # A guide controls framing only; it is deliberately low-resolution and quick.
-    # H3 receives the real reference photos independently and renders the final
-    # preview/final resolution, so this does not trade away character fidelity.
     $guideNegative=(@([string]$job.negative_prompt,'character sheet','model sheet','reference image','turnaround','split screen','collage','portrait insert','white studio panel','white background','border','cutout')|Where-Object {$_}) -join ', '
     $sceneKeyframe=$null
     for($guideAttempt=1;$guideAttempt -le 3;$guideAttempt++){
@@ -961,11 +966,7 @@ function Process-Job($payload) {
   $renderArgs=@($renderClient,'--base-url',$config.H3Url,'--prompt-file',$promptFile,'--output-dir',$outputDir,'--name',$name,'--width',[string]$renderWidth,'--height',[string]$renderHeight,'--frames',[string]$frames,'--steps',[string]$videoSteps,'--seed',[string]([int]$shot.seed),'--low-vram')
   if($sceneKeyframe){$renderArgs += @('--image',$sceneKeyframe)}
   if($speechGuide){$renderArgs += @('--guide-audio',$speechGuide)}
-  foreach($refPath in $cleanRefs){$renderArgs += @('--reference-image',$refPath)}
-  if($cleanRefs.Count -gt 0){
-    $renderArgs += @('--reference-image-size',$h3ReferenceImageSize)
-    Write-Host ("Referenzgeführte Szene ohne falsches Text-Startbild: {0} Fotos" -f $cleanRefs.Count) -ForegroundColor Cyan
-  }
+  # Never pass cleanRefs into this second pass. Only the composed scene is frame 0.
   $renderTimeout=if($config.RenderTimeoutSeconds){[Math]::Max(300,[int]$config.RenderTimeoutSeconds)}else{1800}
   # A render that hits the limit means H3 hung (GPU idle, interrupt ignored) while Pinokio still
   # reports it ready; without a reset every following shot would hang on the same process.

@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { readFile, stat, mkdir, writeFile, copyFile, rm } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
-import { buildSceneContract, reviewIsCurrent, REVIEW_CHECKS, stripStyleTags } from './lib/scene-contract.mjs';
+import { buildSceneContract, reviewIsCurrent, REVIEW_CHECKS, stripStyleTags, SCENE_PIPELINE_VERSION } from './lib/scene-contract.mjs';
 import { createHash, randomBytes, scryptSync, timingSafeEqual, createCipheriv, createDecipheriv } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
@@ -2450,6 +2450,9 @@ const server = http.createServer(async (req, res) => {
       const workerAuth = workerGuard(req,res); if (!workerAuth) return;
       const workerId = workerAuth.id;
       const requiredVersion = publishedWorkerVersion();
+      if (String(req.headers['x-framecut-scene-pipeline'] || '') !== String(SCENE_PIPELINE_VERSION)) {
+        return json(res,409,{error:`Worker unterstützt den Szenenworkflow v${SCENE_PIPELINE_VERSION} noch nicht. Bitte Worker aktualisieren.`,requiredVersion,scenePipelineVersion:SCENE_PIPELINE_VERSION});
+      }
       if (!workerAuth.legacy && requiredVersion && String(workerAuth.worker.installer_version || '') !== requiredVersion) {
         run("UPDATE workers SET last_seen=?,status='awaiting_runtime' WHERE id=?", now(), workerId);
         return json(res, 409, { error:`Worker-Update ${requiredVersion} erforderlich. Installiert: ${workerAuth.worker.installer_version || 'unbekannt'}.`, requiredVersion, installedVersion:workerAuth.worker.installer_version || null });

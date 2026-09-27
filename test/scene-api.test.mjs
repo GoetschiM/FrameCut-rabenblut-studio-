@@ -28,13 +28,16 @@ test('real HTTP claim/download/upload/review and stale-reference rejection',asyn
     db.prepare('INSERT INTO asset_photos(asset_id,file_path,is_primary,created_at) VALUES (1,?,0,?)').run('data/uploads/b.png',now);
     db.exec("INSERT INTO shot_assets(shot_id,asset_id,role) VALUES (1,1,'reference')");
     db.prepare('INSERT INTO jobs(id,episode_id,shot_id,kind,label,state,created_at) VALUES (1,1,1,?,?,?,?)').run('minimax_h3','Test','wartet',now);
-    const worker={'x-framecut-worker':'test-worker-only'},user={cookie:'rabenblut_session=test-session','content-type':'application/json'};
+    const worker={'x-framecut-worker':'test-worker-only','x-framecut-scene-pipeline':'5'},user={cookie:'rabenblut_session=test-session','content-type':'application/json'};
     const req=(path,options={})=>fetch('http://127.0.0.1:14379'+path,options);
+    assert.equal((await req('/api/worker/next',{headers:{'x-framecut-worker':'test-worker-only'}})).status,409);
+    assert.equal(db.prepare('SELECT state FROM jobs WHERE id=1').get().state,'wartet');
     const claim=await req('/api/worker/next',{headers:worker});assert.equal(claim.status,200);const payload=await claim.json();
     assert.equal(payload.sceneContract.references[0].photos.length,2);
     assert.doesNotMatch(payload.sceneContract.prompt,/Red city buses/);
     assert.doesNotMatch(payload.sceneContract.prompt,/<Picture/);
     assert.equal(payload.sceneContract.rawReferenceImages,false);
+    assert.match(payload.sceneContract.keyframe.prompt,/<Picture 1> and <Picture 2>: Leo/);
     const download=await req(payload.sceneContract.references[0].photos[1].downloadUrl,{headers:worker});assert.equal(await download.text(),'reference-b');
     const upload=()=>req('/api/worker/jobs/1/video',{method:'POST',headers:{...worker,'content-type':'video/mp4','x-framecut-scene-fingerprint':payload.sceneContract.fingerprint},body:'test-video'});
     assert.equal((await upload()).status,201);

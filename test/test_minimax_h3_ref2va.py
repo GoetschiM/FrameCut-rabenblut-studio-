@@ -27,6 +27,40 @@ class JsonResponse(io.BytesIO):
 
 
 class Ref2VAGraphTest(unittest.TestCase):
+    def test_keyframe_uses_last_generated_frame_without_portrait_or_audio_anchor(self):
+        adapter = load_adapter()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'ref.png').write_bytes(b'reference')
+            (root / 'prompt.txt').write_text('<Picture 1> is Leo in the tower.', encoding='utf-8')
+            def request(req, timeout=120):
+                url = req.full_url if hasattr(req, 'full_url') else req
+                if url.endswith('/upload/image'):
+                    return JsonResponse(b'{"name":"unique-ref.png"}')
+                if url.endswith('/prompt'):
+                    return JsonResponse(b'{"prompt_id":"test"}')
+                if '/history/' in url:
+                    return JsonResponse(b'{"test":{"status":{"status_str":"success"},"outputs":{"save":{"images":[{"filename":"scene.png","subfolder":"","type":"output"}]}}}}')
+                if '/view?' in url:
+                    return JsonResponse(b'generated scene pixels')
+                raise AssertionError(url)
+            argv = ['render_shot.py', '--base-url', 'http://mock', '--prompt-file', str(root/'prompt.txt'), '--output-dir', str(root), '--name', 'key', '--keyframe', '--frames', '22', '--reference-image', str(root/'ref.png')]
+            with patch.object(sys, 'argv', argv), patch.object(adapter.urllib.request, 'urlopen', side_effect=request):
+                adapter.main()
+            graph = json.loads((root/'key.workflow.json').read_text())
+            self.assertEqual(graph['keyframe']['inputs'], {'image':['decode',0], 'batch_index':21, 'length':1})
+            self.assertEqual(graph['save']['class_type'], 'SaveImage')
+            for forbidden in ('image', 'scene_guide', 'audio_guide', 'decode_audio', 'video'):
+                self.assertNotIn(forbidden, graph)
+            self.assertEqual((root/'key.png').read_bytes(), b'generated scene pixels')
+            self.assertEqual(json.loads((root/'key.state.json').read_text())['status'], 'complete')
+
+    def test_keyframe_rejects_pinning_reference_to_frame_zero(self):
+        adapter = load_adapter()
+        argv = ['render_shot.py', '--base-url', 'http://mock', '--prompt-file', 'unused', '--output-dir', 'unused', '--name', 'unused', '--keyframe', '--image', 'portrait.png', '--reference-image', 'portrait.png']
+        with patch.object(sys, 'argv', argv), self.assertRaisesRegex(ValueError, 'without a pinned image'):
+            adapter.main()
+
     def test_reference_only_scene_has_no_pinned_frame_or_previous_reference(self):
         adapter = load_adapter()
         with tempfile.TemporaryDirectory() as temp:

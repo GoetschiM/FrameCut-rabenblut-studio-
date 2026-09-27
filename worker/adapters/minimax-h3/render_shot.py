@@ -17,6 +17,7 @@ def main():
     p.add_argument('--reference-image',action='append',default=[])
     p.add_argument('--reference-image-size',choices=('match','max'),default='match')
     p.add_argument('--guide-audio', help='Finished dialogue WAV aligned to frame 0; H3 animates lips to it')
+    p.add_argument('--keyframe', action='store_true', help='Generate a reference-conditioned scene PNG; never pin a reference to frame zero')
     a=p.parse_args()
     assert a.width%32==0 and a.height%32==0 and (a.frames-5)%17==0
     if not a.image and not a.reference_image:
@@ -25,6 +26,8 @@ def main():
         raise ValueError('At most 9 reference images; split the scene instead of dropping references')
     if a.crop and not a.image:
         raise ValueError('Crop requires a scene guide')
+    if a.keyframe and (not a.reference_image or a.image or a.guide_audio):
+        raise ValueError('Keyframe mode requires identity references, without a pinned image or audio guide')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     statepath=out/(a.name+'.state.json')
     if statepath.exists():
@@ -97,6 +100,15 @@ def main():
         # Anchoring the finished speech in H3's joint audio latent makes the picture follow it (lip sync).
         g['audio_guide']={'class_type':'MiniMaxH3AddGuide','inputs':{'positive':g['guide']['inputs']['conditioning'],'audio_vae':['avae',0],'latent':['cond',1],'audio':['guide_audio_file',0],'frame_idx':0}}
         g['guide']['inputs']['conditioning']=['audio_guide',0]
+    if a.keyframe:
+        # Semantic pictures condition the identity, not frame zero. Decode a short
+        # independent scene and use its last frame for the subsequent I2V pass.
+        # Do not create/decode model audio or pass raw portraits to that I2V pass.
+        del g['decode_audio']
+        del g['video']
+        g['keyframe']={'class_type':'ImageFromBatch','inputs':{'image':['decode',0],'batch_index':a.frames-1,'length':1}}
+        g['save']={'class_type':'SaveImage','inputs':{'images':['keyframe',0],'filename_prefix':'framecut/keyframes/'+a.name}}
+    extension='.png' if a.keyframe else '.mp4'
     (out/(a.name+'.workflow.json')).write_text(json.dumps(g,indent=2),encoding='utf-8')
     result=api('/prompt',{'prompt':g,'client_id':'rabenblut-film-v2'})
     state={'prompt_id':result['prompt_id'],'input':str(image.resolve()) if image else None,'prompt':prompt,'settings':vars(a),'status':'queued'}
@@ -112,16 +124,16 @@ def main():
                 state['status']='error';statepath.write_text(json.dumps(state,indent=2),encoding='utf-8')
                 raise RuntimeError(json.dumps(record['status']))
             outputs=record.get('outputs',{}).get('save',{})
-            media=[v for values in outputs.values() if isinstance(values,list) for v in values if isinstance(v,dict) and v.get('filename','').endswith('.mp4')]
+            media=[v for values in outputs.values() if isinstance(values,list) for v in values if isinstance(v,dict) and v.get('filename','').endswith(extension)]
             if media:
                 meta=media[0]
                 with urllib.request.urlopen(base+'/view?'+urllib.parse.urlencode({k:meta[k] for k in ['filename','subfolder','type'] if k in meta}),timeout=120) as r:
-                    (out/(a.name+'.mp4')).write_bytes(r.read())
+                    (out/(a.name+extension)).write_bytes(r.read())
                 state.update(status='complete',elapsed=time.time()-started,media=meta)
                 statepath.write_text(json.dumps(state,indent=2),encoding='utf-8')
-                print('DONE '+str(out/(a.name+'.mp4')),flush=True)
+                print('DONE '+str(out/(a.name+extension)),flush=True)
                 return
-            if status=='success':raise RuntimeError('No MP4 metadata: '+json.dumps(outputs))
+            if status=='success':raise RuntimeError('No '+extension+' metadata: '+json.dumps(outputs))
         time.sleep(5)
     raise TimeoutError(state['prompt_id'])
 

@@ -10,6 +10,11 @@ test('multiple photos belong to one identity, pronouns do not discard cast',()=>
   assert.match(c.prompt,/Brunnen, exactly ONE location/);
   assert.doesNotMatch(c.prompt,/<Picture/);
   assert.match(c.prompt,/age 6 years, height 115 cm/);
+  assert.equal(c.version,5);
+  assert.equal(c.keyframe.mode,'h3-reference-keyframe-v1');
+  assert.match(c.keyframe.prompt,/<Picture 1> and <Picture 2>: Leo, exactly ONE character/);
+  assert.match(c.keyframe.prompt,/<Picture 3>: Brunnen, the SAME location/);
+  assert.equal(c.rawReferenceImages,false);
 });
 test('missing photos and overflow fail rather than silently omit references',()=>{
   const b=base();b.references[0].photos=[];assert.throws(()=>buildSceneContract(b),/fehlen/);
@@ -33,6 +38,7 @@ test('every content revision invalidates previous approval and render provenance
 test('contracts are isolated and deterministic',()=>{
   const b=base();assert.equal(buildSceneContract(b).fingerprint,buildSceneContract(b).fingerprint);
   const next=base();next.references=[];assert.doesNotMatch(buildSceneContract(next).prompt,/<Picture/);
+  assert.equal(buildSceneContract(next).keyframe,null);
   assert.equal(separateStyle('Watercolor, soft light.').text,'Watercolor, soft light.');
 });
 test('stale automated asset links are excluded before they can reach the video model',()=>{
@@ -41,4 +47,6 @@ test('stale automated asset links are excluded before they can reach the video m
   assert.deepEqual(c.references.map(x=>x.name),['Leo','Brunnen']);
   assert.match(c.warnings.join('\n'),/Tesla/);
   assert.doesNotMatch(c.prompt,/Tesla/);
+  assert.doesNotMatch(c.keyframe.prompt,/Tesla/);
+  assert.doesNotMatch(c.keyframe.prompt,/<Picture 4>/);
 });

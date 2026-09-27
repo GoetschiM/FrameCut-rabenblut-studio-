@@ -52,7 +52,7 @@ test('two workers atomically claim different jobs and queue exposes both assignm
     const updated = db.prepare('SELECT update_requested_version,runtime_json FROM workers WHERE id=?').get(registration.workerId);
     assert.equal(updated.update_requested_version, null);
     assert.equal(updated.runtime_json, '{"keep":true}');
-    const claim = workerId => fetch(base + '/api/worker/next', { headers:{'x-framecut-worker':'test-fleet-token','x-framecut-worker-id':workerId} });
+    const claim = workerId => fetch(base + '/api/worker/next', { headers:{'x-framecut-worker':'test-fleet-token','x-framecut-worker-id':workerId,'x-framecut-scene-pipeline':'5'} });
     const [firstResponse, secondResponse] = await Promise.all([claim('worker-a'), claim('worker-b')]);
     assert.equal(firstResponse.status, 200);
     assert.equal(secondResponse.status, 200);
