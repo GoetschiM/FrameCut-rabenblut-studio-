@@ -59,6 +59,15 @@ test('a lip-sync trim keeps every rendered cue, moves later lines and keeps spok
   assert.deepEqual(validateAudioManifest(result), []);
 });
 
+test('mixed style keeps light and textures without workshop, buses and gears', () => {
+  const result = separateStyle('Soft volumetric light streaming through dust motes in a vast Swiss bus workshop. Distinct matte-painted textures, vibrant Swiss red accents on city buses, warm sandstone, gleaming polished brass and gold steampunk gears.');
+  assert.match(result.text, /Soft volumetric light streaming through dust motes/);
+  assert.match(result.text, /matte-painted textures/);
+  assert.match(result.text, /vibrant Swiss red accents/);
+  assert.doesNotMatch(result.text, /workshop|buses|gears/i);
+  assert.ok(result.excluded.length >= 3);
+});
+
 test('changed dialogue text still forces a new voice recording', () => {
   const saved = rendered(6);
   const changed = dialogue.map(line => line.id === 10 ? { ...line, text: 'Ein ganz anderer Satz.' } : line);

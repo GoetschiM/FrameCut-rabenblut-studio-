@@ -44,6 +44,14 @@ test('two workers atomically claim different jobs and queue exposes both assignm
     assert.equal(heartbeatResponse.status, 200);
     assert.equal((await heartbeatResponse.json()).status, 'awaiting_runtime');
     assert.equal((await fetch(base + '/api/worker/next', {headers:incompatibleHeaders})).status, 409);
+    db.prepare('UPDATE workers SET update_requested_version=?,update_requested_at=?,runtime_json=? WHERE id=?').run('test-new', now, '{"keep":true}', registration.workerId);
+    const report = version => fetch(base + '/api/worker/version', {method:'POST', headers:incompatibleHeaders, body:JSON.stringify({version})});
+    assert.equal((await (await report('old-version')).json()).updateRequestedVersion, 'test-new');
+    assert.equal(db.prepare('SELECT status FROM workers WHERE id=?').get(registration.workerId).status, 'awaiting_runtime');
+    assert.equal((await (await report('test-new')).json()).updateRequestedVersion, null);
+    const updated = db.prepare('SELECT update_requested_version,runtime_json FROM workers WHERE id=?').get(registration.workerId);
+    assert.equal(updated.update_requested_version, null);
+    assert.equal(updated.runtime_json, '{"keep":true}');
     const claim = workerId => fetch(base + '/api/worker/next', { headers:{'x-framecut-worker':'test-fleet-token','x-framecut-worker-id':workerId} });
     const [firstResponse, secondResponse] = await Promise.all([claim('worker-a'), claim('worker-b')]);
     assert.equal(firstResponse.status, 200);

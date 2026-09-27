@@ -195,6 +195,7 @@ function shotCard(s) {
       <p class="shot-prompt-preview">${esc(s.prompt || 'Noch kein Prompt hinterlegt.')}</p>
       <div class="shot-tags">${refs || '<span class="shot-tag" style="opacity:0.5;">Keine Referenzen</span>'}</div>
       ${sceneAudio ? `<div class="shot-scene-audio"><small style="display:block;margin-top:10px;color:var(--text-muted);font-weight:600;">Audio dieser Szene</small>${sceneAudio}</div>` : ''}
+      ${hasVideo ? `<button class="shot-btn" data-scene-audio="${s.id}">🔊 Szene mit Ton ansehen</button><small style="display:block;color:var(--text-muted)">Dialog und Geräusche gemeinsam mit dem Bild; Musik erst im Film-Mix.</small>` : ''}
       ${hasVideo ? `<button class="shot-btn" data-review-shot="${s.id}" ${(isQueued || isRunning) ? 'disabled' : ''}>Clip prüfen und freigeben</button>` : ''}
       <div class="shot-actions">
         <button class="shot-btn" data-edit-shot="${s.id}">✏️ Bearbeiten</button>
@@ -911,6 +912,15 @@ function bindDynamic() {
     };
   }
 
+  document.querySelectorAll('[data-scene-audio]').forEach(button => button.onclick = async e => {
+    e.stopPropagation();
+    button.disabled = true; button.textContent = 'Tonvorschau wird erstellt …';
+    try {
+      const result = await api(`/api/shots/${Number(button.dataset.sceneAudio)}/audio-preview`, { method: 'POST', body: '{}' });
+      showModal(`<h3>Szene mit Ton</h3><video src="${esc(result.url)}" controls playsinline style="width:100%;max-height:65vh"></video><p>${esc(result.note)}</p>${result.missing.length ? `<p role="status">${result.missing.length} Spur(en) fehlen noch. Du hörst die bereits fertigen Spuren.</p>` : '<p>Alle geplanten Szenenspuren sind enthalten.</p>'}`);
+    } catch (error) { notice(error.message); }
+    finally { button.disabled = false; button.textContent = '🔊 Szene mit Ton ansehen'; }
+  });
   document.querySelectorAll('[data-review-shot]').forEach(button => button.onclick = e => {
     e.stopPropagation();
     const s=data.selected.shots.find(s=>s.id===Number(button.dataset.reviewShot));

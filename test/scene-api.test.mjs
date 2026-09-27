@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
+import {createEpisodeAudioManifest} from '../lib/audio-manifest.mjs';
 import {DatabaseSync} from 'node:sqlite';
 import {once} from 'node:events';
 
@@ -38,6 +39,22 @@ test('real HTTP claim/download/upload/review and stale-reference rejection',asyn
     const upload=()=>req('/api/worker/jobs/1/video',{method:'POST',headers:{...worker,'content-type':'video/mp4','x-framecut-scene-fingerprint':payload.sceneContract.fingerprint},body:'test-video'});
     assert.equal((await upload()).status,201);
     const shot=db.prepare('SELECT * FROM shots WHERE id=1').get();
+    // The real HTTP scene audition mixes existing artifacts, without a GPU job.
+    assert.equal((await req('/api/shots/1/audio-preview',{method:'POST',body:'{}'})).status,401);
+    assert.equal((await req('/api/shots/1/audio-preview',{method:'POST',headers:user,body:'{}'})).status,409);
+    const videoPath=join(dir,shot.output_video_path.replace(/^data\//,''));
+    const generatedVideo=spawnSync('ffmpeg',['-y','-v','error','-f','lavfi','-i','color=c=blue:s=160x96:r=24:d=5','-c:v','libx264',videoPath],{encoding:'utf8'});
+    assert.equal(generatedVideo.status,0,generatedVideo.stderr);
+    const wavPath=join(dir,'uploads','voice.wav');
+    const generatedAudio=spawnSync('ffmpeg',['-v','error','-f','lavfi','-i','sine=frequency=440:duration=2',wavPath],{encoding:'utf8'});
+    assert.equal(generatedAudio.status,0,generatedAudio.stderr);
+    const manifest=createEpisodeAudioManifest({ownerId:1,projectId:1,episodeId:1,shots:[shot],dialogue:[],includeNarrationFallback:true});
+    for(const cue of manifest.cues){cue.state='ready';cue.artifact={path:'data/uploads/voice.wav'};}
+    db.prepare('INSERT INTO episode_audio_manifests(episode_id,owner_id,manifest_json,updated_at) VALUES (1,1,?,?)').run(JSON.stringify(manifest),now);
+    const audition=await req('/api/shots/1/audio-preview',{method:'POST',headers:user,body:'{}'});
+    assert.equal(audition.status,200,await audition.clone().text());
+    const preview=await audition.json();assert.ok(preview.tracks>0);assert.deepEqual(preview.missing,[]);
+    const previewFetch=await req(preview.url,{headers:user});assert.equal(previewFetch.status,200);
     const review=checks=>req('/api/shots/1/visual-review',{method:'POST',headers:user,body:JSON.stringify({videoPath:shot.output_video_path,checks})});
     assert.equal((await review({identity:true})).status,400);
     assert.equal((await review(Object.fromEntries(['identity','count','scale','style','story'].map(k=>[k,true])))).status,200);

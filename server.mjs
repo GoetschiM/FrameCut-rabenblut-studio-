@@ -9,6 +9,7 @@ import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:
 import { buildReferencePrompt } from './lib/reference-prompt.mjs';
 import { parseModelJson, parseProviderHttpResponse } from './lib/provider-response.mjs';
 import { AUDIO_PIPELINE_VERSION, audioPreflight, createEpisodeAudioManifest, reconcileAudioManifest, validateAudioManifest } from './lib/audio-manifest.mjs';
+import { scenePreviewTracks, createScenePreview } from './lib/scene-preview.mjs';
 
 const APP = resolve(import.meta.dirname);
 const WORKSPACE = resolve(APP, '..');
@@ -1089,7 +1090,7 @@ function episodeData(projectId, episodeId, ownerId = null) {
     for (const cue of (audio?.manifest?.cues || [])) {
       if (!cue.shot_id) continue;
       if (!audioByShot.has(String(cue.shot_id))) audioByShot.set(String(cue.shot_id), []);
-      if (cue.artifact?.path && existsSync(mediaPath(cue.artifact.path))) audioByShot.get(String(cue.shot_id)).push({
+      if (cue.state === 'ready' && cue.artifact?.path && existsSync(mediaPath(cue.artifact.path))) audioByShot.get(String(cue.shot_id)).push({
         id: cue.id, kind: cue.kind, text: cue.text || cue.prompt || '',
         url: `/media/${encodeURIComponent(cue.artifact.path)}`
       });
@@ -1316,13 +1317,14 @@ const server = http.createServer(async (req, res) => {
       const d = await body(req);
       const version = String(d.version || '').trim();
       if (!/^[A-Za-z0-9._-]{1,60}$/.test(version)) return json(res, 400, { error:'Ungültige Worker-Version.' });
-      const requested = String(worker.update_requested_version || '').trim();
+      const registered = row('SELECT * FROM workers WHERE id=?', worker.id);
+      const requested = String(registered?.update_requested_version || '').trim();
       const updateInstalled = requested && requested === version;
-      const runtime = d.runtime && typeof d.runtime === 'object' ? JSON.stringify(d.runtime).slice(0, 8000) : String(worker.runtime_json || '{}');
+      const runtime = d.runtime && typeof d.runtime === 'object' ? JSON.stringify(d.runtime).slice(0, 8000) : String(registered?.runtime_json || '{}');
       run(`UPDATE workers SET installer_version=?,runtime_json=?,last_seen=?,status=?,
         update_requested_version=CASE WHEN ? THEN NULL ELSE update_requested_version END,
         update_requested_at=CASE WHEN ? THEN NULL ELSE update_requested_at END WHERE id=?`,
-        version, runtime, now(), 'ready', updateInstalled ? 1 : 0, updateInstalled ? 1 : 0, worker.id);
+        version, runtime, now(), registered?.status || 'awaiting_runtime', updateInstalled ? 1 : 0, updateInstalled ? 1 : 0, worker.id);
       return json(res, 200, { ok:true, version, updateRequestedVersion: updateInstalled ? null : (requested || null) });
     }
     if (path === '/api/workers/join-codes' && req.method === 'POST') {
@@ -1627,6 +1629,20 @@ const server = http.createServer(async (req, res) => {
       const weekAgo = new Date(Date.now() - 7*24*60*60*1000).toISOString();
       const monthAgo = new Date(Date.now() - 30*24*60*60*1000).toISOString();
       return json(res,200,{ week: summarize(weekAgo), month: summarize(monthAgo), allTime: summarize('1970-01-01'), ratesNote: 'Grob geschätzt (USD pro 1 Mio. Token) - keine offizielle Abrechnung, echte Kosten können abweichen.' });
+    }
+    if (/^\/api\/shots\/\d+\/audio-preview$/.test(path) && req.method === 'POST') {
+      const account = guard(req, res); if (!account) return;
+      const shot = row('SELECT * FROM shots WHERE id=?', Number(path.split('/')[3]));
+      if (!shot?.output_video_path || !permittedMediaPath(mediaPath(shot.output_video_path)) || !existsSync(mediaPath(shot.output_video_path))) return json(res, 409, { error: 'Zuerst das Video dieser Szene rendern.' });
+      const audio = audioContextForEpisode(shot.episode_id, account.id);
+      const ordered = rows('SELECT id,duration_seconds FROM shots WHERE episode_id=? ORDER BY sequence,id', shot.episode_id);
+      let startMs = 0;
+      for (const item of ordered) { if (item.id === shot.id) break; startMs += Math.max(1000, Math.round(Number(item.duration_seconds || 1) * 1000)); }
+      const cues = (audio?.manifest?.cues || []).filter(c => !c.artifact?.path || permittedMediaPath(mediaPath(c.artifact.path)));
+      const { tracks, missing } = scenePreviewTracks(cues, shot.id, startMs, mediaPath);
+      if (!tracks.length) return json(res, 409, { error: 'Für diese Szene ist noch kein aktueller Ton fertig. Unter „Ton & Sprache“ die offenen Spuren rendern.' });
+      const file = await createScenePreview({ video: mediaPath(shot.output_video_path), tracks, duration: Number(shot.duration_seconds), directory: UPLOADS, ownerId: account.id, shotId: shot.id, revision: audio.manifest.source_revision });
+      return json(res, 200, { url: `/media/${encodeURIComponent(`data/uploads/${file}`)}`, missing, tracks: tracks.length, note: 'Szenenvorschau mit fertigen Dialogen und Geräuschen; ohne Episodenmusik. Keine automatische Freigabe.' });
     }
     if (path === '/api/dashboard' && req.method === 'GET') { const account=guard(req,res); if (!account) return; const includeArchived=url.searchParams.get('includeArchived')==='1'; const data=episodeData(Number(url.searchParams.get('projectId'))||null,Number(url.searchParams.get('episodeId'))||null,account.id); return json(res,200,{projects:rows(`SELECT * FROM projects ${includeArchived?'':'WHERE archived_at IS NULL'} ORDER BY created_at`), selected:data, episode:data?.episode, shots:data?.shots || [], finals:data?.finals || [], jobs:rows('SELECT * FROM jobs ORDER BY id DESC LIMIT 12'), activity:rows('SELECT * FROM activity ORDER BY id DESC LIMIT 10')}); }
     if (/^\/api\/projects\/\d+\/archive$/.test(path) && req.method === 'POST') { if (!guard(req,res)) return; const id=Number(path.split('/')[3]),p=row('SELECT * FROM projects WHERE id=?',id); if(!p)return json(res,404,{error:'Projekt nicht gefunden.'}); run('UPDATE projects SET archived_at=? WHERE id=?',now(),id); event('Projekt archiviert',p.title); return json(res,200,{ok:true}); }

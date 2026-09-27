@@ -943,8 +943,7 @@ function Process-Job($payload) {
     $guideFilter=($guideFilters -join ';')+(";{0}amix=inputs={1}:normalize=0:duration=longest,apad=whole_dur={2},atrim=duration={2}[g]" -f $labels,$n,$clipText)
     & $ffmpegExe -y -loglevel error @guideInputs -filter_complex $guideFilter -map '[g]' -ar 48000 -ac 2 $speechGuide 2>&1|Out-Null
     if($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $speechGuide)){
-      Write-Warning 'Sprachfuehrung konnte nicht erstellt werden; Clip wird ohne Lippensynchronisierung gerendert.'
-      $speechGuide=$null;$fittedSeconds=$null
+      throw 'Audio-Führung konnte nicht erstellt werden. Video wird nicht ohne die geplante Sprach-/Geräuschführung gerendert. Audio und ffmpeg prüfen, dann erneut starten.'
     } elseif($dialogueLines.Count -eq 0) {
       $promptText=$promptText.Replace($noAudioLine,'One continuous shot; no cuts.')+' Nobody speaks in this shot: every character keeps the mouth closed, no talking, no lip movement. The only sound is the provided natural scene ambience and effects.'
       Write-Host 'Stummer Shot: Szenenton fuehrt H3 (keine erfundene Sprache).' -ForegroundColor Cyan
@@ -983,7 +982,7 @@ function Process-Job($payload) {
       $result=Get-Item -LiteralPath $silent
       Write-Host 'Tonspur entfernt (stumm ausgeliefert).' -ForegroundColor DarkCyan
     } else {
-      Write-Host 'Warnung: Tonspur konnte nicht entfernt werden, Clip wird mit Originalton geliefert.' -ForegroundColor Yellow
+      throw 'Modellton konnte nicht entfernt werden. Upload gestoppt, damit keine erfundene Sprache oder Musik im Ergebnis landet.'
     }
   }
   $actualDuration=Get-ClipDurationSeconds $result.FullName
