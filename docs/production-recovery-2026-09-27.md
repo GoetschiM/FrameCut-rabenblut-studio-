@@ -25,6 +25,10 @@ Lokaler GPU-Test am 27.09.2026: zwei tatsächliche Bibliotheksfotos (Leo 64, Opi
 
 Testdateien und Workflows lokal: pinokio_agent/skills/api/minimax-h3-pinokio.git/output/local/reference-test-20260927 (außerhalb des Repositorys). Testvideo: leo-opi-test-mit-dialog.mp4. Automatisierte Prüfungen: 37 Node-Tests und 4 Python-Adaptertests. Keine Neuberechnung alter Episoden und keine Löschung vorhandener Ergebnisse.
 
+Live-Bestätigung: Laptop-Update auf .4 um 17:22 Uhr, anschließend Job 2495 mit drei frisch geladenen Fotos. Dessen finaler I2V-Graph enthält null reference_-Nodes und eine Audio-Führung. Der neue Szenenguide zeigt Leo und Polo ohne weiße Karte; der ebenfalls referenzierte Chronobot ist darin nicht sichtbar. Der dynamische Szenentext beschreibt sein Verschwinden durch eine Lüftung. Als nächster Qualitätsschritt ist deshalb die Trennung von Anfangskomposition und späterer Handlung zu prüfen; ein letzter Frame der kurzen Komposition kann sonst schon den Endzustand zeigen. Keine Freigabe für einen pauschalen Neulauf. Das Bild ist unter .inspection/job-2495-reference-keyframe.png lokal gesichert.
+
+GitHub: Code auf codex/reference-keyframes-v5 hochgeladen. Kommentar zu Issue #82 wegen fehlender Issues-Schreibrechte des vorhandenen Tokens abgewiesen; Issue nicht geschlossen.
+
 Auch Stimmemotion und Lippensynchronität müssen anhand einer echten, hörbaren Szenenvorschau bewertet werden. Ein fehlerfreier technischer Mix ist noch keine inhaltliche Abnahme. Gaming-PC nicht als funktionierend bestätigt.
 
 ## Vereinbarter späterer Neulauf aller Episoden
