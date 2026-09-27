@@ -25,3 +25,11 @@ Runtime report: data/rebuild-USER.json, authenticated GET /api/production-rebuil
 44 Node tests and 6 Python tests passed locally, including actual HTTP settings/auth/isolation, encrypted storage, quota guards, empty/failed storyboard rollback, two-worker claims, scene provenance, and real FFmpeg mixes.
 
 Two local Gradio VoiceDesign probes produced Leo (4.1s) and Opi (5.2s). These establish runtime generation only; listening/character approval remains necessary. No guarantee of lipsync or emotional quality follows from successful file generation.
+
+## Live handoff
+
+2026-09-27: release .5 published with SHA-256 `8fdfd552d2b29cc0e21d6e51f81b7d4f1e665407b959be508513ea21a6a27d3c`. Laptop automatically updated from .4 and resumed. Real production job 2631 completed and uploaded a 4.455s PCM 48kHz stereo file; job 2632 also completed, extending its shot for the full spoken line. Missing-reference job 2808 completed.
+
+The full rebuild is running as `framecut-rebuild-20260927.service`. Read its report and journal before taking action; do not restart it while active. SQLite snapshots are in `/srv/framecut-data/backups/`, including `rebuild-1790543360742.db`. The original 133 waiting old render jobs were cancelled before the fresh run; no media files were removed. Existing voice profiles for Leo (asset 64) and Opi (asset 81) were clarified for child/older-grandfather timbres and Standard German.
+
+Production authenticated settings/status endpoints and served UI script were verified. ElevenLabs remains unconfigured/local. The Gaming-PC is still `awaiting_runtime` with a stale heartbeat, not an available second renderer. GitHub issue 64 received progress comment 5859886943; it remains open for quality verification.
