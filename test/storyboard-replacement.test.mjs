@@ -1,0 +1,23 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {runInNewContext} from 'node:vm';
+import {DatabaseSync} from 'node:sqlite';
+test('failed or empty replacement preserves the prior storyboard and queued jobs',()=>{
+  const db=new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE episodes(id INTEGER,style_profile TEXT);INSERT INTO episodes VALUES(1,'original');
+    CREATE TABLE jobs(id INTEGER,episode_id INTEGER,state TEXT,completed_at TEXT);INSERT INTO jobs VALUES(1,1,'wartet',NULL);
+    CREATE TABLE shots(id INTEGER,episode_id INTEGER);INSERT INTO shots VALUES(10,1);
+    CREATE TABLE shot_assets(shot_id INTEGER);INSERT INTO shot_assets VALUES(10);
+    CREATE TABLE shot_dialogue(shot_id INTEGER);INSERT INTO shot_dialogue VALUES(10);
+    CREATE TABLE assets(project_id INTEGER);`);
+  const source=readFileSync(new URL('../server.mjs',import.meta.url),'utf8');
+  const fn=source.slice(source.indexOf('function savePlanToEpisode('),source.indexOf('async function rebuildAllExisting('));
+  const save=runInNewContext(fn+';savePlanToEpisode',{db,now:()=>new Date().toISOString(),row:(q,...p)=>db.prepare(q).get(...p),rows:(q,...p)=>db.prepare(q).all(...p),run:(q,...p)=>db.prepare(q).run(...p)});
+  assert.throws(()=>save({id:1,project_id:1},{shots:[]},'new',[],true),/Leerer Plan/);
+  assert.throws(()=>save({id:1,project_id:1},{shots:[{}],assets:[null]},'new',[],true));
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM shots').get().n,1);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM shot_dialogue').get().n,1);
+  assert.equal(db.prepare('SELECT state FROM jobs').get().state,'wartet');
+  assert.equal(db.prepare('SELECT style_profile FROM episodes').get().style_profile,'original');db.close();
+});

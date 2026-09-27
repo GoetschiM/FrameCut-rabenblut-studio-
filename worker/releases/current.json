@@ -1,7 +1,7 @@
 {
     "entrypoint":  "FrameCut-Worker.bat",
-    "sha256":  "ed2620d369481d93cdecca567aa124befd9108498fa4aa38356172ef712f7621",
+    "sha256":  "8fdfd552d2b29cc0e21d6e51f81b7d4f1e665407b959be508513ea21a6a27d3c",
     "installerFile":  "framecut-worker-installer-2026.09.20.zip",
-    "version":  "2026.09.27.4",
-    "file":  "framecut-worker-2026.09.27.4.zip"
+    "version":  "2026.09.27.5",
+    "file":  "framecut-worker-2026.09.27.5.zip"
 }

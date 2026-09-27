@@ -58,8 +58,8 @@ $comfyPythonExe = Join-Path $comfyAppPath 'env\Scripts\python.exe'
 $qwenAppPath = if ($config.QwenTtsAppPath) { $config.QwenTtsAppPath } else { Join-Path $pinokioHome 'api\Qwen3-TTS-Pinokio.git\app' }
 $qwenPythonExe = if ($config.QwenTtsPythonPath) { $config.QwenTtsPythonPath } else { Join-Path $qwenAppPath 'venv\Scripts\python.exe' }
 $qwenClient = Join-Path $workerRoot 'framecut_qwen_tts.py'
-$qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '0.6B' }
-$qwenVoiceMode = if ($config.QwenTtsVoiceMode) { [string]$config.QwenTtsVoiceMode } else { 'custom' }
+$qwenModelSize = if ($config.QwenTtsModelSize) { [string]$config.QwenTtsModelSize } else { '1.7B' }
+$qwenVoiceMode = if ($config.QwenTtsVoiceMode) { [string]$config.QwenTtsVoiceMode } else { 'design' }
 $stableAudioClient = Join-Path $workerRoot 'framecut_stable_audio.py'
 $stableAudioPython = if ($config.StableAudioPythonPath) { $config.StableAudioPythonPath } else { $qwenPythonExe }
 $stableAudioRef = if ($config.StableAudioRef) { [string]$config.StableAudioRef } else { '' }
@@ -627,7 +627,7 @@ function Invoke-QwenSpeech([array]$SpeechJobs,[string]$JobRoot) {
     ConvertTo-Json -InputObject @($SpeechJobs) -Depth 8 | Set-Content -LiteralPath $specPath -Encoding utf8
     $stdoutPath=Join-Path $JobRoot 'qwen-stdout.log';$stderrPath=Join-Path $JobRoot 'qwen-stderr.log'
     $argLine="`"$qwenClient`" --qwen-app `"$qwenAppPath`" --jobs `"$specPath`" --model-size $qwenModelSize --voice-mode $qwenVoiceMode"
-    Write-Host ("Qwen3-TTS erzeugt {0} Stimme(n) ..." -f $SpeechJobs.Count) -ForegroundColor Cyan
+    Write-Host ("Qwen3-TTS {0} {1} erzeugt {2} Stimme(n) mit Stimmprofil und Sprachregie ..." -f $qwenModelSize,$qwenVoiceMode,$SpeechJobs.Count) -ForegroundColor Cyan
     $proc=Start-Process -FilePath $qwenPythonExe -ArgumentList $argLine -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -NoNewWindow -PassThru
     if($null -eq $proc){throw 'Qwen3-TTS-Prozess konnte nicht gestartet werden.'}
     $timeout=if($config.AudioTimeoutSeconds){[Math]::Max(600,[int]$config.AudioTimeoutSeconds)}else{7200}
@@ -676,6 +676,7 @@ function Invoke-StableAudioCue($Cue,[string]$JobRoot) {
   return $output
 }
 function Process-AudioCueJob($payload) {
+  $speechRoute=$null
   $job=$payload.job;$cue=$payload.cue;$root=Join-Path $runtimeRoot ("jobs\audio-cue-{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $root|Out-Null
   if(-not $ffmpegExe){throw 'ffmpeg fehlt; Audio-Spuren können nicht auf den Produktionsstandard normalisiert werden.'}
   Free-Models $config.ComfyUrl;Free-Models $config.H3Url
@@ -690,7 +691,14 @@ function Process-AudioCueJob($payload) {
       }
     }
     $raw=Join-Path $root 'speech-raw.wav'
-    [void](Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;performance=$cue.performance_direction;language=$cue.language;output=$raw}) -JobRoot $root)
+    $speechRoute=Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/speech" -Headers (Headers)
+    if($speechRoute.provider -eq 'elevenlabs'){
+      Invoke-WebRequest -Uri ($config.ServerUrl+$speechRoute.audioUrl) -Headers (Headers) -OutFile $raw
+      Write-Host 'ElevenLabs-Stimme geladen; API-Schlüssel bleibt auf dem Server.' -ForegroundColor Cyan
+    }else{
+      Write-Host ([string]$speechRoute.reason) -ForegroundColor Yellow
+      [void](Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id=$cue.id;text=$cue.text;voice=$cue.voice_profile_id;performance=$cue.performance_direction;language=$cue.language;output=$raw}) -JobRoot $root)
+    }
   } elseif($cue.kind -eq 'sfx' -or $cue.kind -eq 'music' -or $cue.kind -eq 'ambience') {
     $raw=Invoke-StableAudioCue $cue $root
   } else { throw "Unbekannter Audio-Cue-Typ: $($cue.kind)" }
@@ -700,9 +708,7 @@ function Process-AudioCueJob($payload) {
   if($cue.kind -eq 'dialogue' -or $cue.kind -eq 'narration'){
     $direction=([string]$cue.performance_direction).ToLowerInvariant()
     $tempo=1.0
-    if($direction -match 'sehr schnell|panisch|hektisch|atemlos|eilig'){$tempo=1.15}
-    elseif($direction -match 'schnell|aufgeregt|dringlich'){$tempo=1.08}
-    elseif($direction -match 'langsam|ruhig|bedacht|besonnen'){$tempo=0.94}
+    # Emotion belongs in the synthesis, not an artificial post-hoc speed change.
     $gain=if($direction -match 'sehr laut|schrei'){'2.5dB'}elseif($direction -match 'laut'){'1.5dB'}elseif($direction -match 'leise|flüster'){'-2.5dB'}else{'0dB'}
     $rawDuration=Get-ClipDurationSeconds $raw
     $targetSeconds=[Math]::Max(0.65,([double]$cue.target_duration_ms/1000))
@@ -714,7 +720,7 @@ function Process-AudioCueJob($payload) {
       $requiredTempo=[double]$rawDuration/[double]$targetSeconds
       # Beyond ~1.12x speech sounds rushed. A longer line now extends its shot instead
       # (lip sync renders the picture from the voice), so no dialogue is ever rejected.
-      $tempo=[Math]::Max([double]$tempo,[Math]::Min(1.12,[double]$requiredTempo))
+      $tempo=1.0
     }
     $fittedDuration=if($null -ne $rawDuration){[double]$rawDuration/[double]$tempo}else{$targetSeconds}
     Write-Host ("Dialog-Timing: roh {0:N2}s, Ziel {1:N2}s, Tempo {2:N2}x" -f $rawDuration,$targetSeconds,$tempo) -ForegroundColor DarkGray
@@ -730,6 +736,7 @@ function Process-AudioCueJob($payload) {
   & $ffmpegExe -y -loglevel error -i $raw -af $audioFilter -ar 48000 -ac 2 -c:a pcm_s16le $normal 2>&1|Out-Null
   if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $normal)){throw 'ffmpeg konnte die Audio-Spur nicht in 48 kHz Stereo normalisieren.'}
   $headers=Headers;$headers['x-framecut-cue-id']=[string]$cue.id
+  if($speechRoute){$headers['x-framecut-speech-provider']=[string]$speechRoute.provider;if($speechRoute.fallback){$headers['x-framecut-speech-fallback']='quota'}}
   if($speechSeconds){$headers['x-framecut-speech-seconds']=([double]$speechSeconds).ToString([Globalization.CultureInfo]::InvariantCulture)}
   $lastUploadError=$null
   for($uploadAttempt=1;$uploadAttempt -le 3;$uploadAttempt++) {
@@ -751,8 +758,16 @@ function Process-AudioPreviewJob($payload) {
   $job=$payload.job;$asset=$payload.asset;$root=Join-Path $runtimeRoot ("jobs\audio-preview-{0}" -f $job.id);New-Item -ItemType Directory -Force -Path $root|Out-Null
   Free-Models $config.ComfyUrl;Free-Models $config.H3Url
   $out=Join-Path $root 'voice-preview.wav'
-  $result=Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id='preview';text=$payload.preview.text;voice=$payload.preview.voice;language=$payload.preview.language;output=$out}) -JobRoot $root
-  if(-not (Test-Path -LiteralPath $out)){throw 'Qwen3-TTS meldete Erfolg, aber die Stimmprobe fehlt.'}
+  $speechRoute=Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/speech" -Headers (Headers)
+  if($speechRoute.provider -eq 'elevenlabs'){Invoke-WebRequest -Uri ($config.ServerUrl+$speechRoute.audioUrl) -Headers (Headers) -OutFile $out}
+  else {Write-Host ([string]$speechRoute.reason) -ForegroundColor Yellow;$result=Invoke-QwenSpeech -SpeechJobs @([pscustomobject]@{id='preview';text=$payload.preview.text;voice=$payload.preview.voice;language=$payload.preview.language;output=$out}) -JobRoot $root}
+  if(-not (Test-Path -LiteralPath $out)){throw 'Sprachengine meldete Erfolg, aber die Stimmprobe fehlt.'}
+  if($speechRoute.provider -eq 'elevenlabs'){
+    $converted=Join-Path $root 'voice-preview-pcm.wav'
+    & $ffmpegExe -y -v error -i $out -ar 48000 -ac 2 -c:a pcm_s16le $converted 2>&1|Out-Null
+    if($LASTEXITCODE -ne 0){throw 'ElevenLabs-Stimmprobe konnte nicht in WAV umgewandelt werden.'}
+    $out=$converted
+  }
   Invoke-RestMethod -Method Post -Uri "$($config.ServerUrl)/api/worker/jobs/$($job.id)/audio-preview" -Headers (Headers) -ContentType 'audio/wav' -InFile $out | Out-Null
   Write-Host ("Stimmprobe fertig: {0}" -f $asset.name) -ForegroundColor Green
 }

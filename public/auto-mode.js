@@ -51,6 +51,14 @@
     const projectPanel = project ? `<div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">${esc(project.title)}</p><h3>Projekt-Verwaltung</h3><small>Archivierte Projekte verschwinden aus der Seitenleiste, bleiben aber vollständig erhalten und lassen sich jederzeit wiederherstellen.</small></div><div style="display:flex;gap:10px;flex-wrap:wrap;"><button class="form-button" id="archive-project" style="background:rgba(255,255,255,0.08);">Dieses Projekt archivieren</button><button class="form-button" id="delete-project" style="background:rgba(255,82,82,0.12);color:#ff5252;">Dieses Projekt löschen</button></div></div><div class="panel" id="archived-projects-panel"><p class="upload-note">Lade …</p></div>` : '';
     view.innerHTML = `<div class="section-lead"><div><p class="eyebrow">DEIN ARBEITSPLATZ</p><h3>KI & API-Schlüssel</h3><small>Jeder Benutzer verwaltet seine eigenen Schlüssel. Sie werden verschlüsselt gespeichert und niemals wieder im Klartext angezeigt.</small></div><button class="form-button" id="manage-ai">KI-Anbieter einrichten</button></div><div class="panel"><div class="service"><span><b>Auto-Modus</b><br><small>Aus deiner Story entsteht ein editierbarer Plan mit Figuren, Orten und Video-Shots. Für den ersten Test reicht Gemini Flash oder DeepSeek.</small></span><span class="pill">PLANEN, NICHT RENDERN</span></div><div class="service"><span><b>Datenschutz</b><br><small>Nur deine Story und die gewählte Stilvorgabe gehen an den von dir eingerichteten KI-Anbieter.</small></span><span class="pill">PRO BENUTZER</span></div></div><div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">RENDER-INFRASTRUKTUR</p><h3>GPU-Worker</h3><small>Ein zusätzlicher Rechner meldet sich mit einem einmaligen Code an. Ein Bootstrap-Worker ist sichtbar, übernimmt aber erst nach lokalem Pinokio-/Modellcheck Renderjobs.</small></div><button class="ghost" id="create-worker-code">+ Worker verbinden</button></div><div class="panel" id="workers-panel"><p class="upload-note">Lade …</p></div><div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">DEIN VERBRAUCH</p><h3>KI-Token & geschätzte Kosten</h3><small>Nur für deinen Account, basierend auf den tatsächlich von den Anbietern gemeldeten Token-Zahlen. Die Kosten sind grob geschätzt, keine offizielle Abrechnung.</small></div></div><div class="panel" id="usage-panel"><p class="upload-note">Lade …</p></div><div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">FORTGESCHRITTEN</p><h3>KI-Prompts</h3><small>Die Anweisungen, die bei jeder Story-Analyse und Shot-Generierung an die KI gehen. Änderungen wirken für alle deine Projekte, sofort beim nächsten Auto-Modus-Lauf.</small></div></div><div class="panel" id="prompts-panel"><p class="upload-note">Lade …</p></div>${renderPanel}${projectPanel}<div class="section-lead" style="margin-top:24px;"><div><p class="eyebrow">GELÖSCHTE ELEMENTE</p><h3>Papierkorb</h3><small>Gelöschte Shots, Figuren/Orte und Folgen bleiben 14 Tage wiederherstellbar.</small></div></div><div class="panel" id="trash-panel"><p class="upload-note">Lade …</p></div>`;
     $('#manage-ai').onclick = aiSettings;
+    $('#manage-ai').insertAdjacentHTML('afterend','<button class="ghost" id="manage-speech">Stimmen · lokal / ElevenLabs</button>');
+    $('#manage-speech').onclick = speechSettingsDialog;
+    $('#manage-speech').insertAdjacentHTML('afterend','<button class="ghost" id="production-rebuild-status">Gesamtlauf prüfen</button>');
+    $('#production-rebuild-status').onclick=async()=>{
+      try{const report=await api('/api/production-rebuild');const names={not_started:'Noch nicht gestartet',running:'DeepSeek plant',queued:'Renderaufträge eingereiht – Videos noch in Arbeit',completed_with_errors:'Planung mit Fehlern beendet',planning:'Planung läuft',failed:'Fehler',skipped:'Übersprungen'};
+        alert([names[report.state]||report.state,...report.episodes.map(e=>`${e.project} / ${e.title}: ${names[e.state]||e.state}${e.shots?` (${e.shots} Szenen)`:''}${e.reason?` – ${e.reason}`:''}`)].join('\n'));
+      }catch(error){notice(error.message);}
+    };
     $('#create-worker-code').onclick = () => createWorkerCode();
     renderWorkers();
     renderUsage();
@@ -267,6 +275,24 @@
     } catch (err) {
       panel.innerHTML = `<p class="upload-note">Papierkorb konnte nicht geladen werden: ${esc(err.message)}</p>`;
     }
+  }
+
+  async function speechSettingsDialog() {
+    const saved=await api('/api/settings/speech');
+    const people=[{id:'narrator',name:'Erzähler',project:'Alle Projekte'},...saved.assets];
+    const collect=form=>({provider:form.elements.provider.value,key:form.elements.key.value,fallbackOnQuota:form.elements.fallbackOnQuota.checked,voices:Object.fromEntries(people.map(a=>[a.id,form.elements['voice-'+a.id].value]).filter(([,v])=>v))});
+    showModal(`<h3>Stimmen · lokal / ElevenLabs</h3><form><p class="upload-note">Lokal: VoiceDesign mit deiner Stimm- und Emotionsbeschreibung. ElevenLabs: feste Voice-ID pro Figur. Nur bei gewählter Cloud-Stimme werden Dialogtexte an ElevenLabs gesendet. Dieser erste Test unterstützt ausschließlich den Free-Tarif, ohne Zukauf.</p><label>Sprach-Anbieter<select name="provider"><option value="local" ${saved.provider==='local'?'selected':''}>Nur lokal</option><option value="elevenlabs" ${saved.provider==='elevenlabs'?'selected':''}>ElevenLabs für zugeordnete Stimmen</option></select></label><label>ElevenLabs API-Schlüssel<input name="key" type="password" autocomplete="off" placeholder="${saved.configured?'Gespeichert – leer lassen zum Behalten':'Noch nicht eingerichtet'}"></label><label class="check-row"><input type="checkbox" name="fallbackOnQuota" ${saved.fallbackOnQuota?'checked':''}>Bei leerem Kontingent lokal weitermachen (hörbarer Stimmwechsel möglich)</label><button type="button" class="ghost" id="load-speech-voices">Schlüssel speichern & Stimmen/Kontingent laden</button><p id="speech-quota" class="upload-note"></p>${people.map(a=>`<label>${esc(a.project)} · ${esc(a.name)}<select name="voice-${a.id}" class="cloud-voice"><option value="">Lokale Stimme verwenden</option>${saved.voices[a.id]?`<option value="${esc(saved.voices[a.id])}" selected>${esc(saved.voices[a.id])}</option>`:''}</select></label>`).join('')}<p class="upload-note">Stimmproben erzeugst du weiterhin bei „Besetzung & Welten“. Änderungen gelten für neue Sprachjobs; vorhandene Tonspuren bleiben erhalten. Bei Key-, Netzwerk- oder Anbieterfehlern wird nicht still auf eine andere Stimme gewechselt.</p><p id="modal-error" class="error"></p><button class="form-button">Stimmen speichern</button></form>`,async form=>{
+      await api('/api/settings/speech',{method:'PUT',body:JSON.stringify(collect(form))});closeModal();notice('Sprach-Anbieter und feste Stimmen gespeichert.');
+    });
+    $('#load-speech-voices').onclick=async()=>{
+      const form=$('#load-speech-voices').closest('form');
+      try{
+        await api('/api/settings/speech',{method:'PUT',body:JSON.stringify(collect(form))});form.elements.key.value='';
+        const data=await api('/api/settings/speech/catalog');
+        $('#speech-quota').textContent=`Tarif: ${data.quota.tier} · ${data.quota.remaining} von ${data.quota.limit} Credits übrig. Free-Lizenzbedingungen vor Veröffentlichung prüfen.`;
+        for(const select of form.querySelectorAll('.cloud-voice')){const chosen=select.value;select.innerHTML='<option value="">Lokale Stimme verwenden</option>'+data.voices.map(v=>`<option value="${esc(v.id)}">${esc(v.name)} · ${esc(Object.values(v.labels).join(', '))}</option>`).join('');if(chosen&&!data.voices.some(v=>v.id===chosen))select.insertAdjacentHTML('beforeend',`<option value="${esc(chosen)}">${esc(chosen)}</option>`);select.value=chosen;}
+      }catch(error){$('#modal-error').textContent=error.message;}
+    };
   }
 
   async function aiSettings() {

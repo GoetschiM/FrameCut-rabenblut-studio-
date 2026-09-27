@@ -9,16 +9,36 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
+
+def speaker_for_voice(voice):
+    """Fallback timbres have semantic roles, never a random hash assignment.
+
+    CustomVoice has no genuine child preset. VoiceDesign is the production
+    choice for described ages; this mapping is an explicit lower-quality fallback.
+    """
+    v=voice.casefold()
+    if re.search(r'großvater|grossvater|opa|opi|älter|aelter|elderly|senior|sonor',v):
+        return 'Uncle_fu'
+    if re.search(r'junge\b|jungen|boy|kinder|kindlich',v):
+        return 'Dylan'
+    if re.search(r'frau|weiblich|mutter|mütter|female|woman|mädchen|girl',v):
+        return 'Serena'
+    return 'Aiden'
+
+def voice_instruction(voice, performance):
+    return '; '.join(part for part in (voice,performance,
+        'Native Standard German (Hochdeutsch). Natural expressive acting, conversational phrasing, gentle breaths and varied intonation. Preserve the stated age and vocal identity. No robotic cadence, no exaggerated sing-song, no music or sound effects.') if part)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--qwen-app", required=True)
     parser.add_argument("--jobs", required=True, help="JSON array: id, text, voice, language, output")
-    parser.add_argument("--model-size", default="0.6B", choices=["0.6B", "1.7B"])
-    parser.add_argument("--voice-mode", default="custom", choices=["custom", "design"])
+    parser.add_argument("--model-size", default="1.7B", choices=["0.6B", "1.7B"])
+    parser.add_argument("--voice-mode", default="design", choices=["custom", "design"])
     args = parser.parse_args()
 
     app_dir = Path(args.qwen_app).resolve()
@@ -37,9 +57,8 @@ def main() -> int:
     if not isinstance(jobs, list) or not jobs:
         raise RuntimeError("No speech jobs were supplied.")
 
-    # VoiceDesign (1.7B) makes arbitrary voices but can exceed a laptop GPU after
-    # MiniMax has been used. CustomVoice 0.6B is the dependable production default:
-    # it offers distinct, stable speaker identities with dramatically less VRAM.
+    # VoiceDesign supports age and acting directions. The worker releases other
+    # GPU models first. CustomVoice remains an explicit lower-memory option.
     model_type = "VoiceDesign" if args.voice_mode == "design" else "CustomVoice"
     if model_type == "VoiceDesign" and args.model_size != "1.7B":
         raise RuntimeError("VoiceDesign is only available in 1.7B; use CustomVoice for 0.6B.")
@@ -51,7 +70,6 @@ def main() -> int:
     model_path = snapshot_download(repo_id, local_dir=str(model_dir), local_dir_use_symlinks=False)
     model = Qwen3TTSModel.from_pretrained(model_path, device_map="cuda", dtype=torch.bfloat16)
 
-    speakers = ("Aiden", "Dylan", "Eric", "Ono_anna", "Ryan", "Serena", "Sohee", "Uncle_fu", "Vivian")
     results = []
     for job in jobs:
         text = str(job.get("text") or "").strip()
@@ -63,21 +81,20 @@ def main() -> int:
         voice = str(job.get("voice") or "A clear, natural German storyteller voice.").strip()
         performance = str(job.get("performance") or "").strip()
         if model_type == "VoiceDesign":
-            # VoiceDesign samples a new timbre per call. Seeding from the character's
-            # voice description keeps one stable voice per character across all scenes.
+            # A fixed seed reduces variation; it is not an identity guarantee across
+            # different texts. An approved reference voice + cloning is a future gate.
             seed = int.from_bytes(hashlib.sha256(voice.encode("utf-8")).digest()[:4], "big")
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            instruct = "; ".join(part for part in (voice, performance, "Speak only Standard German (Hochdeutsch), clearly articulated. No music or sound effects.") if part)
+            instruct = voice_instruction(voice, performance)
             wavs, sample_rate = model.generate_voice_design(text=text, language=language, instruct=instruct)
         else:
             # Keying by the saved voice direction keeps every character on the same
             # voice across scenes while naturally assigning different casts another one.
-            key = hashlib.sha256(voice.encode("utf-8")).digest()[0]
-            speaker = speakers[key % len(speakers)]
+            speaker = speaker_for_voice(voice)
             wavs, sample_rate = model.generate_custom_voice(
                 text=text, language=language, speaker=speaker,
-                instruct="; ".join(part for part in (voice, performance, "Speak only Standard German. No music or sound effects.") if part) if args.model_size == "1.7B" else None,
+                instruct=voice_instruction(voice,performance) if args.model_size == "1.7B" else None,
             )
         sf.write(str(output), wavs[0], sample_rate)
         results.append({"id": job.get("id"), "output": str(output), "speaker": speaker if model_type == "CustomVoice" else "voice-design", "sample_rate": int(sample_rate), "seconds": round(len(wavs[0]) / sample_rate, 3)})

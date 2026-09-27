@@ -1,23 +1,36 @@
 import http from 'node:http';
-import { readFile, stat, mkdir, writeFile, copyFile, rm } from 'node:fs/promises';
+import { readFile, stat, mkdir, writeFile, copyFile, rm, rename } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { buildSceneContract, reviewIsCurrent, REVIEW_CHECKS, stripStyleTags, SCENE_PIPELINE_VERSION } from './lib/scene-contract.mjs';
 import { createHash, randomBytes, scryptSync, timingSafeEqual, createCipheriv, createDecipheriv } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, backup } from 'node:sqlite';
 import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { buildReferencePrompt } from './lib/reference-prompt.mjs';
 import { parseModelJson, parseProviderHttpResponse } from './lib/provider-response.mjs';
 import { AUDIO_PIPELINE_VERSION, audioPreflight, createEpisodeAudioManifest, reconcileAudioManifest, validateAudioManifest } from './lib/audio-manifest.mjs';
 import { scenePreviewTracks, createScenePreview } from './lib/scene-preview.mjs';
+import { speechSettings, elevenQuota, elevenVoices, elevenSpeech } from './lib/elevenlabs-speech.mjs';
 
 const APP = resolve(import.meta.dirname);
+const MAINTENANCE_REBUILD=process.argv.includes('--rebuild-all-existing');
 const WORKSPACE = resolve(APP, '..');
 // On the laptop this remains ./data.  The LXC sets FRAMECUT_DATA_DIR so
 // database, uploads and retained project data survive application updates.
 const DATA = resolve(process.env.FRAMECUT_DATA_DIR || join(APP, 'data'));
 const UPLOADS = join(DATA, 'uploads');
 const db = new DatabaseSync(join(DATA, 'studio.db'));
+db.exec('CREATE TABLE IF NOT EXISTS user_speech_settings(user_id INTEGER PRIMARY KEY, encrypted_key TEXT, settings_json TEXT NOT NULL DEFAULT \'{}\', updated_at TEXT NOT NULL)');
+const speechLocks=new Map();
+async function serialSpeech(owner,fn){
+  const previous=speechLocks.get(owner)||Promise.resolve();
+  const pending=previous.catch(()=>{}).then(fn);speechLocks.set(owner,pending);
+  try{return await pending;}finally{if(speechLocks.get(owner)===pending)speechLocks.delete(owner);}
+}
+function readSpeechSettings(owner){
+  const stored=row('SELECT * FROM user_speech_settings WHERE user_id=?',owner);
+  return {stored,settings:speechSettings(JSON.parse(stored?.settings_json||'{}'))};
+}
 const PORT = Number(process.env.RABENBLUT_STUDIO_PORT || 4317);
 const HOST = process.env.RABENBLUT_STUDIO_HOST || '127.0.0.1';
 const WORKER_TOKEN = process.env.FRAMECUT_WORKER_TOKEN || '';
@@ -876,11 +889,17 @@ Return JSON: {"action":"...","camera":"..."}`;
   } finally { visualTagRefreshRunning = false; }
   return updated;
 }
-setTimeout(() => refreshVisualTags().catch(error => console.error('visual tags', error.message)), 5000);
-setInterval(() => refreshVisualTags().catch(error => console.error('visual tags', error.message)), 60000);
+if(!MAINTENANCE_REBUILD)setTimeout(() => refreshVisualTags().catch(error => console.error('visual tags', error.message)), 5000);
+if(!MAINTENANCE_REBUILD)setInterval(() => refreshVisualTags().catch(error => console.error('visual tags', error.message)), 60000);
 function savePlanToEpisode(episode, plan, styleProfile, styleReferenceIds=[], replaceExisting=false) {
+  if(!plan.shots?.length)throw new Error('Leerer Plan darf ein Storyboard nicht ersetzen.');
+  db.exec('SAVEPOINT replace_storyboard');
+  try {
   if(styleProfile)run('UPDATE episodes SET style_profile=? WHERE id=?',styleProfile,episode.id);
   if (replaceExisting) {
+    if(row("SELECT id FROM jobs WHERE episode_id=? AND state='läuft' LIMIT 1",episode.id))throw new Error('Diese Episode rendert noch. Vor dem Ersetzen zuerst anhalten.');
+    run("UPDATE jobs SET state='abgebrochen',completed_at=? WHERE episode_id=? AND state='wartet'",now(),episode.id);
+    run('DELETE FROM shot_dialogue WHERE shot_id IN (SELECT id FROM shots WHERE episode_id=?)',episode.id);
     run('DELETE FROM shot_assets WHERE shot_id IN (SELECT id FROM shots WHERE episode_id=?)', episode.id);
     run('DELETE FROM shots WHERE episode_id=?', episode.id);
   }
@@ -889,7 +908,50 @@ function savePlanToEpisode(episode, plan, styleProfile, styleReferenceIds=[], re
   const start=(row('SELECT MAX(sequence) max FROM shots WHERE episode_id=?',episode.id)?.max||0); const byName=new Map([...known.values()].map(a=>[a.name.trim().toLowerCase(),a])); const styleRefs=styleReferenceIds.map(Number).filter(id=>row('SELECT id FROM assets WHERE id=? AND project_id=?',id,episode.project_id)); let index=0;
   for(const item of plan.shots){const result=run('INSERT INTO shots(episode_id,sequence,title,prompt,camera,duration_seconds,seed,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)',episode.id,start+(++index),item.title,item.prompt,item.camera,item.durationSeconds,Math.floor(Math.random()*9000000)+1000000,'Entwurf',now());const shotId=Number(result.lastInsertRowid);const usedAssetIds=new Set();for(const assetName of item.assetNames){const asset=byName.get(assetName.toLowerCase());if(asset && mentionsAsset(`${item.title}\n${item.prompt}`,asset.name)){run('INSERT OR IGNORE INTO shot_assets(shot_id,asset_id,role) VALUES (?,?,?)',shotId,asset.id,'reference');usedAssetIds.add(asset.id);}}for(const assetId of styleRefs){if(!usedAssetIds.has(assetId))run('INSERT OR IGNORE INTO shot_assets(shot_id,asset_id,role) VALUES (?,?,?)',shotId,assetId,'style');}saveDialogue(shotId,item.dialogue,byName,item.audioDirection);}
   run('UPDATE episodes SET duration_seconds=? WHERE id=?',rows('SELECT duration_seconds FROM shots WHERE episode_id=?',episode.id).reduce((sum,s)=>sum+Number(s.duration_seconds||0),0),episode.id);
+  db.exec('RELEASE replace_storyboard');
   return {createdAssets,createdShots:index};
+  }catch(error){db.exec('ROLLBACK TO replace_storyboard');db.exec('RELEASE replace_storyboard');throw error;}
+}
+
+async function rebuildAllExisting(){
+  const owner=Number(process.env.FRAMECUT_REBUILD_USER_ID);
+  if(process.env.FRAMECUT_REBUILD_CONFIRM!=='REBUILD_ALL_EXISTING'||!row('SELECT id FROM users WHERE id=?',owner))throw new Error('Explizite Bestätigung und Benutzer-ID erforderlich.');
+  if(row("SELECT id FROM jobs WHERE state IN ('läuft','wartet') LIMIT 1"))throw new Error('Alte Queue vor dem Neulauf kontrolliert anhalten.');
+  const stored=providerKey(owner,'deepseek');if(!stored)throw new Error('DeepSeek-Schlüssel fehlt.');
+  const reportPath=join(DATA,`rebuild-${owner}.json`);
+  if(existsSync(reportPath)&&JSON.parse(readFileSync(reportPath,'utf8')).state==='running')throw new Error('Neulauf bereits aktiv; Status prüfen.');
+  const backupPath=join(DATA,'backups',`rebuild-${Date.now()}.db`);await mkdir(dirname(backupPath),{recursive:true});await backup(db,backupPath);
+  const episodes=rows(`SELECT e.*,p.title project_title,CASE WHEN length(trim(e.style_profile))>0 THEN e.style_profile ELSE p.style_profile END effective_style FROM episodes e JOIN projects p ON p.id=e.project_id ORDER BY e.id`);
+  const report={state:'running',startedAt:now(),backup:backupPath,episodes:[]};
+  const persist=async()=>{await writeFile(reportPath+'.tmp',JSON.stringify(report,null,2));await rename(reportPath+'.tmp',reportPath);};await persist();
+  for(const episode of episodes){
+    const item={id:episode.id,project:episode.project_title,title:episode.title,state:'planning'};report.episodes.push(item);await persist();
+    try{
+      const story=row('SELECT markdown FROM story_documents WHERE episode_id=?',episode.id)?.markdown?.trim()||'';
+      if(story.length<30){item.state='skipped';item.reason='Keine ausreichende Story vorhanden.';await persist();continue;}
+      const previous=row('SELECT target_seconds FROM auto_plan_drafts WHERE episode_id=? ORDER BY id DESC LIMIT 1',episode.id);
+      const seconds=Math.max(15,Math.min(900,Number(previous?.target_seconds||episode.duration_seconds)||180));
+      const assets=rows('SELECT name,kind,summary,COALESCE(NULLIF(visual_tags,\'\'),visual_notes) visual_notes,voice FROM assets WHERE project_id=?',episode.project_id);
+      const analysis=cleanAnalysis(await callProviderJson('deepseek',stored.key,stored.model||'',analysisInstruction(story,seconds,episode.effective_style,'cinematic',assets),{userId:owner,purpose:'rebuild_analysis'}),seconds);
+      const draft=run("INSERT INTO auto_plan_drafts(user_id,episode_id,provider,model,target_seconds,recommended_seconds,style_profile,adaptation_mode,reference_asset_ids,analysis_json,created_at,commit_state,commit_replace_existing,commit_use_requested) VALUES (?,?,'deepseek',?,?,?,?,'cinematic','[]',?,?,'läuft',1,1)",owner,episode.id,stored.model||'',seconds,analysis.recommendedSeconds,episode.effective_style,JSON.stringify(analysis),now());
+      item.draftId=Number(draft.lastInsertRowid);await persist();
+      await runAutoPlanCommit(item.draftId,owner);
+      const status=row('SELECT commit_state,commit_error FROM auto_plan_drafts WHERE id=?',item.draftId);if(status.commit_state!=='fertig')throw new Error(status.commit_error||'Plan fehlgeschlagen.');
+      const shots=rows('SELECT id,title FROM shots WHERE episode_id=? ORDER BY sequence',episode.id);
+      // Preserve uploaded media; only fresh jobs and manifests replace the old plan.
+      run('DELETE FROM episode_audio_manifests WHERE episode_id=? AND owner_id=?',episode.id,owner);
+      const audio=audioContextForEpisode(episode.id,owner);
+      const manifest=addAutomaticSoundtrack(audio.manifest,episode.id,episode.project_id);
+      manifest.automation={state:'rendering_tracks',started_at:now(),auto_mix:true,auto_export:true,allow_unreviewed:true,ai_provider:'deepseek'};
+      item.audioJobs=queueAudioCueJobs(episode.id,owner,manifest).length;saveAudioManifest(episode.id,owner,manifest);
+      for(const a of missingReferenceAssets(shots.map(s=>s.id)))run("UPDATE jobs SET state='abgebrochen' WHERE asset_id=? AND kind='comfyui_reference_preview' AND state='fehlgeschlagen'",a.id);
+      const refs=queueMissingReferencePreviews({...episode,style_profile:episode.effective_style},owner,shots.map(s=>s.id));item.referenceJobs=refs.queued;
+      for(const shot of shots){run("UPDATE shots SET render_tier='Fertig',status='in Warteschlange' WHERE id=?",shot.id);run("INSERT INTO jobs(episode_id,kind,label,state,detail,created_at,owner_id,shot_id) VALUES (?,'minimax_h3',?,'wartet',?,?,?,?)",episode.id,`MiniMax H3 · ${shot.title}`,'DeepSeek-Neulauf: Sprache vor Video, anschließend automatischer Testexport.',now(),owner,shot.id);}
+      item.shots=shots.length;item.state='queued';event('Episode neu geplant',`${episode.project_title} · ${episode.title} · ${shots.length} Shots, automatische Produktion eingereiht.`);
+    }catch(error){item.state='failed';item.reason=String(error.message).slice(0,500);}
+    await persist();console.log(JSON.stringify(item));
+  }
+  report.state=report.episodes.some(e=>e.state==='failed')?'completed_with_errors':'queued';report.finishedAt=now();await persist();return report;
 }
 
 async function runAutoPlanCommit(draftId, accountId) {
@@ -1113,7 +1175,7 @@ function readFileSyncCompat(file) { const fs = process.getBuiltinModule('node:fs
 // startRender() removed: it shelled out to a laptop-only python script that does not exist on the server.
 async function serveFile(res, file, cacheable = false) { try { const info = await stat(file); if (!info.isFile()) throw new Error(); const ext = extname(file).toLowerCase(); res.writeHead(200, { 'content-type':MIME[ext] || 'application/octet-stream', 'content-length':info.size, 'cache-control': cacheable ? 'private, max-age=604800' : 'no-cache, no-store, must-revalidate' }); (await import('node:fs')).createReadStream(file).pipe(res); } catch { json(res,404,{error:'Datei nicht gefunden.'}); } }
 
-setInterval(() => {
+if(!MAINTENANCE_REBUILD)setInterval(() => {
   try {
     const orphaned = rows(`SELECT j.id, j.shot_id FROM jobs j WHERE j.state='läuft' AND j.worker_id IS NOT NULL
       AND EXISTS (SELECT 1 FROM jobs newer WHERE newer.worker_id = j.worker_id AND newer.started_at > j.started_at)`);
@@ -1148,7 +1210,7 @@ setInterval(() => {
   } catch (error) { console.error('Stale job sweep failed:', error.message); }
 }, 2 * 60 * 1000).unref();
 
-setInterval(() => {
+if(!MAINTENANCE_REBUILD)setInterval(() => {
   try {
     run('DELETE FROM sessions WHERE expires_at < ?', now());
     run('DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT 2000)');
@@ -1156,7 +1218,7 @@ setInterval(() => {
   } catch (error) { console.error('Housekeeping failed:', error.message); }
 }, 60 * 60 * 1000).unref();
 
-const existingRabenblut = row('SELECT * FROM projects WHERE slug=?', 'rabenblut'); if (existingRabenblut) hydrateRabenblut(existingRabenblut); hydrateShotAssetLinks();
+if(!MAINTENANCE_REBUILD){const existingRabenblut = row('SELECT * FROM projects WHERE slug=?', 'rabenblut'); if (existingRabenblut) hydrateRabenblut(existingRabenblut); hydrateShotAssetLinks();}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`); const path = url.pathname;
   try {
@@ -2446,6 +2508,61 @@ const server = http.createServer(async (req, res) => {
         return json(res, 500, { error: 'Export fehlgeschlagen: ' + err.message });
       }
     }
+    if(path==='/api/production-rebuild' && req.method==='GET'){
+      const account=guard(req,res);if(!account)return;
+      const file=join(DATA,`rebuild-${account.id}.json`);
+      if(!existsSync(file))return json(res,200,{state:'not_started',episodes:[]});
+      const report=JSON.parse(await readFile(file,'utf8'));delete report.backup;
+      return json(res,200,report);
+    }
+    if(path==='/api/settings/speech' && req.method==='GET'){
+      const account=guard(req,res);if(!account)return;
+      const {stored,settings}=readSpeechSettings(account.id);
+      return json(res,200,{...settings,configured:Boolean(stored?.encrypted_key),assets:rows("SELECT a.id,a.name,p.title project FROM assets a JOIN projects p ON p.id=a.project_id WHERE a.kind='character' ORDER BY p.title,a.name")});
+    }
+    if(path==='/api/settings/speech' && req.method==='PUT'){
+      const account=guard(req,res);if(!account)return;const d=await body(req),settings=speechSettings(d),{stored}=readSpeechSettings(account.id);
+      const key=String(d.key||'').trim();if(key && (key.length<12||key.length>1000))return json(res,400,{error:'Ungültiger API-Schlüssel.'});
+      const encrypted=key?encryptSecret(key):stored?.encrypted_key||null;
+      if(settings.provider==='elevenlabs'&&!encrypted)return json(res,400,{error:'Bitte zuerst deinen ElevenLabs-API-Schlüssel hinterlegen.'});
+      run('INSERT INTO user_speech_settings(user_id,encrypted_key,settings_json,updated_at) VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET encrypted_key=excluded.encrypted_key,settings_json=excluded.settings_json,updated_at=excluded.updated_at',account.id,encrypted,JSON.stringify(settings),now());
+      return json(res,200,{ok:true,configured:Boolean(encrypted)});
+    }
+    if(path==='/api/settings/speech/catalog' && req.method==='GET'){
+      const account=guard(req,res);if(!account)return;const {stored}=readSpeechSettings(account.id);
+      if(!stored?.encrypted_key)return json(res,400,{error:'ElevenLabs-Schlüssel noch nicht gespeichert.'});
+      const key=decryptSecret(stored.encrypted_key);
+      return json(res,200,{quota:await elevenQuota(key),voices:await elevenVoices(key)});
+    }
+    if(/^\/api\/worker\/jobs\/\d+\/speech(?:-file)?$/.test(path)){
+      const auth=workerGuard(req,res);if(!auth)return;
+      const id=Number(path.split('/')[4]),job=row('SELECT * FROM jobs WHERE id=?',id);
+      if(!job||job.worker_id!==auth.id||job.state!=='läuft'||!['audio_cue','audio_preview'].includes(job.kind))return json(res,409,{error:'Kein aktiver Sprachauftrag dieses Workers.'});
+      if(req.method==='GET'&&path.endsWith('speech-file')){
+        const hash=url.searchParams.get('cache')||'';if(!/^[a-f0-9]{64}$/.test(hash))return json(res,400,{error:'Ungültiger Cache.'});
+        const file=join(UPLOADS,`speech-${job.owner_id}-${hash}.mp3`);if(!existsSync(file))return json(res,404,{error:'Sprachdatei fehlt.'});
+        return serveFile(res,file);
+      }
+      if(req.method!=='POST'||path.endsWith('speech-file'))return json(res,405,{error:'Methode nicht erlaubt.'});
+      const result=await serialSpeech(job.owner_id,async()=>{
+        const {stored,settings}=readSpeechSettings(job.owner_id);
+        if(settings.provider!=='elevenlabs')return {provider:'local',reason:'Lokale Sprachgenerierung ausgewählt.'};
+        let detail={};try{detail=JSON.parse(job.detail||'{}');}catch{}
+        const cue=job.kind==='audio_cue'?audioContextForEpisode(job.episode_id,job.owner_id)?.manifest?.cues.find(c=>c.id===detail.cue_id):{text:detail.text,asset_id:job.asset_id,kind:'dialogue'};
+        if(!cue||!['dialogue','narration'].includes(cue.kind))throw new Error('Keine gültige Sprachspur.');
+        const voiceId=settings.voices[cue.asset_id||'narrator'];
+        if(!voiceId)return {provider:'local',reason:'Für diese Figur ist lokal ausgewählt (keine ElevenLabs Voice-ID).'};
+        if(!stored?.encrypted_key)throw new Error('ElevenLabs-Schlüssel fehlt.');
+        const hash=createHash('sha256').update(JSON.stringify([job.owner_id,voiceId,settings.model,cue.text,cue.performance_direction||'',1])).digest('hex');
+        const file=join(UPLOADS,`speech-${job.owner_id}-${hash}.mp3`);
+        if(!existsSync(file)){
+          try{const audio=await elevenSpeech({key:decryptSecret(stored.encrypted_key),text:cue.text,voiceId,performance:cue.performance_direction});await writeFile(file+'.tmp',audio);await rename(file+'.tmp',file);}
+          catch(error){if(error.code==='quota'&&settings.fallbackOnQuota){event('Lokale Ersatzstimme',`Job ${id}: ElevenLabs-Kontingent aufgebraucht; Stimmwechsel möglich.`);return {provider:'local',fallback:true,reason:'ElevenLabs-Kontingent aufgebraucht; lokale Ersatzstimme.'};}throw error;}
+        }
+        return {provider:'elevenlabs',audioUrl:`/api/worker/jobs/${id}/speech-file?cache=${hash}`};
+      });
+      return json(res,200,result);
+    }
     if (path === '/api/worker/next' && req.method === 'GET') {
       const workerAuth = workerGuard(req,res); if (!workerAuth) return;
       const workerId = workerAuth.id;
@@ -2645,6 +2762,8 @@ const server = http.createServer(async (req, res) => {
       const manifest = structuredClone(audio.manifest), cue = manifest.cues.find(item => String(item.id) === cueId);
       if (!cue) return json(res, 409, { error: 'Die Audio-Spur wurde inzwischen verändert. Bitte erneut rendern.' });
       cue.state = 'ready'; cue.artifact = { path: portable, sha256: createHash('sha256').update(bytes).digest('hex') }; cue.rendered_at = now();
+      if(['local','elevenlabs'].includes(req.headers['x-framecut-speech-provider']))cue.artifact.provider=req.headers['x-framecut-speech-provider'];
+      if(req.headers['x-framecut-speech-fallback']==='quota')cue.artifact.fallback_reason='ElevenLabs-Kontingent leer; lokale Ersatzstimme';
       // A spoken line longer than planned extends its shot instead of failing: with lip sync
       // the picture is rendered from this voice, so the shot must fit the whole sentence.
       const spokenMs = Math.round(Number(req.headers['x-framecut-speech-seconds'] || 0) * 1000);
@@ -2754,7 +2873,9 @@ const server = http.createServer(async (req, res) => {
   } catch (error) { console.error(error); json(res,500,{error:error.message || 'Interner Fehler.'}); }
   if(path === '/api/jobs/bulk-delete' && req.method === 'POST') { if (!guard(req,res)) return; const d=await body(req); const ids=(d.jobIds||[]).filter(id=>Number.isInteger(Number(id))); if(ids.length===0) { json(res,400,{error:'Mindestens eine Job-ID erforderlich.'}); } else { const placeholders=ids.map(()=>'?').join(','); const deleted=run(`DELETE FROM jobs WHERE id IN (${placeholders})`,...ids); json(res,200,{deleted:deleted.changes,remaining:row('SELECT COUNT(*) as count FROM jobs').count}); } }
 });
-  if(process.argv.includes('--smoke-plan-existing')){
+  if(MAINTENANCE_REBUILD){
+  rebuildAllExisting().then(result=>{console.log(JSON.stringify(result));db.close();process.exit(0);}).catch(error=>{console.error(error.message);db.close();process.exit(1);});
+}else if(process.argv.includes('--smoke-plan-existing')){
   smokePlanExistingProject().then(result=>{console.log(JSON.stringify(result));db.close();}).catch(error=>{console.error(error.message);db.close();process.exitCode=1;});
 }else{
   server.listen(PORT,HOST,()=>console.log(`FrameCut: http://${HOST}:${PORT}`));
