@@ -22,3 +22,11 @@ Issue #87 tracks focused settings navigation and voice discovery; #64 remains op
 46 Node tests pass, including auth, settings isolation, filters, retry payload and duplicate uploads, scene contracts and multi-worker claims. Headless Edge checks desktop and 390px mobile, all seven pages, filter/selection preservation and no implicit PUT calls. The UI skill detector reports only a pre-existing width-transition warning outside the changed settings surface.
 
 Two Rabenblut audio tracks failed in the overnight run. The music failure includes a Stable Audio Gradio file-download 403; do not call the music/master pipeline fully verified until this is fixed and heard. Naturalness, lipsync and visual consistency still require inspecting completed new clips; prompt corrections are not a guarantee.
+
+## Deployment
+
+Deployed on 28 September at 06:11 UTC. The worker completed its active audio job, paused cleanly, and resumed on version `2026.09.27.5`; no worker package change was required. Fresh heartbeat and actual video claim `#2688` verified after restart. Gaming PC remains offline/awaiting runtime.
+
+Backup: `/srv/framecut-data/backups/before-style-cleanup-2026-09-28T06-10-59-058Z.db`. Seven legacy episode style profiles were normalized; three were preserved. All 309 shots and stories were retained. Source rollback archive: `/srv/framecut-data/backups/settings-source-20260928T061058Z.tgz`.
+
+Live speech catalog and new settings script both return HTTP 200. ElevenLabs quota is still 10,000/10,000; no voice assignments or paid synthesis were performed. All 46 regression tests pass. German voice discovery does not imply that existing rendered tracks have been regenerated with ElevenLabs.
