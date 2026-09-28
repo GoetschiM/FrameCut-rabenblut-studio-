@@ -56,7 +56,7 @@
     $('#manage-speech').insertAdjacentHTML('afterend','<button class="ghost" id="production-rebuild-status">Gesamtlauf prüfen</button>');
     $('#production-rebuild-status').onclick=async()=>{
       try{const report=await api('/api/production-rebuild');const names={not_started:'Noch nicht gestartet',running:'DeepSeek plant',queued:'Renderaufträge eingereiht – Videos noch in Arbeit',completed_with_errors:'Planung mit Fehlern beendet',planning:'Planung läuft',failed:'Fehler',skipped:'Übersprungen'};
-        alert([names[report.state]||report.state,...report.episodes.map(e=>`${e.project} / ${e.title}: ${names[e.state]||e.state}${e.shots?` (${e.shots} Szenen)`:''}${e.reason?` – ${e.reason}`:''}`)].join('\n'));
+        alert([names[report.state]||report.state,...report.episodes.map(e=>`${e.project} / ${e.title}: ${names[e.state]||e.state}${e.progress?.total?` · ${e.progress.rendered||0}/${e.progress.total} Videos`:''}${e.audio?.find(a=>a.state==='fehlgeschlagen')?` · ${e.audio.find(a=>a.state==='fehlgeschlagen').count} Audiofehler`:''}${e.reason?` – ${e.reason}`:''}`)].join('\n'));
       }catch(error){notice(error.message);}
     };
     $('#create-worker-code').onclick = () => createWorkerCode();
@@ -100,6 +100,8 @@
     };
     renderArchivedProjects();
     renderTrash();
+    FrameCutSettings.organize(view);
+    speechSettingsDialog().catch(error=>{const panel=$('#speech-settings-panel');if(panel)panel.textContent=`Stimmeinstellungen konnten nicht geladen werden: ${error.message}`;});
   }
 
   async function renderWorkers() {
@@ -280,19 +282,52 @@
   async function speechSettingsDialog() {
     const saved=await api('/api/settings/speech');
     const people=[{id:'narrator',name:'Erzähler',project:'Alle Projekte'},...saved.assets];
+    const target=$('#speech-settings-panel');if(!target)return;
+    const projects=[...new Set(saved.assets.map(a=>a.project))];
     const collect=form=>({provider:form.elements.provider.value,key:form.elements.key.value,fallbackOnQuota:form.elements.fallbackOnQuota.checked,voices:Object.fromEntries(people.map(a=>[a.id,form.elements['voice-'+a.id].value]).filter(([,v])=>v))});
-    showModal(`<h3>Stimmen · lokal / ElevenLabs</h3><form><p class="upload-note">Lokal: VoiceDesign mit deiner Stimm- und Emotionsbeschreibung. ElevenLabs: feste Voice-ID pro Figur. Nur bei gewählter Cloud-Stimme werden Dialogtexte an ElevenLabs gesendet. Dieser erste Test unterstützt ausschließlich den Free-Tarif, ohne Zukauf.</p><label>Sprach-Anbieter<select name="provider"><option value="local" ${saved.provider==='local'?'selected':''}>Nur lokal</option><option value="elevenlabs" ${saved.provider==='elevenlabs'?'selected':''}>ElevenLabs für zugeordnete Stimmen</option></select></label><label>ElevenLabs API-Schlüssel<input name="key" type="password" autocomplete="off" placeholder="${saved.configured?'Gespeichert – leer lassen zum Behalten':'Noch nicht eingerichtet'}"></label><label class="check-row"><input type="checkbox" name="fallbackOnQuota" ${saved.fallbackOnQuota?'checked':''}>Bei leerem Kontingent lokal weitermachen (hörbarer Stimmwechsel möglich)</label><button type="button" class="ghost" id="load-speech-voices">Schlüssel speichern & Stimmen/Kontingent laden</button><p id="speech-quota" class="upload-note"></p>${people.map(a=>`<label>${esc(a.project)} · ${esc(a.name)}<select name="voice-${a.id}" class="cloud-voice"><option value="">Lokale Stimme verwenden</option>${saved.voices[a.id]?`<option value="${esc(saved.voices[a.id])}" selected>${esc(saved.voices[a.id])}</option>`:''}</select></label>`).join('')}<p class="upload-note">Stimmproben erzeugst du weiterhin bei „Besetzung & Welten“. Änderungen gelten für neue Sprachjobs; vorhandene Tonspuren bleiben erhalten. Bei Key-, Netzwerk- oder Anbieterfehlern wird nicht still auf eine andere Stimme gewechselt.</p><p id="modal-error" class="error"></p><button class="form-button">Stimmen speichern</button></form>`,async form=>{
-      await api('/api/settings/speech',{method:'PUT',body:JSON.stringify(collect(form))});closeModal();notice('Sprach-Anbieter und feste Stimmen gespeichert.');
-    });
-    $('#load-speech-voices').onclick=async()=>{
-      const form=$('#load-speech-voices').closest('form');
-      try{
-        await api('/api/settings/speech',{method:'PUT',body:JSON.stringify(collect(form))});form.elements.key.value='';
-        const data=await api('/api/settings/speech/catalog');
-        $('#speech-quota').textContent=`Tarif: ${data.quota.tier} · ${data.quota.remaining} von ${data.quota.limit} Credits übrig. Free-Lizenzbedingungen vor Veröffentlichung prüfen.`;
-        for(const select of form.querySelectorAll('.cloud-voice')){const chosen=select.value;select.innerHTML='<option value="">Lokale Stimme verwenden</option>'+data.voices.map(v=>`<option value="${esc(v.id)}">${esc(v.name)} · ${esc(Object.values(v.labels).join(', '))}</option>`).join('');if(chosen&&!data.voices.some(v=>v.id===chosen))select.insertAdjacentHTML('beforeend',`<option value="${esc(chosen)}">${esc(chosen)}</option>`);select.value=chosen;}
-      }catch(error){$('#modal-error').textContent=error.message;}
+    target.innerHTML=`<form id="speech-settings-form">
+      <label>Sprach-Anbieter<select name="provider"><option value="local" ${saved.provider==='local'?'selected':''}>Nur lokal</option><option value="elevenlabs" ${saved.provider==='elevenlabs'?'selected':''}>ElevenLabs für zugeordnete Stimmen</option></select></label>
+      <p class="upload-note">Nur zugeordnete Dialogtexte gehen an ElevenLabs. Ohne Zuordnung bleibt die Figur lokal. Diese Integration nutzt ausschließlich ElevenLabs Free, ohne Zukauf.</p>
+      <details class="speech-access"><summary>API-Schlüssel ${saved.configured?'gespeichert – ändern':'hinterlegen'}</summary><label>ElevenLabs API-Schlüssel<input name="key" type="password" autocomplete="off" placeholder="Leer lassen, um den gespeicherten Schlüssel zu behalten"></label></details>
+      <label class="check-row"><input type="checkbox" name="fallbackOnQuota" ${saved.fallbackOnQuota?'checked':''}>Bei leerem Kontingent lokal weiterarbeiten. Die Stimme kann dabei hörbar wechseln.</label>
+      <div class="settings-actions"><button type="button" class="ghost" id="load-speech-voices">Stimmen aktualisieren</button><a href="https://elevenlabs.io/app/voice-library" target="_blank" rel="noopener noreferrer">Weitere Stimmen bei ElevenLabs hinzufügen</a></div>
+      <p id="speech-quota" class="upload-note" role="status"></p>
+      <h4>Stimmen zuordnen</h4><p class="upload-note">Der Filter zeigt die Herkunft der Stimme, nicht alle Sprachen, die sie sprechen kann. Deutsch ist unterstützt. Schweizer Akzent ist kein garantierter Schweizerdeutsch-Dialekt; der Produktionsdialog bleibt Hochdeutsch.</p>
+      <div class="speech-filters"><label>Projekt<select name="castProject"><option value="">Alle Projekte</option>${projects.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select></label><label>Stimmherkunft<select name="voiceLocale"><option value="de">Deutsch</option><option value="ch">Deutsch · Schweizer Akzent</option><option value="all">Alle Sprachen</option></select></label><label>Stimme suchen<input name="voiceSearch" type="search" placeholder="Name, Alter oder Akzent"></label></div>
+      <p id="speech-matches" class="upload-note" role="status"></p><p id="speech-assignment-status" class="upload-note" role="status"></p>
+      <div class="speech-cast">${people.map(a=>`<div class="speech-person" data-cast-project="${esc(a.id==='narrator'?'':a.project)}"><label>${esc(a.name)}<small>${esc(a.project)}</small><select name="voice-${a.id}" class="cloud-voice"><option value="">Lokale Stimme verwenden</option>${saved.voices[a.id]?`<option value="${esc(saved.voices[a.id])}" selected>${esc(saved.voices[a.id])}</option>`:''}</select></label><audio controls preload="none" hidden aria-label="Hörprobe für ${esc(a.name)}"></audio></div>`).join('')}</div>
+      <p class="upload-note">Die Hörprobe stammt von ElevenLabs und kann in einer anderen Sprache aufgenommen sein. Einen eigenen deutschen Testsatz erzeugst du unter „Besetzung & Welten“. Änderungen gelten für neue Sprachaufträge, nicht rückwirkend für fertige Tonspuren.</p>
+      <p id="speech-error" class="error" role="alert"></p><button class="form-button" type="submit">Stimmen speichern</button><p id="speech-saved" role="status"></p>
+    </form>`;
+    const form=$('#speech-settings-form');let voices=[];
+    if(projects.includes(data?.selected?.project?.title))form.elements.castProject.value=data.selected.project.title;
+    const updateRows=()=>{
+      for(const row of form.querySelectorAll('.speech-person')){
+        row.hidden=Boolean(form.elements.castProject.value&&row.dataset.castProject&&row.dataset.castProject!==form.elements.castProject.value);
+        const chosen=row.querySelector('select').value,voice=voices.find(v=>v.id===chosen),audio=row.querySelector('audio');
+        audio.hidden=!voice?.previewUrl;if(voice?.previewUrl){if(audio.getAttribute('src')!==voice.previewUrl){audio.pause();audio.src=voice.previewUrl;}}else{audio.pause();audio.removeAttribute('src');}
+      }
+      const count=[...form.querySelectorAll('.cloud-voice')].filter(s=>s.value).length;
+      $('#speech-assignment-status').textContent=form.elements.provider.value==='local'?'Lokale Sprachgenerierung ist ausgewählt.':count?`${count} feste ElevenLabs-Zuordnungen. Alle übrigen Figuren bleiben lokal.`:'Noch keine Figur zugeordnet: Trotz gespeichertem Key werden alle Stimmen lokal erzeugt.';
     };
+    const filterVoices=()=>{
+      const matches=voices.filter(v=>FrameCutSettings.matchesVoice(v,form.elements.voiceLocale.value,form.elements.voiceSearch.value)).sort((a,b)=>a.name.localeCompare(b.name,'de'));
+      $('#speech-matches').textContent=matches.length?`${matches.length} passende Stimmen in deinem ElevenLabs-Konto.`:'Keine passende gespeicherte Stimme. Füge sie zuerst in der ElevenLabs-Bibliothek hinzu und aktualisiere hier. Oder wähle „Alle Sprachen“.';
+      for(const select of form.querySelectorAll('.cloud-voice')){const chosen=select.value;select.innerHTML='<option value="">Lokale Stimme verwenden</option>'+matches.map(v=>`<option value="${esc(v.id)}">${esc(FrameCutSettings.voiceLabel(v))}</option>`).join('');if(chosen&&!matches.some(v=>v.id===chosen)){const v=voices.find(v=>v.id===chosen);select.insertAdjacentHTML('beforeend',`<option value="${esc(chosen)}">${esc(v?FrameCutSettings.voiceLabel(v):chosen)} (bestehende Auswahl)</option>`);}select.value=chosen;}
+      updateRows();
+    };
+    form.elements.castProject.onchange=updateRows;form.elements.voiceLocale.onchange=filterVoices;form.elements.voiceSearch.oninput=filterVoices;form.elements.provider.onchange=updateRows;
+    form.querySelectorAll('.cloud-voice').forEach(select=>select.onchange=updateRows);
+    form.onsubmit=async event=>{event.preventDefault();const button=form.querySelector('[type=submit]');button.disabled=true;$('#speech-error').textContent='';try{await api('/api/settings/speech',{method:'PUT',body:JSON.stringify(collect(form))});form.elements.key.value='';$('#speech-saved').textContent='Gespeichert. Neue Sprachaufträge verwenden diese Zuordnung.';}catch(error){$('#speech-error').textContent=error.message;}finally{button.disabled=false;}};
+    const loadVoices=async(saveKey=false)=>{
+      const button=$('#load-speech-voices');button.disabled=true;$('#speech-error').textContent='';$('#speech-quota').textContent='Stimmen und Kontingent werden geladen …';
+      try{
+        if(saveKey&&form.elements.key.value){await api('/api/settings/speech',{method:'PUT',body:JSON.stringify(collect(form))});form.elements.key.value='';}
+        const catalog=await api('/api/settings/speech/catalog');voices=catalog.voices;
+        $('#speech-quota').textContent=`${catalog.quota.remaining.toLocaleString('de-CH')} von ${catalog.quota.limit.toLocaleString('de-CH')} Credits übrig · Tarif ${catalog.quota.tier}. Free-Lizenzbedingungen vor Veröffentlichung prüfen.`;filterVoices();
+      }catch(error){$('#speech-error').textContent=error.message;$('#speech-quota').textContent='Kontingent nicht verfügbar. Gespeicherte Zuordnungen bleiben erhalten.';}finally{button.disabled=false;}
+    };
+    $('#load-speech-voices').onclick=()=>loadVoices(true);updateRows();if(saved.configured)await loadVoices();else $('#speech-quota').textContent='Noch kein ElevenLabs-Key gespeichert. Lokale Stimmen funktionieren ohne Key.';
   }
 
   async function aiSettings() {

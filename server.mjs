@@ -129,6 +129,8 @@ try { db.exec("ALTER TABLE jobs ADD COLUMN worker_id TEXT"); } catch { /* column
 try { db.exec("ALTER TABLE jobs ADD COLUMN shot_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE jobs ADD COLUMN asset_id INTEGER"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"); } catch { /* column already exists */ }
+if (!db.prepare('PRAGMA table_info(jobs)').all().some(c=>c.name==='payload_json')) db.exec('ALTER TABLE jobs ADD COLUMN payload_json TEXT');
+db.exec("UPDATE jobs SET payload_json=detail WHERE kind='audio_cue' AND payload_json IS NULL AND json_valid(detail)");
 try { db.exec("ALTER TABLE shots ADD COLUMN audio_direction_json TEXT NOT NULL DEFAULT '{}'"); } catch { /* column already exists */ }
 try { db.exec("ALTER TABLE shots ADD COLUMN render_completed_at TEXT"); } catch { /* column already exists */ }
 // Concise English action text for the video model (German prose is read aloud by H3).
@@ -248,7 +250,7 @@ function audioContextForEpisode(episodeId, ownerId) {
   // left the manifest at `rendering` forever. Reconcile that split-brain state
   // whenever the audio view is opened so the cue exposes a retry action again.
   if (saved && Array.isArray(manifest?.cues)) {
-    const activeCueIds = new Set(rows("SELECT detail FROM jobs WHERE episode_id=? AND kind='audio_cue' AND state IN ('wartet','läuft')", episodeId).map(job => {
+    const activeCueIds = new Set(rows("SELECT COALESCE(payload_json,detail) detail FROM jobs WHERE episode_id=? AND kind='audio_cue' AND state IN ('wartet','läuft')", episodeId).map(job => {
       try { return String(JSON.parse(job.detail || '{}').cue_id || ''); } catch { return ''; }
     }).filter(Boolean));
     let reconciled = false;
@@ -333,7 +335,7 @@ function addAutomaticSoundtrack(manifest, episodeId, projectId) {
   return result;
 }
 function activeAudioCueIds(episodeId) {
-  return new Set(rows("SELECT detail FROM jobs WHERE episode_id=? AND kind='audio_cue' AND state IN ('wartet','läuft')", episodeId).map(job => {
+  return new Set(rows("SELECT COALESCE(payload_json,detail) detail FROM jobs WHERE episode_id=? AND kind='audio_cue' AND state IN ('wartet','läuft')", episodeId).map(job => {
     try { return String(JSON.parse(job.detail || '{}').cue_id || ''); } catch { return ''; }
   }).filter(Boolean));
 }
@@ -2513,6 +2515,7 @@ const server = http.createServer(async (req, res) => {
       const file=join(DATA,`rebuild-${account.id}.json`);
       if(!existsSync(file))return json(res,200,{state:'not_started',episodes:[]});
       const report=JSON.parse(await readFile(file,'utf8'));delete report.backup;
+      for(const episode of report.episodes||[]){episode.progress=row('SELECT COUNT(*) total,SUM(CASE WHEN output_video_path IS NOT NULL THEN 1 ELSE 0 END) rendered FROM shots WHERE episode_id=?',episode.id);episode.audio=rows("SELECT state,count(*) count FROM jobs WHERE episode_id=? AND kind='audio_cue' AND id>=? GROUP BY state",episode.id,row('SELECT MIN(id) id FROM jobs WHERE episode_id=? AND created_at>=?',episode.id,report.startedAt)?.id||0);}
       return json(res,200,report);
     }
     if(path==='/api/settings/speech' && req.method==='GET'){
@@ -2547,7 +2550,7 @@ const server = http.createServer(async (req, res) => {
       const result=await serialSpeech(job.owner_id,async()=>{
         const {stored,settings}=readSpeechSettings(job.owner_id);
         if(settings.provider!=='elevenlabs')return {provider:'local',reason:'Lokale Sprachgenerierung ausgewählt.'};
-        let detail={};try{detail=JSON.parse(job.detail||'{}');}catch{}
+        let detail={};try{detail=JSON.parse(job.payload_json||job.detail||'{}');}catch{}
         const cue=job.kind==='audio_cue'?audioContextForEpisode(job.episode_id,job.owner_id)?.manifest?.cues.find(c=>c.id===detail.cue_id):{text:detail.text,asset_id:job.asset_id,kind:'dialogue'};
         if(!cue||!['dialogue','narration'].includes(cue.kind))throw new Error('Keine gültige Sprachspur.');
         const voiceId=settings.voices[cue.asset_id||'narrator'];
@@ -2608,7 +2611,9 @@ const server = http.createServer(async (req, res) => {
           -- Explicit single-track audio previews and cue tests are short, user-facing
           -- approval gates. Run them before multi-minute video jobs so a voice/SFX
           -- check does not sit behind an entire episode render.
-          ORDER BY CASE
+          ORDER BY CASE WHEN j.kind IN ('audio_preview','caption_asset') THEN 0 ELSE 1 END,
+            j.episode_id,
+            CASE
             WHEN j.kind='audio_preview' THEN 1
             WHEN j.kind='caption_asset' THEN 2
             -- A prerequisite reference for a waiting video must come first.
@@ -2630,6 +2635,7 @@ const server = http.createServer(async (req, res) => {
             -- short audio prerequisites above still run before any video.
             CASE WHEN j.detail LIKE 'Vorrang:%' THEN 0 ELSE 1 END,j.id LIMIT 1`);
         if(job){
+          if(job.kind==='audio_cue'&&!job.payload_json){run('UPDATE jobs SET payload_json=? WHERE id=?',job.detail,job.id);job.payload_json=job.detail;}
           const claimed=run("UPDATE jobs SET state='läuft',started_at=?,worker_id=? WHERE id=? AND state='wartet'",now(),workerId,job.id);
           if(!claimed.changes) job=null;
           else if(job.shot_id) run("UPDATE shots SET status='läuft' WHERE id=?",job.shot_id);
@@ -2654,7 +2660,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { job, asset, preview: { text: String(preview.text || ''), voice: String(preview.voice || asset.voice || ''), language: String(preview.language || 'German') } });
       }
       if (job.kind === 'audio_cue') {
-        let cueRequest = {}; try { cueRequest = JSON.parse(job.detail || '{}'); } catch {}
+        let cueRequest = {}; try { cueRequest = JSON.parse(job.payload_json || job.detail || '{}'); } catch {}
         const audio = audioContextForEpisode(job.episode_id, job.owner_id);
         const cue = audio?.manifest?.cues?.find(item => String(item.id) === String(cueRequest.cue_id));
         if (!cue || cue.state === 'skipped' || cue.state === 'ready') { run("UPDATE jobs SET state='fehlgeschlagen',detail=?,completed_at=? WHERE id=?", 'Die zugehörige Audio-Spur fehlt oder wurde bereits ersetzt.', now(), job.id); return json(res, 204, {}); }
@@ -2750,9 +2756,10 @@ const server = http.createServer(async (req, res) => {
       const id = Number(path.split('/')[4]), job = row('SELECT * FROM jobs WHERE id=?', id);
       if (!job || job.kind !== 'audio_cue') return json(res, 404, { error: 'Audio-Spurauftrag nicht gefunden.' });
       if (job.state === 'abgebrochen') return json(res, 409, { error: 'Dieser Auftrag wurde bereits abgebrochen.' });
-      let detail = {}; try { detail = JSON.parse(job.detail || '{}'); } catch {}
+      let detail = {}; try { detail = JSON.parse(job.payload_json || job.detail || '{}'); } catch {}
       const cueId = String(req.headers['x-framecut-cue-id'] || detail.cue_id || '').trim();
       if (!cueId || cueId !== String(detail.cue_id || '')) return json(res, 400, { error: 'Die Audio-Cue-ID passt nicht zum Auftrag.' });
+      if(job.state==='fertig'){req.resume();return json(res,200,{ok:true,cueId,alreadyCompleted:true});}
       const chunks = []; let size = 0; for await (const chunk of req) { size += chunk.length; if (size > 80 * 1024 * 1024) throw new Error('Audio-Spur ist größer als 80 MB.'); chunks.push(chunk); }
       if (!size) return json(res, 400, { error: 'Audio-Spur ist leer.' }); await mkdir(UPLOADS, { recursive: true });
       const file = `audio-cue-${job.episode_id}-${randomBytes(5).toString('hex')}.wav`, portable = `data/uploads/${file}`, bytes = Buffer.concat(chunks);
@@ -2835,6 +2842,7 @@ const server = http.createServer(async (req, res) => {
       const id=Number(path.split('/')[4]),action=path.split('/')[5],d=await body(req),job=row('SELECT * FROM jobs WHERE id=?',id);
       if(!job)return json(res,404,{error:'Job nicht gefunden.'});
       if(job.state==='abgebrochen')return json(res,409,{error:'Dieser Auftrag wurde bereits abgebrochen.'});
+      if(job.kind==='audio_cue'&&job.state==='fertig')return json(res,200,{ok:true,alreadyCompleted:true});
       const state=action==='complete'?'fertig':'fehlgeschlagen';
       run('UPDATE jobs SET state=?,detail=?,completed_at=? WHERE id=?',state,String(d.detail||'').slice(0,4000),now(),id);
       if(action==='complete'&&job.shot_id){run('UPDATE shots SET status=?,output_video_path=COALESCE(?,output_video_path) WHERE id=?','Gerendert',String(d.outputPath||'').trim()||null,job.shot_id);}
@@ -2843,7 +2851,7 @@ const server = http.createServer(async (req, res) => {
       // table. Keep both in sync so a failed renderer becomes visibly retryable
       // instead of remaining forever as a phantom "in Queue" cue.
       if(action==='fail'&&job.kind==='audio_cue'){
-        let request={}; try{request=JSON.parse(job.detail||'{}');}catch{}
+        let request={}; try{request=JSON.parse(job.payload_json||job.detail||'{}');}catch{}
         const cueId=String(request.cue_id||'').trim();
         const audio=audioContextForEpisode(job.episode_id,job.owner_id);
         if(cueId&&audio?.manifest){
@@ -2864,6 +2872,7 @@ const server = http.createServer(async (req, res) => {
     if (path === '/app.css') return serveFile(res,join(APP,'public','app.css'));
     if (path === '/guided.css') return serveFile(res,join(APP,'public','guided.css'));
     if (path === '/app.js') return serveFile(res,join(APP,'public','app.js'));
+    if (path === '/settings-ui.js') return serveFile(res,join(APP,'public','settings-ui.js'));
     if (path === '/auto-mode.js') return serveFile(res,join(APP,'public','auto-mode.js'));
     if (path === '/pwa.js') return serveFile(res,join(APP,'public','pwa.js'));
     if (path === '/sw.js') return serveFile(res,join(APP,'public','sw.js'));

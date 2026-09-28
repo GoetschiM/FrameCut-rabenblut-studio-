@@ -6,6 +6,12 @@ import { createEpisodeAudioManifest, reconcileAudioManifest, validateAudioManife
 const shot = { id: 263, title: 'Portal schliesst', prompt: 'Rick zieht den Hebel und erklärt Morty etwas.', camera: 'Totale', seed: 1, duration_seconds: 5, audio_direction_json: '{}', dialogue_lines: [] };
 const rick = { id: 152, name: 'Rick', kind: 'character', summary: 'Wahnsinniger Wissenschaftler, der Morty instrumentalisiert.', visual_notes: 'Rick hat zerzaustes blaues Haar.', photos: [{ sha256: 'a', downloadUrl: '/a' }] };
 
+test('reference appearance fallback cannot reintroduce a competing art medium',()=>{
+  const contract=buildSceneContract({shot,style:'Consistent 3D animation.',references:[{...rick,visual_notes:'2D cartoon, blue hair, white coat',visual_tags:''}]});
+  assert.doesNotMatch(contract.prompt,/2D cartoon/);assert.doesNotMatch(contract.keyframe.prompt,/2D cartoon/);
+  assert.match(contract.prompt,/blue hair/);assert.match(contract.keyframe.prompt,/NOT their rendering medium/);
+});
+
 test('generated English tags and action text never change the review fingerprint', () => {
   const plain = buildSceneContract({ shot, style: 'cel-shaded', references: [rick] });
   const tagged = buildSceneContract({ shot: { ...shot, prompt_en: 'Rick pulls the lever; everyone keeps their mouth closed.' }, style: 'cel-shaded', references: [{ ...rick, visual_tags: 'elderly scientist, spiky light-blue hair' }] });

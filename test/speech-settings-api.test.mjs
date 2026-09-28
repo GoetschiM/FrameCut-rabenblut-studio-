@@ -30,5 +30,21 @@ test('speech settings encrypt keys, isolate users and require owned active worke
     assert.equal((await(await req('/api/production-rebuild',{headers:user(1)})).json()).state,'not_started');
     assert.equal((await req('/api/settings/speech',{method:'PUT',headers:user(1),body:JSON.stringify({provider:'local'})})).status,200);
     assert.equal(db.prepare('SELECT encrypted_key FROM user_speech_settings WHERE user_id=1').get().encrypted_key,encrypted);
+    assert.match(await(await req('/settings-ui.js')).text(),/FrameCutSettings/);
+    db.prepare('INSERT INTO projects(id,slug,title,source_path,created_at) VALUES (1,?,?,?,?)').run('test','Test','',now);
+    db.prepare('INSERT INTO episodes(id,project_id,number,title,created_at) VALUES (1,1,1,?,?)').run('Test',now);
+    db.prepare('INSERT INTO shots(id,episode_id,sequence,title,prompt,camera,seed,created_at) VALUES (1,1,1,?,?,?,?,?)').run('Hallo','Test','Static',42,now);
+    const audio=await(await req('/api/episodes/1/audio-preflight',{headers:user(1)})).json();
+    const cue=audio.manifest.cues[0];assert.ok(cue);
+    db.prepare('INSERT INTO jobs(id,episode_id,kind,label,state,detail,created_at,owner_id) VALUES(1,1,?,?,?,?,?,1)').run('audio_cue','Test','wartet',JSON.stringify({cue_id:cue.id}),now);
+    const worker={'x-framecut-worker':'test-worker','x-framecut-scene-pipeline':'5','content-type':'application/json'};
+    assert.equal((await req('/api/worker/next',{headers:worker})).status,200);
+    assert.equal((await req('/api/worker/jobs/1/fail',{method:'POST',headers:worker,body:JSON.stringify({detail:'Temporary connection error'})})).status,200);
+    db.prepare("UPDATE jobs SET state='wartet',detail='Automatischer Neuversuch nach Verbindungsfehler' WHERE id=1").run();
+    const retry=await req('/api/worker/next',{headers:worker});assert.equal(retry.status,200);assert.equal((await retry.json()).cue.id,cue.id);
+    const upload=()=>req('/api/worker/jobs/1/audio-cue',{method:'POST',headers:{...worker,'x-framecut-cue-id':cue.id,'content-type':'audio/wav'},body:Buffer.alloc(256)});
+    assert.equal((await upload()).status,201);assert.equal((await upload()).status,200);
+    await req('/api/worker/jobs/1/fail',{method:'POST',headers:worker,body:JSON.stringify({detail:'Late lost response'})});
+    assert.equal(db.prepare('SELECT state FROM jobs WHERE id=1').get().state,'fertig');
   }finally{db?.close();proc.kill();await once(proc,'exit');rmSync(dir,{recursive:true,force:true});}
 });
