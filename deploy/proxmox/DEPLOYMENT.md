@@ -33,3 +33,32 @@ Authentik wird später über OIDC eingebunden. Dafür braucht FrameCut erst beim
 - erlaubte Callback-URL der FrameCut-Domain
 
 Bis OIDC aktiv ist, bleibt die vorhandene lokale Anmeldung verfügbar. Der Cloudflare Tunnel sollte erst öffentlich freigegeben werden, wenn mindestens Cloudflare Access oder Authentik davor liegt.
+
+## Automatisches Deployment bei Push
+
+`.github/workflows/deploy.yml` löst bei jedem Push auf `main` per SSH
+`deploy/proxmox/remote-deploy.sh` auf dem LXC aus. Das Skript macht
+`git fetch` + `git reset --hard origin/main` in `/opt/framecut` und startet
+`framecut.service` neu.
+
+Damit das läuft, einmalig einrichten:
+
+1. **GitHub-Secrets** im Repo (Settings → Secrets and variables → Actions):
+   - `DEPLOY_HOST` — IP/Hostname des LXC
+   - `DEPLOY_USER` — SSH-Deploy-User (z. B. `framecut`, nicht `root`)
+   - `DEPLOY_SSH_KEY` — privater SSH-Key für diesen User (Pubkey vorher in
+     `~/.ssh/authorized_keys` des Deploy-Users auf dem LXC eintragen)
+   - `DEPLOY_PORT` — optional, falls SSH nicht auf Port 22 läuft
+2. **Sudoers-Eintrag** auf dem LXC, damit der Deploy-User `framecut.service`
+   ohne Passwort neu starten darf, z. B. in `/etc/sudoers.d/framecut-deploy`:
+   ```
+   framecut ALL=(root) NOPASSWD: /usr/bin/systemctl restart framecut, /usr/bin/systemctl status framecut
+   ```
+3. **Git-Remote auf dem LXC**: `/opt/framecut` muss ein Checkout dieses Repos
+   mit `origin` = `https://github.com/GoetschiM/rabenblut-studio.git` sein
+   (oder per Deploy-Key, falls das Repo privat bleiben soll und kein PAT auf
+   dem LXC liegen soll).
+
+Ohne diese drei Schritte bleibt der Workflow rot (SSH schlägt fehl), ändert
+aber nichts am laufenden Dienst — sicher zum Mergen, bevor die Secrets
+gesetzt sind.
